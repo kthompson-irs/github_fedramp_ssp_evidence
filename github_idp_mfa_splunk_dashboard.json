@@ -1,0 +1,64 @@
+{
+  "title": "GitHub IdP MFA Correlation",
+  "description": "Dashboard for correlating IdP MFA success with GitHub audit-log login activity.",
+  "timezone": "utc",
+  "filters": {
+    "timeRange": {
+      "earliest": "-24h@h",
+      "latest": "now"
+    },
+    "github_index": "github_audit",
+    "idp_index": "idp_auth"
+  },
+  "panels": [
+    {
+      "title": "Matched GitHub logins with prior IdP MFA",
+      "type": "table",
+      "query": "index=$github_index$ action IN (org.login, saml_authentication, oauth_authorization) | eval user=coalesce(user, actor) | join type=left user [ search index=$idp_index$ (mfa_result=success OR mfa_satisfied=true OR mfa_status=success) | eval user=coalesce(user, principal, username, upn, email) | eval idp_time=_time | fields user idp_time auth_method mfa_result mfa_satisfied ] | eval delta_seconds=abs(_time-idp_time) | where isnotnull(idp_time) AND delta_seconds<=900 | table _time user action auth_method mfa_result idp_time delta_seconds",
+      "viz": {
+        "rowNumbers": true,
+        "sort": [["_time", "desc"]]
+      }
+    },
+    {
+      "title": "Unmatched GitHub login-like events",
+      "type": "table",
+      "query": "index=$github_index$ action IN (org.login, saml_authentication, oauth_authorization) | eval user=coalesce(user, actor) | join type=left user [ search index=$idp_index$ (mfa_result=success OR mfa_satisfied=true OR mfa_status=success) | eval user=coalesce(user, principal, username, upn, email) | eval idp_time=_time | fields user idp_time ] | where isnull(idp_time) | table _time user action repo org",
+      "viz": {
+        "rowNumbers": true
+      }
+    },
+    {
+      "title": "GitHub auth events by user",
+      "type": "bar",
+      "query": "index=$github_index$ action IN (org.login, saml_authentication, oauth_authorization, credential_authorization) | eval user=coalesce(user, actor) | stats count by user | sort - count",
+      "viz": {
+        "orientation": "horizontal"
+      }
+    },
+    {
+      "title": "IdP MFA success trend",
+      "type": "line",
+      "query": "index=$idp_index$ (mfa_result=success OR mfa_satisfied=true OR mfa_status=success) | timechart span=1h count",
+      "viz": {
+        "yAxisLabel": "MFA successes"
+      }
+    },
+    {
+      "title": "Potential gaps",
+      "type": "singleValue",
+      "query": "index=$github_index$ action IN (org.login, saml_authentication, oauth_authorization) | eval user=coalesce(user, actor) | join type=left user [ search index=$idp_index$ (mfa_result=success OR mfa_satisfied=true OR mfa_status=success) | eval user=coalesce(user, principal, username, upn, email) | fields user ] | where isnull(user_1) | stats count",
+      "viz": {
+        "thresholds": [
+          {"value": 0, "color": "green"},
+          {"value": 1, "color": "red"}
+        ]
+      }
+    }
+  ],
+  "notes": [
+    "GitHub Enterprise audit logs can be streamed to external data management systems, and the audit-log API can be used for retrieval.",
+    "Adjust index names and auth field names to match your deployment.",
+    "Use the IdP export schema emitted by your Azure AD / Okta pipeline for exact field mapping."
+  ]
+}
