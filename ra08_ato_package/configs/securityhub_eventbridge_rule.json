@@ -1,12 +1,3 @@
-enable_ec2_scanning: true
-enable_container_scanning: true
-enable_lambda_scanning: false
-aggregation_region: us-gov-west-1
-scan_frequency: continuous
-notes:
-  - Use AWS Organizations delegated administrator if available.
-  - Confirm Inspector is enabled in every in-scope GovCloud region.
-[wnglb@vp2smtbappiem02 configs]$ cat securityhub_eventbridge_rule.json
 {
   "source": ["aws.securityhub"],
   "detail-type": ["Security Hub Findings - Imported"],
