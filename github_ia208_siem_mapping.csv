@@ -1,0 +1,9 @@
+GitHub Log Field,Meaning,Splunk Mapping,Sentinel Mapping,Detection / Use Case,Notes
+action,Audit-log action name,sourcetype=github:audit; field action,GitHubAuditLogsV2_CL.Action,Filter auth actions repo changes privilege changes,Use action prefixes such as org. repo. team. oauth. saml.
+actor,GitHub username or agent,user=actor,AccountCustomEntity or Actor,Who performed the change,Keep GitHub username as the canonical actor field.
+user,Target account or affected principal,target_user=user,TargetUserName,Who was affected,Useful for token revocations or membership changes.
+org,Organization slug,org,Organization,Scope events to the monitored org,Required for multi-org GitHub Enterprise estates.
+repo,Repository slug,repo,Repository,Repository-specific detections,Absent for org-level actions not tied to a repo.
+created_at,Event timestamp,_time from created_at,TimeGenerated,Event timeline and correlation,GitHub audit log exports use epoch ms timestamps.
+actor_location.country_code,Originating country,geoip or country field,Country,Geo anomaly detection,Useful for impossible-travel style analytics.
+data.*,Event-specific payload,json_extract data.*,AdditionalFields or dynamic columns,Content-specific detections,Preserve raw JSON for forensics.
