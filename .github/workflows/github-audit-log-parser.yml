@@ -1,0 +1,109 @@
+name: GitHub Audit Log Risk Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      ORG_NAME: ${{ vars.ORG_NAME }}
+      GH_TOKEN: ${{ secrets.GH_ORG_AUDIT_TOKEN }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch GitHub audit log
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib import request, error
+
+          org = os.environ["ORG_NAME"].strip()
+          token = os.environ["GH_TOKEN"].strip()
+
+          if not org:
+              raise SystemExit("ORG_NAME is empty. Set it as a repository variable.")
+          if not token:
+              raise SystemExit("GH_ORG_AUDIT_TOKEN is empty. Set it as a repository secret.")
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "github-audit-log-parser",
+          }
+
+          next_url = f"https://api.github.com/orgs/{org}/audit-log?per_page=100"
+          total = 0
+
+          with open("audit.log.jsonl", "w", encoding="utf-8") as out:
+              while next_url:
+                  req = request.Request(next_url, headers=headers)
+                  try:
+                      with request.urlopen(req) as resp:
+                          payload = json.load(resp)
+                          if not isinstance(payload, list):
+                              payload = [payload]
+
+                          for event in payload:
+                              out.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+                              total += 1
+
+                          link = resp.headers.get("Link", "")
+                  except error.HTTPError as e:
+                      body = e.read().decode("utf-8", errors="replace")
+                      raise SystemExit(f"Failed to fetch audit log: {e.code} {e.reason}\n{body}") from e
+
+                  next_url = None
+                  for part in link.split(","):
+                      part = part.strip()
+                      if 'rel="next"' in part and "<" in part and ">" in part:
+                          next_url = part[part.find("<") + 1 : part.find(">")]
+                          break
+
+          print(f"Fetched {total} audit log events")
+          PY
+
+      - name: Run parser
+        run: |
+          python github_audit_log_parser.py --input audit.log.jsonl --output findings.json | tee parser.log
+
+      - name: Summarize results
+        if: always()
+        run: |
+          {
+            echo "## GitHub audit log scan"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Organization: $ORG_NAME"
+            echo
+            echo "### Parser output"
+            echo '```'
+            sed -n '1,200p' parser.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit log and findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-audit-log-findings
+          path: |
+            audit.log.jsonl
+            findings.json
+            parser.log
