@@ -1,0 +1,234 @@
+{
+  "uid": "fedramp-conmon",
+  "title": "FedRAMP Continuous Monitoring Dashboard",
+  "tags": [
+    "fedramp",
+    "conmon",
+    "github",
+    "aws-govcloud",
+    "azure-gov"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "5m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "system",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "POSTGRES_MAIN"
+        },
+        "query": "SELECT DISTINCT system_name FROM dim_system ORDER BY 1",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ".*"
+        }
+      },
+      {
+        "name": "family",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "POSTGRES_MAIN"
+        },
+        "query": "SELECT DISTINCT control_family FROM dim_control_family ORDER BY 1",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ".*"
+        }
+      },
+      {
+        "name": "severity",
+        "type": "custom",
+        "query": "All,Low,Medium,High,Critical",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": ".*"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Overall Compliance Score",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT ROUND(100.0 * SUM(CASE WHEN status = 'PASS' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS compliance_score FROM fact_control_status WHERE $__timeFilter(last_checked_at) AND system_name ~ '${system}' AND control_family ~ '${family}';",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Open High Severity Findings",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT COUNT(*) AS high_findings FROM fact_findings WHERE status <> 'Closed' AND severity IN ('High','Critical') AND system_name ~ '${system}';",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Evidence Freshness (Hours)",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT MAX(EXTRACT(EPOCH FROM (NOW() - collected_at))/3600.0) AS evidence_age_hours FROM fact_evidence_event WHERE system_name ~ '${system}' AND control_family ~ '${family}';",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Control Family Pass Rate",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT control_family, ROUND(100.0 * SUM(CASE WHEN status = 'PASS' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS pass_rate FROM fact_control_status WHERE system_name ~ '${system}' GROUP BY control_family ORDER BY control_family;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Compliance Trend",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT date_trunc('day', last_checked_at) AS time, ROUND(100.0 * SUM(CASE WHEN status = 'PASS' THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS compliance_score FROM fact_control_status WHERE $__timeFilter(last_checked_at) AND system_name ~ '${system}' GROUP BY 1 ORDER BY 1;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Open Findings",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "POSTGRES_MAIN"
+          },
+          "rawSql": "SELECT finding_id, control_id, severity, status, owner, opened_at, due_date, title FROM fact_findings WHERE status <> 'Closed' AND severity ~ '${severity}' AND system_name ~ '${system}' ORDER BY CASE severity WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END, due_date ASC NULLS LAST;",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}
