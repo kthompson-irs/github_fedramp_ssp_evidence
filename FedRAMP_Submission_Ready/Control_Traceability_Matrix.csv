@@ -1,0 +1,5 @@
+Control,Implementation,Artifact,Path
+IA-5(6),FIPS Mode Enabled,linux_fips_enabled_output.txt,01_FIPS_Mode/
+IA-5(6),TLS Enforcement,ssl_scan_results.txt,06_Encryption_In_Transit/
+SC-12,Key Management,KMS_policy.json,04_Key_Management/
+SC-13,Crypto Protection,tls_configuration.yaml,06_Encryption_In_Transit/
