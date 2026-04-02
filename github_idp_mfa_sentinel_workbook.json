@@ -1,0 +1,48 @@
+{
+  "name": "GitHub IdP MFA Correlation Workbook",
+  "version": "Notebook/1.0",
+  "kind": "shared",
+  "displayName": "GitHub IdP MFA Correlation",
+  "description": "Workbook template for correlating GitHub audit-log events with IdP MFA events.",
+  "fallbackResourceIds": [],
+  "serializedData": {
+    "version": "Notebook/1.0",
+    "items": [
+      {
+        "type": 1,
+        "content": {
+          "json": "{\"version\":\"KqlItem/1.0\",\"query\":\"GitHubAuditLogsV2_CL | where Action in ('org.login','saml_authentication','oauth_authorization') | extend User=tostring(coalesce(User,Actor,ActorLogin)) | project TimeGenerated, User, Action, Repo=tostring(Repo), Org=tostring(Org), IP=tostring(IPAddress)\",\"size\":0,\"title\":\"GitHub login-like events\",\"timeContext\":{\"durationMs\":86400000},\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\"}"
+        },
+        "name": "github-logins",
+        "position": {"x": 0, "y": 0, "colSpan": 12, "rowSpan": 6}
+      },
+      {
+        "type": 1,
+        "content": {
+          "json": "{\"version\":\"KqlItem/1.0\",\"query\":\"GitHubAuditLogsV2_CL | where Action in ('org.login','saml_authentication','oauth_authorization') | extend User=tostring(coalesce(User,Actor,ActorLogin)) | join kind=leftouter ( EntraSignInLogs | where ResultType == 0 | extend User=tostring(coalesce(UserPrincipalName,Identity,UserDisplayName)) | project SignInTime=TimeGenerated, User, AuthenticationRequirement, AuthenticationMethodsUsed, ConditionalAccessStatus ) on User | extend DeltaMinutes = datetime_diff('minute', TimeGenerated, SignInTime) | where isnotempty(SignInTime) and abs(DeltaMinutes) <= 15 | project TimeGenerated, SignInTime, DeltaMinutes, User, Action, AuthenticationRequirement, AuthenticationMethodsUsed, ConditionalAccessStatus\",\"size\":0,\"title\":\"Matched GitHub events with IdP MFA\",\"timeContext\":{\"durationMs\":86400000},\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\"}"
+        },
+        "name": "correlation-table",
+        "position": {"x": 0, "y": 6, "colSpan": 12, "rowSpan": 8}
+      },
+      {
+        "type": 1,
+        "content": {
+          "json": "{\"version\":\"KqlItem/1.0\",\"query\":\"EntraSignInLogs | where ResultType == 0 | summarize Count=count() by bin(TimeGenerated, 1h)\",\"size\":0,\"title\":\"IdP MFA success trend\",\"visualization\":\"linechart\",\"timeContext\":{\"durationMs\":86400000},\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\"}"
+        },
+        "name": "mfa-trend",
+        "position": {"x": 0, "y": 14, "colSpan": 6, "rowSpan": 6}
+      },
+      {
+        "type": 1,
+        "content": {
+          "json": "{\"version\":\"KqlItem/1.0\",\"query\":\"GitHubAuditLogsV2_CL | where Action has_any ('token','credential','oauth','saml') | summarize Count=count() by Action | order by Count desc\",\"size\":0,\"title\":\"GitHub auth activity by action\",\"visualization\":\"barchart\",\"timeContext\":{\"durationMs\":86400000},\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\"}"
+        },
+        "name": "action-bar",
+        "position": {"x": 6, "y": 14, "colSpan": 6, "rowSpan": 6}
+      }
+    ],
+    "isLocked": false,
+    "fallbackResourceIds": [],
+    "style": "v1"
+  }
+}
