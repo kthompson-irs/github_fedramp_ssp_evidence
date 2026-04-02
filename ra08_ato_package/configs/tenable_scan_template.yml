@@ -1,0 +1,15 @@
+scan_name: treasury-govcloud-authenticated-weekly
+scan_type: authenticated
+frequency: weekly
+targets:
+  - subnet-10-0-0-0-24
+  - subnet-10-0-1-0-24
+credential_method: ssh_or_iam_role
+policy:
+  critical: 30
+  high: 30
+  medium: 90
+  low: 180
+notes:
+  - Enable plugin updates daily.
+  - Confirm credentialed check coverage exceeds 90 percent.
