@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "name": "grafana_dashboard.json",
+      "type": "Grafana dashboard JSON"
+    },
+    {
+      "name": "powerbi_data_model_measures_pack.md",
+      "type": "Power BI data model + measures pack"
+    }
+  ],
+  "notes": [
+    "Replace POSTGRES_MAIN with your Grafana datasource UID.",
+    "Wire Power BI to the actual warehouse or lakehouse schema before use."
+  ]
+}
