@@ -3,8 +3,8 @@ name: GitHub Enterprise Security Alerts to POA&M
 on:
   workflow_dispatch:
     inputs:
-      gh_enterprise:
-        description: "GitHub enterprise slug"
+      gh_enterprise_slug:
+        description: "GitHub enterprise slug (for example: rs-enterprise)"
         required: false
         type: string
   schedule:
@@ -21,7 +21,7 @@ jobs:
 
     env:
       GH_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
-      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
+      GH_ENTERPRISE_SLUG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise_slug || vars.GH_ENTERPRISE_SLUG }}
       GH_API_URL: https://api.github.com
       GH_API_VERSION: 2022-11-28
       OUTPUT_DIR: poam-output
@@ -50,8 +50,8 @@ jobs:
             exit 1
           fi
 
-          if [ -z "$GH_ENTERPRISE" ]; then
-            echo "GH_ENTERPRISE is missing. Set vars.GH_ENTERPRISE or pass gh_enterprise on workflow_dispatch." >&2
+          if [ -z "$GH_ENTERPRISE_SLUG" ]; then
+            echo "GH_ENTERPRISE_SLUG is missing. Set vars.GH_ENTERPRISE_SLUG or pass gh_enterprise_slug on workflow_dispatch." >&2
             exit 1
           fi
 
@@ -83,20 +83,33 @@ jobs:
             }
 
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-            const title = `High POA&M findings (${summary.enterprise})`;
-            const body = [
+            const title = `High POA&M findings (${summary.enterprise_slug})`;
+
+            const bodyLines = [
               `# High POA&M findings`,
               ``,
-              `- Enterprise: \`${summary.enterprise}\``,
+              `- Enterprise slug: \`${summary.enterprise_slug}\``,
               `- Total rows: ${summary.total_count}`,
               `- HIGH rows: ${summary.high_count}`,
+              `- Moderate rows: ${summary.moderate_count}`,
+              `- Low rows: ${summary.low_count}`,
               ``,
               `## HIGH findings`,
-              ``,
-              ...(summary.high_rows || []).slice(0, 25).map(r =>
-                `- **${r.poam_id}** | ${r.weakness_name} | severity=${r.severity} | asset=${r.asset_identifier} | source=${r.source_url}`
-              )
-            ].join('\n');
+              ``
+            ];
+
+            for (const row of (summary.high_rows || []).slice(0, 25)) {
+              bodyLines.push(
+                `- **${row.poam_id}** | ${row.weakness_name} | severity=${row.severity} | asset=${row.asset_identifier} | source=${row.source_url}`
+              );
+            }
+
+            if ((summary.high_rows || []).length > 25) {
+              bodyLines.push('');
+              bodyLines.push(`_Showing first 25 of ${summary.high_rows.length} HIGH findings._`);
+            }
+
+            const body = bodyLines.join('\n');
 
             const existing = await github.rest.search.issuesAndPullRequests({
               q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`
