@@ -57,7 +57,11 @@ jobs:
 
       - name: Run POA&M generator
         run: |
-          python path/to/your_script.py
+          python ./poam_github.py
+          echo "Workspace contents:"
+          ls -lah
+          echo "POA&M outputs:"
+          ls -lah "$OUTPUT_CSV" "$OUTPUT_JSON"
 
       - name: Summarize output
         if: always()
