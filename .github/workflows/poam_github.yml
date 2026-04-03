@@ -30,23 +30,28 @@ jobs:
       OUTPUT_SUMMARY: poam-output/poam_summary.json
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - run: pip install requests
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
 
       - name: Validate inputs
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "GH_ENTERPRISE_TOKEN missing" >&2
+            echo "GH_ENTERPRISE_TOKEN secret is missing." >&2
             exit 1
           fi
 
           if [ -z "$GH_ENTERPRISE" ]; then
-            echo "GH_ENTERPRISE missing" >&2
+            echo "GH_ENTERPRISE is missing. Set vars.GH_ENTERPRISE or pass gh_enterprise on workflow_dispatch." >&2
             exit 1
           fi
 
@@ -54,6 +59,7 @@ jobs:
         run: |
           mkdir -p "$OUTPUT_DIR"
           python ./github_to_poam_sync.py
+          echo "Output directory contents:"
           ls -lah "$OUTPUT_DIR"
 
       - name: Create issue for HIGH findings
@@ -65,24 +71,35 @@ jobs:
             const summaryPath = process.env.OUTPUT_SUMMARY;
 
             if (!fs.existsSync(summaryPath)) {
-              core.info("No summary found");
+              core.info("No summary found; skipping issue creation.");
               return;
             }
 
             const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
 
             if (!summary.high_count || summary.high_count === 0) {
-              core.info("No HIGH findings");
+              core.info("No HIGH findings.");
               return;
             }
 
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
             const title = `High POA&M findings (${summary.enterprise})`;
-
-            const body = JSON.stringify(summary.high_rows.slice(0, 25), null, 2);
+            const body = [
+              `# High POA&M findings`,
+              ``,
+              `- Enterprise: \`${summary.enterprise}\``,
+              `- Total rows: ${summary.total_count}`,
+              `- HIGH rows: ${summary.high_count}`,
+              ``,
+              `## HIGH findings`,
+              ``,
+              ...(summary.high_rows || []).slice(0, 25).map(r =>
+                `- **${r.poam_id}** | ${r.weakness_name} | severity=${r.severity} | asset=${r.asset_identifier} | source=${r.source_url}`
+              )
+            ].join('\n');
 
             const existing = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${owner}/${repo} is:issue is:open "${title}"`
+              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`
             });
 
             if (existing.data.total_count > 0) {
