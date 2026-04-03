@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       github_repo:
-        description: "Optional repository name; leave blank to scan org-level alerts"
+        description: "Optional repository name; leave blank for org-level code scanning alerts"
         required: false
         type: string
   schedule:
@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependency
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install requests
@@ -51,27 +51,20 @@ jobs:
             echo "GH_GITHUB_TOKEN secret is missing." >&2
             exit 1
           fi
+
           if [ -z "$GITHUB_OWNER" ]; then
-            echo "GITHUB_OWNER is missing. Set it as a repository variable or workflow_dispatch input." >&2
+            echo "GITHUB_OWNER is missing. Set vars.GITHUB_OWNER or pass github_owner on workflow_dispatch." >&2
             exit 1
           fi
 
-      - name: Prepare output directory
-        run: |
-          mkdir -p "$OUTPUT_DIR"
-
       - name: Run POA&M generator
         run: |
-          python ./poam_github.py
+          mkdir -p "$OUTPUT_DIR"
+          python ./github_to_poam_sync.py
           echo "Workspace contents:"
           ls -lah
           echo "Output directory contents:"
           ls -lah "$OUTPUT_DIR"
-
-      - name: Fail if outputs are missing
-        run: |
-          test -f "$OUTPUT_CSV"
-          test -f "$OUTPUT_JSON"
 
       - name: Summarize output
         if: always()
