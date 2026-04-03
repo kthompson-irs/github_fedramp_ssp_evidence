@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pull GitHub code scanning alerts and repository security advisories and emit POA&M rows."""
+"""Pull GitHub enterprise code scanning alerts and repository security advisories and emit POA&M rows."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import json
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,28 +17,18 @@ import requests
 
 API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
 TOKEN = os.getenv("GITHUB_TOKEN")
-OWNER = os.getenv("GITHUB_OWNER")
-REPO = os.getenv("GITHUB_REPO") or ""
+ENTERPRISE = os.getenv("GITHUB_ENTERPRISE")
+API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
 OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", str(Path(OUTPUT_DIR) / "poam_summary.json"))
 
-if not TOKEN or not OWNER:
-    sys.exit("GITHUB_TOKEN and GITHUB_OWNER are required.")
+if not TOKEN or not ENTERPRISE:
+    sys.exit("GITHUB_TOKEN and GITHUB_ENTERPRISE are required.")
 
 output_dir_path = Path(OUTPUT_DIR)
 output_dir_path.mkdir(parents=True, exist_ok=True)
-
-session = requests.Session()
-session.headers.update(
-    {
-        "Authorization": f"Bearer {TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": API_VERSION,
-        "User-Agent": "github-to-poam-sync/1.0",
-    }
-)
 
 
 @dataclass
@@ -58,28 +49,88 @@ class PoamRow:
     source_url: str
 
 
-def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, Any]]:
-    next_url = url
-    next_params = dict(params or {})
+class GitHubEnterpriseClient:
+    def __init__(self, token: str, api_url: str, api_version: str) -> None:
+        self.api_url = api_url.rstrip("/")
+        self.api_version = api_version
+        self.rest_session = requests.Session()
+        self.rest_session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": api_version,
+                "User-Agent": "github-enterprise-to-poam-sync/1.0",
+            }
+        )
 
-    while next_url:
-        resp = session.get(next_url, params=next_params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        self.graphql_session = requests.Session()
+        self.graphql_session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": api_version,
+                "User-Agent": "github-enterprise-to-poam-sync/1.0",
+            }
+        )
 
-        if isinstance(data, list):
-            for item in data:
-                yield item
-        else:
-            yield data
+    def rest_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        url = f"{self.api_url}/{path.lstrip('/')}"
+        backoff = 2
 
-        next_url = None
-        next_params = {}
-        link = resp.headers.get("Link", "")
-        for part in link.split(","):
-            if 'rel="next"' in part and "<" in part and ">" in part:
-                next_url = part[part.find("<") + 1 : part.find(">")]
-                break
+        for _ in range(6):
+            resp = self.rest_session.request(method, url, params=params, timeout=30)
+            if resp.status_code not in (403, 429):
+                return resp
+
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                sleep_for = min(int(retry_after), 60)
+            else:
+                sleep_for = min(backoff, 60)
+                backoff *= 2
+            time.sleep(sleep_for)
+
+        return resp
+
+    def rest_paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
+        next_url = f"{self.api_url}/{path.lstrip('/')}"
+        next_params = dict(params or {})
+        next_params.setdefault("per_page", 100)
+
+        while next_url:
+            resp = self.rest_session.get(next_url, params=next_params, timeout=30)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"GET {resp.url} failed: {resp.status_code} {resp.text[:600]}")
+
+            data = resp.json()
+            if isinstance(data, list):
+                for item in data:
+                    yield item
+            else:
+                yield data
+
+            next_url = None
+            next_params = {}
+            link = resp.headers.get("Link", "")
+            for part in link.split(","):
+                if 'rel="next"' in part and "<" in part and ">" in part:
+                    next_url = part[part.find("<") + 1 : part.find(">")]
+                    break
+
+    def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"{self.api_url}/graphql"
+        resp = self.graphql_session.post(url, json={"query": query, "variables": variables}, timeout=30)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"GraphQL request failed: {resp.status_code} {resp.text[:600]}")
+        payload = resp.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL errors: {json.dumps(payload['errors'], ensure_ascii=False)}")
+        return payload["data"]
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _map_severity(sev: str) -> str:
@@ -91,65 +142,87 @@ def _map_severity(sev: str) -> str:
     return "Low"
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-def _safe_list_with_error(url: str, params: Optional[dict], source_name: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _safe_rest_list(client: GitHubEnterpriseClient, path: str, params: Optional[Dict[str, Any]], source_name: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     try:
-        return list(_paged_get(url, params=params)), None
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        body = exc.response.text[:400].strip() if exc.response is not None else str(exc)
-
-        if status in {403, 404}:
-            return [], f"{source_name} unavailable ({status}) for {url}: {body}"
-
+        return list(client.rest_paginate(path, params=params)), None
+    except RuntimeError as exc:
+        msg = str(exc)
+        if any(code in msg for code in ("404", "403")):
+            return [], f"{source_name} unavailable: {msg}"
         raise
 
 
-def code_scanning_alerts() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if REPO:
-        url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
-    else:
-        url = f"https://api.github.com/orgs/{OWNER}/code-scanning/alerts"
+def list_enterprise_orgs(client: GitHubEnterpriseClient, enterprise_slug: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    query = """
+    query($slug: String!, $first: Int!, $after: String) {
+      enterprise(slug: $slug) {
+        organizations(first: $first, after: $after) {
+          nodes {
+            login
+            name
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+    """
 
-    return _safe_list_with_error(
-        url,
-        params={"state": "open", "per_page": 100},
-        source_name="code scanning alerts",
-    )
+    orgs: List[Dict[str, Any]] = []
+    after: Optional[str] = None
+
+    try:
+        while True:
+            data = client.graphql(query, {"slug": enterprise_slug, "first": 100, "after": after})
+            enterprise = data.get("enterprise")
+            if not enterprise:
+                return [], f"Enterprise not found or inaccessible: {enterprise_slug}"
+
+            organizations = enterprise["organizations"]
+            for node in organizations["nodes"]:
+                if node and node.get("login"):
+                    orgs.append({"login": node["login"], "name": node.get("name")})
+
+            page_info = organizations["pageInfo"]
+            if not page_info["hasNextPage"]:
+                break
+            after = page_info["endCursor"]
+
+        deduped = []
+        seen = set()
+        for org in orgs:
+            login = org["login"]
+            if login not in seen:
+                seen.add(login)
+                deduped.append(org)
+        return deduped, None
+
+    except RuntimeError as exc:
+        return [], f"Unable to enumerate enterprise organizations: {exc}"
 
 
-def repo_security_advisories() -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not REPO:
-        return [], None
-
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/security-advisories"
-    return _safe_list_with_error(
-        url,
-        params={"state": "open", "per_page": 100},
-        source_name="repository security advisories",
-    )
-
-
-def to_poam_rows() -> Tuple[List[PoamRow], List[str]]:
+def collect_enterprise_code_scanning_alerts(client: GitHubEnterpriseClient, enterprise_slug: str) -> Tuple[List[PoamRow], List[str]]:
     rows: List[PoamRow] = []
     source_errors: List[str] = []
-    today = _today()
 
-    alerts, err = code_scanning_alerts()
-    if err:
-        source_errors.append(err)
-
-    advisories, err = repo_security_advisories()
+    alerts, err = _safe_rest_list(
+        client,
+        f"/enterprises/{enterprise_slug}/code-scanning/alerts",
+        params={"state": "open", "per_page": 100},
+        source_name="enterprise code scanning alerts",
+    )
     if err:
         source_errors.append(err)
 
     for alert in alerts:
+        repository = alert.get("repository") or {}
+        full_name = repository.get("full_name") or repository.get("name") or enterprise_slug
         severity = _map_severity(
             alert.get("rule", {}).get("security_severity_level")
             or alert.get("most_recent_instance", {}).get("severity")
+            or alert.get("rule", {}).get("severity")
         )
 
         path = (alert.get("most_recent_instance") or {}).get("location", {}).get("path", "repository")
@@ -161,15 +234,15 @@ def to_poam_rows() -> Tuple[List[PoamRow], List[str]]:
 
         rows.append(
             PoamRow(
-                poam_id=f"GHA-{alert.get('number', '')}",
+                poam_id=f"GHA-{str(alert.get('number', ''))}",
                 weakness_name=title[:120],
-                weakness_description=f"GitHub code scanning alert on {path}. Alert: {title}.",
+                weakness_description=f"Enterprise code scanning alert on {path}. Alert: {title}.",
                 source_identifying_weakness="GitHub Code Scanning / CodeQL",
-                asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
+                asset_identifier=full_name,
                 severity=severity,
                 risk_rating=severity,
-                date_identified=today,
-                scheduled_completion_date=today,
+                date_identified=_today(),
+                scheduled_completion_date=_today(),
                 actual_completion_date="",
                 status="Open",
                 owner="DevSecOps",
@@ -178,21 +251,39 @@ def to_poam_rows() -> Tuple[List[PoamRow], List[str]]:
             )
         )
 
+    return rows, source_errors
+
+
+def collect_org_security_advisories(client: GitHubEnterpriseClient, org_login: str) -> Tuple[List[PoamRow], List[str]]:
+    rows: List[PoamRow] = []
+    source_errors: List[str] = []
+
+    advisories, err = _safe_rest_list(
+        client,
+        f"/orgs/{org_login}/security-advisories",
+        params={"state": "open", "per_page": 100},
+        source_name=f"organization security advisories for {org_login}",
+    )
+    if err:
+        source_errors.append(err)
+
     for adv in advisories:
         gh_sev = (adv.get("severity") or "moderate").capitalize()
         risk = _map_severity(gh_sev)
+        repository = adv.get("repository") or {}
+        asset_identifier = repository.get("full_name") or org_login
 
         rows.append(
             PoamRow(
                 poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
-                weakness_name=adv.get("summary", "Repository security advisory")[:120],
+                weakness_name=(adv.get("summary", "Repository security advisory") or "")[:120],
                 weakness_description=adv.get("description", "Open GitHub repository advisory."),
                 source_identifying_weakness="GitHub Repository Security Advisory",
-                asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
+                asset_identifier=asset_identifier,
                 severity=gh_sev,
                 risk_rating=risk,
-                date_identified=today,
-                scheduled_completion_date=today,
+                date_identified=_today(),
+                scheduled_completion_date=_today(),
                 actual_completion_date="",
                 status="Open",
                 owner="DevSecOps",
@@ -204,11 +295,30 @@ def to_poam_rows() -> Tuple[List[PoamRow], List[str]]:
     return rows, source_errors
 
 
-def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
-    fields = list(asdict(rows[0]).keys()) if rows else list(
-        asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
-    )
+def collect_rows(client: GitHubEnterpriseClient, enterprise_slug: str) -> Tuple[List[PoamRow], List[str], int]:
+    all_rows: List[PoamRow] = []
+    source_errors: List[str] = []
 
+    enterprise_alert_rows, err = collect_enterprise_code_scanning_alerts(client, enterprise_slug)
+    all_rows.extend(enterprise_alert_rows)
+    if err:
+        source_errors.extend(err)
+
+    orgs, err = list_enterprise_orgs(client, enterprise_slug)
+    if err:
+        source_errors.append(err)
+        return all_rows, source_errors, 0
+
+    for org in orgs:
+        rows, err = collect_org_security_advisories(client, org["login"])
+        all_rows.extend(rows)
+        if err:
+            source_errors.extend(err)
+
+    return all_rows, source_errors, len(orgs)
+
+
+def write_outputs(rows: List[PoamRow], source_errors: List[str], org_count: int) -> None:
     csv_path = Path(OUTPUT_CSV)
     json_path = Path(OUTPUT_JSON)
     summary_path = Path(OUTPUT_SUMMARY)
@@ -217,6 +327,11 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
     json_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if rows:
+        fields = list(asdict(rows[0]).keys())
+    else:
+        fields = list(asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys())
+
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -224,7 +339,7 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
             writer.writerow(asdict(row))
 
     with json_path.open("w", encoding="utf-8") as f:
-        json.dump([asdict(r) for r in rows], f, indent=2)
+        json.dump([asdict(r) for r in rows], f, indent=2, ensure_ascii=False)
 
     high_rows = [asdict(r) for r in rows if r.severity.lower() == "high"]
     moderate_rows = [asdict(r) for r in rows if r.severity.lower() == "moderate"]
@@ -232,8 +347,9 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
 
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "owner": OWNER,
-        "repo": REPO,
+        "scope": "enterprise",
+        "enterprise": ENTERPRISE,
+        "org_count": org_count,
         "total_count": len(rows),
         "high_count": len(high_rows),
         "moderate_count": len(moderate_rows),
@@ -242,7 +358,7 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
         "source_errors": source_errors,
     }
 
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"Wrote CSV: {csv_path.resolve()}")
     print(f"Wrote JSON: {json_path.resolve()}")
@@ -250,16 +366,13 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
 
 
 def main() -> int:
-    rows, source_errors = to_poam_rows()
-    write_outputs(rows, source_errors)
+    client = GitHubEnterpriseClient(TOKEN, API_URL, API_VERSION)
+    rows, source_errors, org_count = collect_rows(client, ENTERPRISE)
+    write_outputs(rows, source_errors, org_count)
 
     print(f"Wrote {len(rows)} POA&M rows")
-    print(f"Owner: {OWNER}")
-    if REPO:
-        print(f"Repository: {REPO}")
-    else:
-        print("Repository: org-level scan")
-
+    print(f"Enterprise: {ENTERPRISE}")
+    print(f"Organizations scanned: {org_count}")
     if source_errors:
         print("Source errors detected:")
         for err in source_errors:
