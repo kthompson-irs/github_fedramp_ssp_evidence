@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Pull GitHub code scanning alerts and repository security advisories and emit POA&M rows."""
+
 from __future__ import annotations
 
 import csv
@@ -22,12 +23,22 @@ OUTPUT_JSON = os.getenv("OUTPUT_JSON", "poam_github.json")
 if not TOKEN or not OWNER:
     sys.exit("GITHUB_TOKEN and GITHUB_OWNER are required.")
 
+# ✅ Ensure output directory exists
+def ensure_output_dir(path: str):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+ensure_output_dir(OUTPUT_CSV)
+ensure_output_dir(OUTPUT_JSON)
+
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": API_VERSION,
 })
+
 
 @dataclass
 class PoamRow:
@@ -53,11 +64,13 @@ def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, An
         resp = session.get(next_url, params=params)
         resp.raise_for_status()
         data = resp.json()
+
         if isinstance(data, list):
             for item in data:
                 yield item
         else:
             yield data
+
         next_url = None
         link = resp.headers.get("Link", "")
         for part in link.split(","):
@@ -100,9 +113,18 @@ def to_poam_rows() -> List[PoamRow]:
     today = _today()
 
     for alert in code_scanning_alerts():
-        severity = _map_severity(alert.get("rule", {}).get("security_severity_level") or alert.get("most_recent_instance", {}).get("severity"))
+        severity = _map_severity(
+            alert.get("rule", {}).get("security_severity_level")
+            or alert.get("most_recent_instance", {}).get("severity")
+        )
+
         path = (alert.get("most_recent_instance") or {}).get("location", {}).get("path", "repository")
-        title = alert.get("rule", {}).get("description") or alert.get("rule", {}).get("id") or "Code scanning alert"
+        title = (
+            alert.get("rule", {}).get("description")
+            or alert.get("rule", {}).get("id")
+            or "Code scanning alert"
+        )
+
         rows.append(PoamRow(
             poam_id=f"GHA-{alert.get('number', '')}",
             weakness_name=title[:120],
@@ -123,6 +145,7 @@ def to_poam_rows() -> List[PoamRow]:
     for adv in repo_security_advisories():
         gh_sev = (adv.get("severity") or "moderate").capitalize()
         risk = _map_severity(gh_sev)
+
         rows.append(PoamRow(
             poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
             weakness_name=adv.get("summary", "Repository security advisory")[:120],
@@ -145,11 +168,15 @@ def to_poam_rows() -> List[PoamRow]:
 
 def write_outputs(rows: List[PoamRow]) -> None:
     fields = list(asdict(rows[0]).keys()) if rows else list(asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys())
+
+    print(f"Writing CSV to: {OUTPUT_CSV}")
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             writer.writerow(asdict(row))
+
+    print(f"Writing JSON to: {OUTPUT_JSON}")
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump([asdict(r) for r in rows], f, indent=2)
 
@@ -157,7 +184,11 @@ def write_outputs(rows: List[PoamRow]) -> None:
 def main() -> int:
     rows = to_poam_rows()
     write_outputs(rows)
-    print(f"Wrote {len(rows)} POA&M rows to {OUTPUT_CSV} and {OUTPUT_JSON}")
+
+    print(f"Wrote {len(rows)} POA&M rows")
+    print(f"CSV: {OUTPUT_CSV}")
+    print(f"JSON: {OUTPUT_JSON}")
+
     return 0
 
 
