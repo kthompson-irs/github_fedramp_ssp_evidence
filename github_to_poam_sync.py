@@ -15,20 +15,30 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-API_VERSION = os.getenv("GH_API_VERSION", "2022-11-28")
-TOKEN = os.getenv("GH_TOKEN")
-ENTERPRISE = os.getenv("GH_ENTERPRISE")
-API_URL = os.getenv("GH_API_URL", "https://api.github.com")
+GH_TOKEN = os.getenv("GH_TOKEN")
+GH_ENTERPRISE_SLUG = os.getenv("GH_ENTERPRISE_SLUG")
+GH_API_URL = os.getenv("GH_API_URL", "https://api.github.com")
+GH_API_VERSION = os.getenv("GH_API_VERSION", "2022-11-28")
+
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
-OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
-OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
-OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", str(Path(OUTPUT_DIR) / "poam_summary.json"))
+OUTPUT_CSV = os.getenv("OUTPUT_CSV", f"{OUTPUT_DIR}/poam_github.csv")
+OUTPUT_JSON = os.getenv("OUTPUT_JSON", f"{OUTPUT_DIR}/poam_github.json")
+OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", f"{OUTPUT_DIR}/poam_summary.json")
 
-if not TOKEN or not ENTERPRISE:
-    sys.exit("GITHUB_TOKEN and GITHUB_ENTERPRISE are required.")
+if not GH_TOKEN or not GH_ENTERPRISE_SLUG:
+    sys.exit("GH_TOKEN and GH_ENTERPRISE_SLUG are required.")
 
-output_dir_path = Path(OUTPUT_DIR)
-output_dir_path.mkdir(parents=True, exist_ok=True)
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+session = requests.Session()
+session.headers.update(
+    {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GH_API_VERSION,
+        "User-Agent": "github-enterprise-to-poam-sync/1.0",
+    }
+)
 
 
 @dataclass
@@ -53,8 +63,8 @@ class GitHubEnterpriseClient:
     def __init__(self, token: str, api_url: str, api_version: str) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_version = api_version
-        self.rest_session = requests.Session()
-        self.rest_session.headers.update(
+        self.session = requests.Session()
+        self.session.headers.update(
             {
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
@@ -63,43 +73,13 @@ class GitHubEnterpriseClient:
             }
         )
 
-        self.graphql_session = requests.Session()
-        self.graphql_session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": api_version,
-                "User-Agent": "github-enterprise-to-poam-sync/1.0",
-            }
-        )
-
-    def rest_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        url = f"{self.api_url}/{path.lstrip('/')}"
-        backoff = 2
-
-        for _ in range(6):
-            resp = self.rest_session.request(method, url, params=params, timeout=30)
-            if resp.status_code not in (403, 429):
-                return resp
-
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                sleep_for = min(int(retry_after), 60)
-            else:
-                sleep_for = min(backoff, 60)
-                backoff *= 2
-            time.sleep(sleep_for)
-
-        return resp
-
-    def rest_paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
+    def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
         next_url = f"{self.api_url}/{path.lstrip('/')}"
         next_params = dict(params or {})
         next_params.setdefault("per_page", 100)
 
         while next_url:
-            resp = self.rest_session.get(next_url, params=next_params, timeout=30)
+            resp = self.session.get(next_url, params=next_params, timeout=30)
             if resp.status_code >= 400:
                 raise RuntimeError(f"GET {resp.url} failed: {resp.status_code} {resp.text[:600]}")
 
@@ -120,7 +100,11 @@ class GitHubEnterpriseClient:
 
     def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.api_url}/graphql"
-        resp = self.graphql_session.post(url, json={"query": query, "variables": variables}, timeout=30)
+        resp = self.session.post(
+            url,
+            json={"query": query, "variables": variables},
+            timeout=30,
+        )
         if resp.status_code >= 400:
             raise RuntimeError(f"GraphQL request failed: {resp.status_code} {resp.text[:600]}")
         payload = resp.json()
@@ -142,9 +126,14 @@ def _map_severity(sev: str) -> str:
     return "Low"
 
 
-def _safe_rest_list(client: GitHubEnterpriseClient, path: str, params: Optional[Dict[str, Any]], source_name: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _safe_rest_list(
+    client: GitHubEnterpriseClient,
+    path: str,
+    params: Optional[Dict[str, Any]],
+    source_name: str,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     try:
-        return list(client.rest_paginate(path, params=params)), None
+        return list(client.paginate(path, params=params)), None
     except RuntimeError as exc:
         msg = str(exc)
         if any(code in msg for code in ("404", "403")):
@@ -348,7 +337,7 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str], org_count: int)
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "scope": "enterprise",
-        "enterprise": ENTERPRISE,
+        "enterprise_slug": GH_ENTERPRISE_SLUG,
         "org_count": org_count,
         "total_count": len(rows),
         "high_count": len(high_rows),
@@ -366,12 +355,12 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str], org_count: int)
 
 
 def main() -> int:
-    client = GitHubEnterpriseClient(TOKEN, API_URL, API_VERSION)
-    rows, source_errors, org_count = collect_rows(client, ENTERPRISE)
+    client = GitHubEnterpriseClient(GH_TOKEN, GH_API_URL, GH_API_VERSION)
+    rows, source_errors, org_count = collect_rows(client, GH_ENTERPRISE_SLUG)
     write_outputs(rows, source_errors, org_count)
 
     print(f"Wrote {len(rows)} POA&M rows")
-    print(f"Enterprise: {ENTERPRISE}")
+    print(f"Enterprise slug: {GH_ENTERPRISE_SLUG}")
     print(f"Organizations scanned: {org_count}")
     if source_errors:
         print("Source errors detected:")
