@@ -1,14 +1,10 @@
-name: GitHub Security Alerts to POA&M
+name: GitHub Enterprise Security Alerts to POA&M
 
 on:
   workflow_dispatch:
     inputs:
-      github_owner:
-        description: "GitHub owner or organization login"
-        required: false
-        type: string
-      github_repo:
-        description: "Optional repository name; leave blank for org-level code scanning alerts"
+      github_enterprise:
+        description: "GitHub enterprise slug (for example: acme-enterprise)"
         required: false
         type: string
   schedule:
@@ -21,12 +17,12 @@ permissions:
 jobs:
   generate-poam:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
-      GITHUB_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
-      GITHUB_OWNER: ${{ github.event_name == 'workflow_dispatch' && inputs.github_owner || vars.GITHUB_OWNER }}
-      GITHUB_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.github_repo || vars.GITHUB_REPO }}
+      GITHUB_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
+      GITHUB_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.github_enterprise || vars.GITHUB_ENTERPRISE }}
+      GITHUB_API_URL: https://api.github.com
       GITHUB_API_VERSION: 2022-11-28
       OUTPUT_DIR: poam-output
       OUTPUT_CSV: poam-output/poam_github.csv
@@ -50,12 +46,12 @@ jobs:
       - name: Validate required inputs
         run: |
           if [ -z "$GITHUB_TOKEN" ]; then
-            echo "GH_GITHUB_TOKEN secret is missing." >&2
+            echo "GH_ENTERPRISE_TOKEN secret is missing." >&2
             exit 1
           fi
 
-          if [ -z "$GITHUB_OWNER" ]; then
-            echo "GITHUB_OWNER is missing. Set vars.GITHUB_OWNER or pass github_owner on workflow_dispatch." >&2
+          if [ -z "$GITHUB_ENTERPRISE" ]; then
+            echo "GITHUB_ENTERPRISE is missing. Set vars.GITHUB_ENTERPRISE or pass github_enterprise on workflow_dispatch." >&2
             exit 1
           fi
 
@@ -88,17 +84,18 @@ jobs:
               return;
             }
 
-            const owner = process.env.GITHUB_REPOSITORY.split('/')[0];
-            const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
-            const title = `High POA&M findings from GitHub security alerts (${summary.owner}${summary.repo ? '/' + summary.repo : ''})`;
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const title = `High POA&M findings from GitHub enterprise alerts (${summary.enterprise})`;
 
             const lines = [];
-            lines.push(`# High POA&M findings from GitHub security alerts`);
+            lines.push(`# High POA&M findings from GitHub enterprise alerts`);
             lines.push('');
-            lines.push(`- Owner: \`${summary.owner}\``);
-            lines.push(`- Repository: \`${summary.repo || 'org-level scan'}\``);
+            lines.push(`- Enterprise: \`${summary.enterprise}\``);
             lines.push(`- Total POA&M rows: ${summary.total_count}`);
             lines.push(`- HIGH rows: ${summary.high_count}`);
+            lines.push(`- Moderate rows: ${summary.moderate_count}`);
+            lines.push(`- Low rows: ${summary.low_count}`);
+            lines.push(`- Organization count scanned: ${summary.org_count}`);
             lines.push('');
 
             if ((summary.source_errors || []).length > 0) {
@@ -151,14 +148,9 @@ jobs:
         if: always()
         run: |
           {
-            echo "## GitHub POA&M output"
+            echo "## GitHub enterprise POA&M output"
             echo
-            echo "Owner: $GITHUB_OWNER"
-            if [ -n "$GITHUB_REPO" ]; then
-              echo "Repository: $GITHUB_REPO"
-            else
-              echo "Repository: org-level scan"
-            fi
+            echo "Enterprise: $GITHUB_ENTERPRISE"
             echo
             echo "Files created:"
             [ -f "$OUTPUT_CSV" ] && echo "- $OUTPUT_CSV"
