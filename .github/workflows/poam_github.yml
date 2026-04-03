@@ -27,8 +27,9 @@ jobs:
       GITHUB_OWNER: ${{ github.event_name == 'workflow_dispatch' && inputs.github_owner || vars.GITHUB_OWNER }}
       GITHUB_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.github_repo || vars.GITHUB_REPO }}
       GITHUB_API_VERSION: 2022-11-28
-      OUTPUT_CSV: poam_github.csv
-      OUTPUT_JSON: poam_github.json
+      OUTPUT_DIR: poam-output
+      OUTPUT_CSV: poam-output/poam_github.csv
+      OUTPUT_JSON: poam-output/poam_github.json
 
     steps:
       - name: Check out repository
@@ -55,13 +56,22 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare output directory
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+
       - name: Run POA&M generator
         run: |
           python ./poam_github.py
           echo "Workspace contents:"
           ls -lah
-          echo "POA&M outputs:"
-          ls -lah "$OUTPUT_CSV" "$OUTPUT_JSON"
+          echo "Output directory contents:"
+          ls -lah "$OUTPUT_DIR"
+
+      - name: Fail if outputs are missing
+        run: |
+          test -f "$OUTPUT_CSV"
+          test -f "$OUTPUT_JSON"
 
       - name: Summarize output
         if: always()
@@ -86,7 +96,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: poam-github-output
-          path: |
-            poam_github.csv
-            poam_github.json
+          path: poam-output/
           if-no-files-found: error
