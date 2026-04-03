@@ -15,10 +15,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
-TOKEN = os.getenv("GITHUB_TOKEN")
-ENTERPRISE = os.getenv("GITHUB_ENTERPRISE")
-API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com")
+API_VERSION = os.getenv("GH_API_VERSION", "2022-11-28")
+TOKEN = os.getenv("GH_TOKEN")
+ENTERPRISE = os.getenv("GH_ENTERPRISE")
+API_URL = os.getenv("GH_API_URL", "https://api.github.com")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
