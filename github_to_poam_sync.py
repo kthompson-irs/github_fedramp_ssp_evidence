@@ -10,7 +10,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
@@ -21,6 +21,7 @@ REPO = os.getenv("GITHUB_REPO") or ""
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
+OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", str(Path(OUTPUT_DIR) / "poam_summary.json"))
 
 if not TOKEN or not OWNER:
     sys.exit("GITHUB_TOKEN and GITHUB_OWNER are required.")
@@ -94,26 +95,58 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def code_scanning_alerts() -> Iterable[Dict[str, Any]]:
+def _safe_list_with_error(url: str, params: Optional[dict], source_name: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        return list(_paged_get(url, params=params)), None
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        body = exc.response.text[:400].strip() if exc.response is not None else str(exc)
+
+        if status in {403, 404}:
+            return [], f"{source_name} unavailable ({status}) for {url}: {body}"
+
+        raise
+
+
+def code_scanning_alerts() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if REPO:
         url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
     else:
         url = f"https://api.github.com/orgs/{OWNER}/code-scanning/alerts"
-    return _paged_get(url, params={"state": "open", "per_page": 100})
+
+    return _safe_list_with_error(
+        url,
+        params={"state": "open", "per_page": 100},
+        source_name="code scanning alerts",
+    )
 
 
-def repo_security_advisories() -> Iterable[Dict[str, Any]]:
+def repo_security_advisories() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     if not REPO:
-        return []
+        return [], None
+
     url = f"https://api.github.com/repos/{OWNER}/{REPO}/security-advisories"
-    return _paged_get(url, params={"state": "open", "per_page": 100})
+    return _safe_list_with_error(
+        url,
+        params={"state": "open", "per_page": 100},
+        source_name="repository security advisories",
+    )
 
 
-def to_poam_rows() -> List[PoamRow]:
+def to_poam_rows() -> Tuple[List[PoamRow], List[str]]:
     rows: List[PoamRow] = []
+    source_errors: List[str] = []
     today = _today()
 
-    for alert in code_scanning_alerts():
+    alerts, err = code_scanning_alerts()
+    if err:
+        source_errors.append(err)
+
+    advisories, err = repo_security_advisories()
+    if err:
+        source_errors.append(err)
+
+    for alert in alerts:
         severity = _map_severity(
             alert.get("rule", {}).get("security_severity_level")
             or alert.get("most_recent_instance", {}).get("severity")
@@ -145,7 +178,7 @@ def to_poam_rows() -> List[PoamRow]:
             )
         )
 
-    for adv in repo_security_advisories():
+    for adv in advisories:
         gh_sev = (adv.get("severity") or "moderate").capitalize()
         risk = _map_severity(gh_sev)
 
@@ -168,18 +201,21 @@ def to_poam_rows() -> List[PoamRow]:
             )
         )
 
-    return rows
+    return rows, source_errors
 
 
-def write_outputs(rows: List[PoamRow]) -> None:
+def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
     fields = list(asdict(rows[0]).keys()) if rows else list(
         asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
     )
 
     csv_path = Path(OUTPUT_CSV)
     json_path = Path(OUTPUT_JSON)
+    summary_path = Path(OUTPUT_SUMMARY)
+
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -190,13 +226,32 @@ def write_outputs(rows: List[PoamRow]) -> None:
     with json_path.open("w", encoding="utf-8") as f:
         json.dump([asdict(r) for r in rows], f, indent=2)
 
+    high_rows = [asdict(r) for r in rows if r.severity.lower() == "high"]
+    moderate_rows = [asdict(r) for r in rows if r.severity.lower() == "moderate"]
+    low_rows = [asdict(r) for r in rows if r.severity.lower() == "low"]
+
+    summary = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "owner": OWNER,
+        "repo": REPO,
+        "total_count": len(rows),
+        "high_count": len(high_rows),
+        "moderate_count": len(moderate_rows),
+        "low_count": len(low_rows),
+        "high_rows": high_rows,
+        "source_errors": source_errors,
+    }
+
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
     print(f"Wrote CSV: {csv_path.resolve()}")
     print(f"Wrote JSON: {json_path.resolve()}")
+    print(f"Wrote summary: {summary_path.resolve()}")
 
 
 def main() -> int:
-    rows = to_poam_rows()
-    write_outputs(rows)
+    rows, source_errors = to_poam_rows()
+    write_outputs(rows, source_errors)
 
     print(f"Wrote {len(rows)} POA&M rows")
     print(f"Owner: {OWNER}")
@@ -204,6 +259,11 @@ def main() -> int:
         print(f"Repository: {REPO}")
     else:
         print("Repository: org-level scan")
+
+    if source_errors:
+        print("Source errors detected:")
+        for err in source_errors:
+            print(f"- {err}")
 
     return 0
 
