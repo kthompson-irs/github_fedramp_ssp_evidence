@@ -7,8 +7,9 @@ import csv
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -16,28 +17,26 @@ import requests
 API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
 TOKEN = os.getenv("GITHUB_TOKEN")
 OWNER = os.getenv("GITHUB_OWNER")
-REPO = os.getenv("GITHUB_REPO")
-OUTPUT_CSV = os.getenv("OUTPUT_CSV", "poam_github.csv")
-OUTPUT_JSON = os.getenv("OUTPUT_JSON", "poam_github.json")
+REPO = os.getenv("GITHUB_REPO") or ""
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
+OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
+OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
 
 if not TOKEN or not OWNER:
     sys.exit("GITHUB_TOKEN and GITHUB_OWNER are required.")
 
-# ✅ Ensure output directory exists
-def ensure_output_dir(path: str):
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-ensure_output_dir(OUTPUT_CSV)
-ensure_output_dir(OUTPUT_JSON)
+output_dir_path = Path(OUTPUT_DIR)
+output_dir_path.mkdir(parents=True, exist_ok=True)
 
 session = requests.Session()
-session.headers.update({
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": API_VERSION,
-})
+session.headers.update(
+    {
+        "Authorization": f"Bearer {TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": API_VERSION,
+        "User-Agent": "github-to-poam-sync/1.0",
+    }
+)
 
 
 @dataclass
@@ -60,8 +59,10 @@ class PoamRow:
 
 def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, Any]]:
     next_url = url
+    next_params = dict(params or {})
+
     while next_url:
-        resp = session.get(next_url, params=params)
+        resp = session.get(next_url, params=next_params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
@@ -72,11 +73,11 @@ def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, An
             yield data
 
         next_url = None
+        next_params = {}
         link = resp.headers.get("Link", "")
         for part in link.split(","):
-            if 'rel="next"' in part:
+            if 'rel="next"' in part and "<" in part and ">" in part:
                 next_url = part[part.find("<") + 1 : part.find(">")]
-                params = None
                 break
 
 
@@ -125,60 +126,72 @@ def to_poam_rows() -> List[PoamRow]:
             or "Code scanning alert"
         )
 
-        rows.append(PoamRow(
-            poam_id=f"GHA-{alert.get('number', '')}",
-            weakness_name=title[:120],
-            weakness_description=f"GitHub code scanning alert on {path}. Alert: {title}.",
-            source_identifying_weakness="GitHub Code Scanning / CodeQL",
-            asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
-            severity=severity,
-            risk_rating=severity,
-            date_identified=today,
-            scheduled_completion_date=today,
-            actual_completion_date="",
-            status="Open",
-            owner="DevSecOps",
-            remediation_action="Review code scanning alert and remediate vulnerable code or dependency.",
-            source_url=alert.get("html_url", ""),
-        ))
+        rows.append(
+            PoamRow(
+                poam_id=f"GHA-{alert.get('number', '')}",
+                weakness_name=title[:120],
+                weakness_description=f"GitHub code scanning alert on {path}. Alert: {title}.",
+                source_identifying_weakness="GitHub Code Scanning / CodeQL",
+                asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
+                severity=severity,
+                risk_rating=severity,
+                date_identified=today,
+                scheduled_completion_date=today,
+                actual_completion_date="",
+                status="Open",
+                owner="DevSecOps",
+                remediation_action="Review code scanning alert and remediate vulnerable code or dependency.",
+                source_url=alert.get("html_url", ""),
+            )
+        )
 
     for adv in repo_security_advisories():
         gh_sev = (adv.get("severity") or "moderate").capitalize()
         risk = _map_severity(gh_sev)
 
-        rows.append(PoamRow(
-            poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
-            weakness_name=adv.get("summary", "Repository security advisory")[:120],
-            weakness_description=adv.get("description", "Open GitHub repository advisory."),
-            source_identifying_weakness="GitHub Repository Security Advisory",
-            asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
-            severity=gh_sev,
-            risk_rating=risk,
-            date_identified=today,
-            scheduled_completion_date=today,
-            actual_completion_date="",
-            status="Open",
-            owner="DevSecOps",
-            remediation_action="Patch dependency or apply available GitHub advisory fix.",
-            source_url=adv.get("html_url", ""),
-        ))
+        rows.append(
+            PoamRow(
+                poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
+                weakness_name=adv.get("summary", "Repository security advisory")[:120],
+                weakness_description=adv.get("description", "Open GitHub repository advisory."),
+                source_identifying_weakness="GitHub Repository Security Advisory",
+                asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
+                severity=gh_sev,
+                risk_rating=risk,
+                date_identified=today,
+                scheduled_completion_date=today,
+                actual_completion_date="",
+                status="Open",
+                owner="DevSecOps",
+                remediation_action="Patch dependency or apply available GitHub advisory fix.",
+                source_url=adv.get("html_url", ""),
+            )
+        )
 
     return rows
 
 
 def write_outputs(rows: List[PoamRow]) -> None:
-    fields = list(asdict(rows[0]).keys()) if rows else list(asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys())
+    fields = list(asdict(rows[0]).keys()) if rows else list(
+        asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
+    )
 
-    print(f"Writing CSV to: {OUTPUT_CSV}")
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+    csv_path = Path(OUTPUT_CSV)
+    json_path = Path(OUTPUT_JSON)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             writer.writerow(asdict(row))
 
-    print(f"Writing JSON to: {OUTPUT_JSON}")
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
+    with json_path.open("w", encoding="utf-8") as f:
         json.dump([asdict(r) for r in rows], f, indent=2)
+
+    print(f"Wrote CSV: {csv_path.resolve()}")
+    print(f"Wrote JSON: {json_path.resolve()}")
 
 
 def main() -> int:
@@ -186,8 +199,11 @@ def main() -> int:
     write_outputs(rows)
 
     print(f"Wrote {len(rows)} POA&M rows")
-    print(f"CSV: {OUTPUT_CSV}")
-    print(f"JSON: {OUTPUT_JSON}")
+    print(f"Owner: {OWNER}")
+    if REPO:
+        print(f"Repository: {REPO}")
+    else:
+        print("Repository: org-level scan")
 
     return 0
 
