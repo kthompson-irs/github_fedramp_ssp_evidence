@@ -14,20 +14,23 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-API_VERSION = os.getenv("GITHUB_API_VERSION", "2022-11-28")
-TOKEN = os.getenv("GITHUB_TOKEN")
-OWNER = os.getenv("GITHUB_OWNER")
-REPO = os.getenv("GITHUB_REPO") or ""
+# ✅ Support BOTH naming styles (GH_* preferred)
+TOKEN = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+OWNER = os.getenv("GH_OWNER") or os.getenv("GITHUB_OWNER")
+REPO = os.getenv("GH_REPO") or os.getenv("GITHUB_REPO") or ""
+
+API_VERSION = os.getenv("GH_API_VERSION") or os.getenv("GITHUB_API_VERSION", "2022-11-28")
+
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
 OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", str(Path(OUTPUT_DIR) / "poam_summary.json"))
 
 if not TOKEN or not OWNER:
-    sys.exit("GITHUB_TOKEN and GITHUB_OWNER are required.")
+    sys.exit("GH_TOKEN and GH_OWNER are required.")
 
-output_dir_path = Path(OUTPUT_DIR)
-output_dir_path.mkdir(parents=True, exist_ok=True)
+# Ensure output directory exists
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 session = requests.Session()
 session.headers.update(
@@ -35,7 +38,7 @@ session.headers.update(
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": API_VERSION,
-        "User-Agent": "github-to-poam-sync/1.0",
+        "User-Agent": "github-to-poam-sync/1.1",
     }
 )
 
@@ -64,8 +67,10 @@ def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, An
 
     while next_url:
         resp = session.get(next_url, params=next_params, timeout=30)
+
         if resp.status_code >= 400:
             raise RuntimeError(f"GET {resp.url} failed: {resp.status_code} {resp.text[:600]}")
+
         data = resp.json()
 
         if isinstance(data, list):
@@ -78,9 +83,16 @@ def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, An
         next_params = {}
         link = resp.headers.get("Link", "")
         for part in link.split(","):
-            if 'rel="next"' in part and "<" in part and ">" in part:
+            if 'rel="next"' in part and "<" in part:
                 next_url = part[part.find("<") + 1 : part.find(">")]
                 break
+
+
+def _safe_list(url: str, params: Optional[dict], label: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        return list(_paged_get(url, params)), None
+    except Exception as e:
+        return [], f"{label} unavailable: {e}"
 
 
 def _map_severity(sev: str) -> str:
@@ -96,143 +108,47 @@ def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-def _safe_rest_list(
-    client: "GitHubClient",
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    label: str = "resource",
-) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    try:
-        return list(client.paginate(path, params=params)), None
-    except RuntimeError as exc:
-        msg = str(exc)
-        if any(code in msg for code in (" 403 ", " 404 ", " 500 ")):
-            return [], f"{label} unavailable: {msg}"
-        raise
-
-
-class GitHubClient:
-    def __init__(self, token: str, api_version: str = API_VERSION):
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": api_version,
-                "User-Agent": "github-to-poam-sync/1.0",
-            }
-        )
-
-    def request(self, method: str, url: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        resp = self.session.request(method, url, params=params, timeout=30)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"{method} {resp.url} failed: {resp.status_code} {resp.text[:600]}")
-        return resp
-
-    def paginate(self, url: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Dict[str, Any]]:
-        next_url = url
-        next_params = dict(params or {})
-        while next_url:
-            resp = self.request("GET", next_url, params=next_params)
-            data = resp.json()
-
-            if isinstance(data, list):
-                for item in data:
-                    yield item
-            else:
-                yield data
-
-            next_url = None
-            next_params = {}
-            link = resp.headers.get("Link", "")
-            for part in link.split(","):
-                if 'rel="next"' in part and "<" in part and ">" in part:
-                    next_url = part[part.find("<") + 1 : part.find(">")]
-                    break
-
-
-def _org_code_scanning_alerts(client: GitHubClient) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    url = f"https://api.github.com/orgs/{OWNER}/code-scanning/alerts"
-    return _safe_rest_list(
-        client,
-        url,
-        params={"state": "open", "per_page": 100},
-        label="organization code scanning alerts",
-    )
-
-
-def _repo_code_scanning_alerts(client: GitHubClient) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not REPO:
-        return [], None
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
-    return _safe_rest_list(
-        client,
-        url,
-        params={"state": "open", "per_page": 100},
-        label="repository code scanning alerts",
-    )
-
-
-def _org_security_advisories(client: GitHubClient) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    url = f"https://api.github.com/orgs/{OWNER}/security-advisories"
-    return _safe_rest_list(
-        client,
-        url,
-        params={"state": "open", "per_page": 100},
-        label="organization security advisories",
-    )
-
-
-def _repo_security_advisories(client: GitHubClient) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not REPO:
-        return [], None
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/security-advisories"
-    return _safe_rest_list(
-        client,
-        url,
-        params={"state": "open", "per_page": 100},
-        label="repository security advisories",
-    )
-
-
-def collect_rows(client: GitHubClient) -> Tuple[List[PoamRow], List[str]]:
+def collect_rows() -> Tuple[List[PoamRow], List[str]]:
     rows: List[PoamRow] = []
-    source_errors: List[str] = []
+    errors: List[str] = []
     today = _today()
 
-    org_alerts, err = _org_code_scanning_alerts(client)
-    if err:
-        source_errors.append(err)
+    # Code scanning alerts
+    if REPO:
+        url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
+    else:
+        url = f"https://api.github.com/orgs/{OWNER}/code-scanning/alerts"
 
-    repo_alerts, err = _repo_code_scanning_alerts(client)
+    alerts, err = _safe_list(url, {"state": "open", "per_page": 100}, "code scanning alerts")
     if err:
-        source_errors.append(err)
+        errors.append(err)
 
-    org_advisories, err = _org_security_advisories(client)
-    if err:
-        source_errors.append(err)
+    # Security advisories (repo only)
+    advisories = []
+    if REPO:
+        url = f"https://api.github.com/repos/{OWNER}/{REPO}/security-advisories"
+        advisories, err = _safe_list(url, {"state": "open", "per_page": 100}, "security advisories")
+        if err:
+            errors.append(err)
 
-    repo_advisories, err = _repo_security_advisories(client)
-    if err:
-        source_errors.append(err)
-
-    for alert in org_alerts + repo_alerts:
+    for alert in alerts:
         severity = _map_severity(
             alert.get("rule", {}).get("security_severity_level")
             or alert.get("most_recent_instance", {}).get("severity")
         )
-        path = (alert.get("most_recent_instance") or {}).get("location", {}).get("path", "repository")
+
         title = (
             alert.get("rule", {}).get("description")
             or alert.get("rule", {}).get("id")
             or "Code scanning alert"
         )
+
         rows.append(
             PoamRow(
                 poam_id=f"GHA-{alert.get('number', '')}",
                 weakness_name=title[:120],
-                weakness_description=f"GitHub code scanning alert on {path}. Alert: {title}.",
-                source_identifying_weakness="GitHub Code Scanning / CodeQL",
+                weakness_description=title,
+                source_identifying_weakness="GitHub Code Scanning",
                 asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
                 severity=severity,
                 risk_rating=severity,
@@ -241,48 +157,45 @@ def collect_rows(client: GitHubClient) -> Tuple[List[PoamRow], List[str]]:
                 actual_completion_date="",
                 status="Open",
                 owner="DevSecOps",
-                remediation_action="Review code scanning alert and remediate vulnerable code or dependency.",
+                remediation_action="Fix vulnerability",
                 source_url=alert.get("html_url", ""),
             )
         )
 
-    for adv in org_advisories + repo_advisories:
-        gh_sev = (adv.get("severity") or "moderate").capitalize()
-        risk = _map_severity(gh_sev)
+    for adv in advisories:
+        sev = (adv.get("severity") or "moderate").capitalize()
         rows.append(
             PoamRow(
                 poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
-                weakness_name=adv.get("summary", "Repository security advisory")[:120],
-                weakness_description=adv.get("description", "Open GitHub repository advisory."),
-                source_identifying_weakness="GitHub Repository Security Advisory",
-                asset_identifier=f"{OWNER}/{REPO}" if REPO else OWNER,
-                severity=gh_sev,
-                risk_rating=risk,
+                weakness_name=adv.get("summary", "")[:120],
+                weakness_description=adv.get("description", ""),
+                source_identifying_weakness="GitHub Advisory",
+                asset_identifier=f"{OWNER}/{REPO}",
+                severity=sev,
+                risk_rating=_map_severity(sev),
                 date_identified=today,
                 scheduled_completion_date=today,
                 actual_completion_date="",
                 status="Open",
                 owner="DevSecOps",
-                remediation_action="Patch dependency or apply available GitHub advisory fix.",
+                remediation_action="Patch dependency",
                 source_url=adv.get("html_url", ""),
             )
         )
 
-    return rows, source_errors
+    return rows, errors
 
 
-def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
-    fields = list(asdict(rows[0]).keys()) if rows else list(
-        asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
-    )
-
+def write_outputs(rows: List[PoamRow], errors: List[str]) -> None:
     csv_path = Path(OUTPUT_CSV)
     json_path = Path(OUTPUT_JSON)
     summary_path = Path(OUTPUT_SUMMARY)
 
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fields = list(asdict(rows[0]).keys()) if rows else list(
+        asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
+    )
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -293,46 +206,21 @@ def write_outputs(rows: List[PoamRow], source_errors: List[str]) -> None:
     with json_path.open("w", encoding="utf-8") as f:
         json.dump([asdict(r) for r in rows], f, indent=2)
 
-    high_rows = [asdict(r) for r in rows if r.severity.lower() == "high"]
-    moderate_rows = [asdict(r) for r in rows if r.severity.lower() == "moderate"]
-    low_rows = [asdict(r) for r in rows if r.severity.lower() == "low"]
-
     summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "owner": OWNER,
-        "repo": REPO,
         "total_count": len(rows),
-        "high_count": len(high_rows),
-        "moderate_count": len(moderate_rows),
-        "low_count": len(low_rows),
-        "high_rows": high_rows,
-        "source_errors": source_errors,
+        "high_count": len([r for r in rows if r.severity.lower() == "high"]),
+        "source_errors": errors,
     }
 
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    print(f"Wrote CSV: {csv_path.resolve()}")
-    print(f"Wrote JSON: {json_path.resolve()}")
-    print(f"Wrote summary: {summary_path.resolve()}")
+    print(f"Wrote {len(rows)} rows")
+    print(f"Errors: {errors}")
 
 
 def main() -> int:
-    client = GitHubClient(TOKEN or "", API_VERSION)
-    rows, source_errors = collect_rows(client)
-    write_outputs(rows, source_errors)
-
-    print(f"Wrote {len(rows)} POA&M rows")
-    print(f"Owner: {OWNER}")
-    if REPO:
-        print(f"Repository: {REPO}")
-    else:
-        print("Repository: org-level scan")
-
-    if source_errors:
-        print("Source errors detected:")
-        for err in source_errors:
-            print(f"- {err}")
-
+    rows, errors = collect_rows()
+    write_outputs(rows, errors)
     return 0
 
 
