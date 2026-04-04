@@ -1,10 +1,14 @@
-name: GitHub Enterprise Security Alerts to POA&M
+name: GitHub Security Alerts to POA&M
 
 on:
   workflow_dispatch:
     inputs:
-      gh_enterprise_slug:
-        description: "GitHub enterprise slug (for example: rs-enterprise)"
+      gh_owner:
+        description: "GitHub owner or organization login"
+        required: false
+        type: string
+      gh_repo:
+        description: "Optional repository name; leave blank for org-level code scanning alerts"
         required: false
         type: string
   schedule:
@@ -17,12 +21,12 @@ permissions:
 jobs:
   generate-poam:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     env:
-      GH_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
-      GH_ENTERPRISE_SLUG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise_slug || vars.GH_ENTERPRISE_SLUG }}
-      GH_API_URL: https://api.github.com
+      GH_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
+      GH_OWNER: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_owner || vars.GH_OWNER }}
+      GH_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_repo || vars.GH_REPO }}
       GH_API_VERSION: 2022-11-28
       OUTPUT_DIR: poam-output
       OUTPUT_CSV: poam-output/poam_github.csv
@@ -43,19 +47,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests
 
-      - name: Validate inputs
+      - name: Validate required inputs
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "GH_ENTERPRISE_TOKEN secret is missing." >&2
+            echo "GH_GITHUB_TOKEN secret is missing." >&2
             exit 1
           fi
 
-          if [ -z "$GH_ENTERPRISE_SLUG" ]; then
-            echo "GH_ENTERPRISE_SLUG is missing. Set vars.GH_ENTERPRISE_SLUG or pass gh_enterprise_slug on workflow_dispatch." >&2
+          if [ -z "$GH_OWNER" ]; then
+            echo "GH_OWNER is missing. Set vars.GH_OWNER or pass gh_owner on workflow_dispatch." >&2
             exit 1
           fi
 
-      - name: Run generator
+      - name: Run POA&M generator
         run: |
           mkdir -p "$OUTPUT_DIR"
           python ./github_to_poam_sync.py
@@ -68,92 +72,133 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const summaryPath = process.env.OUTPUT_SUMMARY;
-
-            if (!fs.existsSync(summaryPath)) {
-              core.info("No summary found; skipping issue creation.");
+            const path = process.env.OUTPUT_SUMMARY;
+            if (!fs.existsSync(path)) {
+              core.info(`Summary file not found at ${path}; skipping issue creation.`);
               return;
             }
 
-            const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+            const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const highCount = Number(summary.high_count || 0);
 
-            if (!summary.high_count || summary.high_count === 0) {
-              core.info("No HIGH findings.");
+            if (highCount <= 0) {
+              core.info('No HIGH findings; skipping issue creation.');
               return;
             }
 
-            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-            const title = `High POA&M findings (${summary.enterprise_slug})`;
+            const owner = process.env.GITHUB_REPOSITORY.split('/')[0];
+            const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
+            const title = `High POA&M findings from GitHub security alerts (${summary.owner}${summary.repo ? '/' + summary.repo : ''})`;
 
-            const bodyLines = [
-              `# High POA&M findings`,
-              ``,
-              `- Enterprise slug: \`${summary.enterprise_slug}\``,
-              `- Total rows: ${summary.total_count}`,
-              `- HIGH rows: ${summary.high_count}`,
-              `- Moderate rows: ${summary.moderate_count}`,
-              `- Low rows: ${summary.low_count}`,
-              ``,
-              `## HIGH findings`,
-              ``
-            ];
+            const lines = [];
+            lines.push(`# High POA&M findings from GitHub security alerts`);
+            lines.push('');
+            lines.push(`- Owner: \`${summary.owner}\``);
+            lines.push(`- Repository: \`${summary.repo || 'org-level scan'}\``);
+            lines.push(`- Total POA&M rows: ${summary.total_count}`);
+            lines.push(`- HIGH rows: ${summary.high_count}`);
+            lines.push('');
+
+            if ((summary.source_errors || []).length > 0) {
+              lines.push('## Source errors');
+              lines.push('');
+              for (const err of summary.source_errors) {
+                lines.push(`- ${err}`);
+              }
+              lines.push('');
+            }
+
+            lines.push('## HIGH findings');
+            lines.push('');
 
             for (const row of (summary.high_rows || []).slice(0, 25)) {
-              bodyLines.push(
-                `- **${row.poam_id}** | ${row.weakness_name} | severity=${row.severity} | asset=${row.asset_identifier} | source=${row.source_url}`
-              );
+              lines.push(`- **${row.poam_id}** | ${row.weakness_name} | severity=${row.severity} | asset=${row.asset_identifier} | source=${row.source_url}`);
             }
 
             if ((summary.high_rows || []).length > 25) {
-              bodyLines.push('');
-              bodyLines.push(`_Showing first 25 of ${summary.high_rows.length} HIGH findings._`);
+              lines.push('');
+              lines.push(`_Showing first 25 of ${summary.high_rows.length} HIGH findings._`);
             }
 
-            const body = bodyLines.join('\n');
+            const body = lines.join('\n');
 
-            const existing = await github.rest.search.issuesAndPullRequests({
+            const search = await github.rest.search.issuesAndPullRequests({
               q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`
             });
 
-            if (existing.data.total_count > 0) {
+            if (search.data.total_count > 0) {
+              const existing = search.data.items[0];
               await github.rest.issues.createComment({
                 owner,
                 repo,
-                issue_number: existing.data.items[0].number,
+                issue_number: existing.number,
                 body
               });
+              core.notice(`Commented on existing issue #${existing.number}`);
             } else {
-              await github.rest.issues.create({
+              const created = await github.rest.issues.create({
                 owner,
                 repo,
                 title,
                 body
               });
+              core.notice(`Created issue #${created.data.number}`);
             }
 
-      - name: Upload artifacts
+      - name: Summarize output
+        if: always()
+        run: |
+          {
+            echo "## GitHub POA&M output"
+            echo
+            echo "Owner: $GH_OWNER"
+            if [ -n "$GH_REPO" ]; then
+              echo "Repository: $GH_REPO"
+            else
+              echo "Repository: org-level scan"
+            fi
+            echo
+            echo "Files created:"
+            [ -f "$OUTPUT_CSV" ] && echo "- $OUTPUT_CSV"
+            [ -f "$OUTPUT_JSON" ] && echo "- $OUTPUT_JSON"
+            [ -f "$OUTPUT_SUMMARY" ] && echo "- $OUTPUT_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload POA&M artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: poam-github-output
           path: poam-output/
+          if-no-files-found: error
 
-      - name: Fail conditions
+      - name: Fail when no alerts or source access is unavailable
+        if: always()
         run: |
           python - <<'PY'
-          import json, os, sys
+          import json
+          import os
+          import sys
           from pathlib import Path
 
-          p = Path(os.environ["OUTPUT_SUMMARY"])
-          if not p.exists():
-              sys.exit("Missing summary")
-
-          s = json.loads(p.read_text())
-          if s.get("source_errors"):
-              print("Source errors:", s["source_errors"], file=sys.stderr)
+          summary_path = Path(os.environ["OUTPUT_SUMMARY"])
+          if not summary_path.exists():
+              print(f"Summary file not found: {summary_path}", file=sys.stderr)
               sys.exit(1)
 
-          if s.get("total_count", 0) == 0:
-              sys.exit("No alerts found")
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          total = int(summary.get("total_count", 0))
+          source_errors = summary.get("source_errors", []) or []
 
-          print("Success:", s["total_count"])
+          if source_errors:
+              print("One or more sources could not be collected:", file=sys.stderr)
+              for err in source_errors:
+                  print(f"- {err}", file=sys.stderr)
+              sys.exit(1)
+
+          if total == 0:
+              print("No alerts were found; failing the workflow as requested.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Alerts found: {total}")
           PY
