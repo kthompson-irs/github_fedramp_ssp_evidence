@@ -17,13 +17,12 @@ Required env vars:
 Optional env vars:
 - GITHUB_API_URL: default https://api.github.com
 - GITHUB_API_VERSION: default 2022-11-28
-- GITHUB_ENTERPRISE: enterprise slug (enables optional enterprise audit stream checks)
+- GITHUB_ENTERPRISE: enterprise slug (retained for reporting only)
 - GITHUB_DAYS: default 90; how many days of audit log to collect
 
 Notes:
 - The organization token must belong to an organization owner.
 - Organization audit log access and SAML SSO authorization listing require owner privileges.
-- Enterprise audit log streaming configuration checks are only attempted when GITHUB_ENTERPRISE is provided.
 """
 from __future__ import annotations
 
@@ -108,16 +107,11 @@ class GitHubClient:
 
         return last_resp if last_resp is not None else resp
 
-    def _format_auth_hint(self, resp: requests.Response) -> str:
+    def _auth_hint(self, resp: requests.Response) -> str:
         sso = resp.headers.get("X-GitHub-SSO")
-        parts = []
         if sso:
-            parts.append(f"X-GitHub-SSO={sso}")
-        if resp.headers.get("X-RateLimit-Remaining") is not None:
-            parts.append(
-                f"rate_limit_remaining={resp.headers.get('X-RateLimit-Remaining')}"
-            )
-        return f" ({'; '.join(parts)})" if parts else ""
+            return f" X-GitHub-SSO={sso}"
+        return ""
 
     def get_json(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.request("GET", path_or_url, params=params)
@@ -125,22 +119,22 @@ class GitHubClient:
         if resp.status_code == 404:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 404 Not Found. "
-                f"Verify the exact org login, token visibility, and API host. "
-                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
+                f"Verify the exact org login and that the token can see it. "
+                f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
             )
 
         if resp.status_code == 401:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 401 Unauthorized. "
-                f"Check the token and whether it is valid for the target GitHub host. "
-                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
+                f"Check the token and whether it is valid for GitHub.com. "
+                f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
             )
 
         if resp.status_code == 403:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 403 Forbidden. "
-                f"Check token permissions and whether the token is authorized for SSO. "
-                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
+                f"Check token permissions and SSO authorization. "
+                f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
             )
 
         if resp.status_code >= 400:
@@ -150,12 +144,7 @@ class GitHubClient:
 
         return resp.json()
 
-    def paginate(
-        self,
-        path_or_url: str,
-        *,
-        params: Optional[Dict[str, Any]] = None,
-    ) -> Iterable[Any]:
+    def paginate(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Iterable[Any]:
         params = dict(params or {})
         params.setdefault("per_page", 100)
         page = 1
@@ -169,21 +158,21 @@ class GitHubClient:
             if resp.status_code == 404:
                 raise RuntimeError(
                     f"GET {path_or_url} page {page} failed: 404 Not Found. "
-                    f"Verify the exact org login and API host. "
-                    f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
+                    f"Verify the exact org login and that the token can see it. "
+                    f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
                 )
 
             if resp.status_code == 401:
                 raise RuntimeError(
                     f"GET {path_or_url} page {page} failed: 401 Unauthorized. "
-                    f"Check token validity and host. Response: {resp.text[:400]}"
+                    f"Check token validity and host. Response: {resp.text[:400]}{self._auth_hint(resp)}"
                 )
 
             if resp.status_code == 403:
                 raise RuntimeError(
                     f"GET {path_or_url} page {page} failed: 403 Forbidden. "
                     f"Check token permissions and SSO authorization. "
-                    f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
+                    f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
                 )
 
             if resp.status_code >= 400:
@@ -209,21 +198,21 @@ class GitHubClient:
             self._root_metadata = self.get_json("/")
         return self._root_metadata
 
-    def org_url(self, org: str) -> str:
-        root = self.root_metadata()
-        template = root.get("organization_url", "/orgs/{org}")
+    def current_user(self) -> Dict[str, Any]:
+        return self.get_json(self.root_metadata().get("current_user_url", "/user"))
+
+    def visible_org_logins(self) -> List[str]:
+        url = self.root_metadata().get("user_organizations_url", "/user/orgs")
+        orgs: List[str] = []
         try:
-            return template.format(org=org)
+            for item in self.paginate(url):
+                if isinstance(item, dict):
+                    login = item.get("login")
+                    if login:
+                        orgs.append(login)
         except Exception:
-            return f"/orgs/{org}"
-
-    def current_user_url(self) -> str:
-        root = self.root_metadata()
-        return root.get("current_user_url", "/user")
-
-    def user_orgs_url(self) -> str:
-        root = self.root_metadata()
-        return root.get("user_organizations_url", "/user/orgs")
+            return []
+        return orgs
 
 
 def iso_date_days_ago(days: int) -> str:
@@ -280,17 +269,6 @@ def build_manifest(output_dir: Path, files: List[Path]) -> None:
     (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def visible_org_logins(client: GitHubClient) -> List[str]:
-    try:
-        return [
-            item.get("login", "")
-            for item in client.paginate(client.user_orgs_url())
-            if isinstance(item, dict)
-        ]
-    except Exception:
-        return []
-
-
 def collect(cfg: GitHubConfig) -> Path:
     client = GitHubClient(cfg)
 
@@ -300,31 +278,24 @@ def collect(cfg: GitHubConfig) -> Path:
 
     files: List[Path] = []
 
-    if cfg.enterprise and "api.github.com" in cfg.api_url:
-        print(
-            f"WARNING: GITHUB_ENTERPRISE is set to '{cfg.enterprise}' but GITHUB_API_URL "
-            f"is still '{cfg.api_url}'. If you are targeting GitHub Enterprise Server, "
-            f"point GITHUB_API_URL at that host's API root.",
-            file=sys.stderr,
-        )
-
-    root = client.root_metadata()
-    org_url = client.org_url(cfg.org)
+    # Preflight auth check.
+    me = client.current_user()
+    if isinstance(me, dict) and me.get("login"):
+        print(f"Authenticated as: {me.get('login')}", file=sys.stderr)
 
     try:
-        org = client.get_json(org_url)
+        org = client.get_json(f"/orgs/{cfg.org}")
     except RuntimeError as exc:
         if "404 Not Found" in str(exc):
-            visible_orgs = visible_org_logins(client)
+            visible_orgs = client.visible_org_logins()
             if visible_orgs:
                 raise RuntimeError(
                     f"Organization '{cfg.org}' was not found or is not visible to this token. "
-                    f"Visible orgs for the current token: {', '.join(sorted(set(visible_orgs)))}. "
-                    f"Check the org login and whether the token is authorized for that org."
+                    f"Visible orgs for this token: {', '.join(sorted(set(visible_orgs)))}."
                 ) from exc
             raise RuntimeError(
                 f"Organization '{cfg.org}' was not found or is not visible to this token. "
-                f"Check the org login, the token's access, and the API host."
+                f"Check the org login and whether the token has access to that organization."
             ) from exc
         raise
 
@@ -395,8 +366,6 @@ def collect(cfg: GitHubConfig) -> Path:
         "enterprise": cfg.enterprise,
         "days_collected": cfg.days,
         "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "root_organization_url_template": root.get("organization_url"),
-        "root_user_organizations_url_template": root.get("user_organizations_url"),
         "org_two_factor_requirement_enabled": org.get("two_factor_requirement_enabled"),
         "org_has_saml_sso_authorizations_endpoint": True,
         "credential_authorization_count": len(cred_auths) if isinstance(cred_auths, list) else None,
@@ -415,7 +384,7 @@ def collect(cfg: GitHubConfig) -> Path:
 
     if isinstance(audit_events, list) and audit_events and "error" in audit_events[0]:
         summary["potential_gaps"].append(
-            "Could not retrieve audit log; verify owner permissions, token scope, and API host."
+            "Could not retrieve audit log; verify owner permissions, token scope, and org access."
         )
 
     auth_related = [
