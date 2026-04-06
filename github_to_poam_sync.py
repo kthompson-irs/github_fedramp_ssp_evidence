@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert GitHub audit log findings into POA&M rows and export CSV, JSON, and XLSX."""
+"""Pull GitHub code scanning alerts and repository security advisories and emit POA&M rows."""
 
 from __future__ import annotations
 
@@ -8,26 +8,36 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+import requests
 
-GH_OWNER = os.getenv("GH_OWNER") or os.getenv("GITHUB_OWNER") or ""
+GH_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+GH_OWNER = os.getenv("GH_OWNER") or os.getenv("GITHUB_OWNER")
 GH_REPO = os.getenv("GH_REPO") or os.getenv("GITHUB_REPO") or ""
+GH_API_VERSION = os.getenv("GH_API_VERSION") or os.getenv("GITHUB_API_VERSION", "2022-11-28")
 
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "poam-output"))
-AUDIT_FINDINGS_JSON = Path(os.getenv("AUDIT_FINDINGS_JSON", "findings.json"))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "poam-output")
+OUTPUT_CSV = os.getenv("OUTPUT_CSV", str(Path(OUTPUT_DIR) / "poam_github.csv"))
+OUTPUT_JSON = os.getenv("OUTPUT_JSON", str(Path(OUTPUT_DIR) / "poam_github.json"))
+OUTPUT_SUMMARY = os.getenv("OUTPUT_SUMMARY", str(Path(OUTPUT_DIR) / "poam_summary.json"))
 
-OUTPUT_CSV = Path(os.getenv("OUTPUT_CSV", str(OUTPUT_DIR / "poam_github.csv")))
-OUTPUT_JSON = Path(os.getenv("OUTPUT_JSON", str(OUTPUT_DIR / "poam_github.json")))
-OUTPUT_SUMMARY = Path(os.getenv("OUTPUT_SUMMARY", str(OUTPUT_DIR / "poam_summary.json")))
-OUTPUT_XLSX = Path(os.getenv("OUTPUT_XLSX", str(OUTPUT_DIR / "fedramp_poam_populated.xlsx")))
+if not GH_TOKEN or not GH_OWNER:
+    sys.exit("GH_TOKEN and GH_OWNER are required.")
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+session = requests.Session()
+session.headers.update(
+    {
+        "Authorization": f"Bearer {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GH_API_VERSION,
+        "User-Agent": "github-to-poam-sync/1.2",
+    }
+)
 
 
 @dataclass
@@ -46,24 +56,42 @@ class PoamRow:
     owner: str
     remediation_action: str
     source_url: str
-    finding_category: str = ""
-    finding_actor: str = ""
-    finding_action: str = ""
-    finding_timestamp: str = ""
-    finding_reason: str = ""
-    finding_raw_json: str = ""
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+def _paged_get(url: str, params: Optional[dict] = None) -> Iterable[Dict[str, Any]]:
+    next_url = url
+    next_params = dict(params or {})
+
+    while next_url:
+        resp = session.get(next_url, params=next_params, timeout=30)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"GET {resp.url} failed: {resp.status_code} {resp.text[:600]}")
+        data = resp.json()
+
+        if isinstance(data, list):
+            for item in data:
+                yield item
+        else:
+            yield data
+
+        next_url = None
+        next_params = {}
+        link = resp.headers.get("Link", "")
+        for part in link.split(","):
+            if 'rel="next"' in part and "<" in part and ">" in part:
+                next_url = part[part.find("<") + 1 : part.find(">")]
+                break
 
 
-def _plus_30_days() -> str:
-    return (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
+def _safe_list(url: str, params: Optional[dict], label: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    try:
+        return list(_paged_get(url, params)), None
+    except Exception as e:
+        return [], f"{label} unavailable: {e}"
 
 
 def _map_severity(sev: str) -> str:
-    s = (sev or "").strip().lower()
+    s = (sev or "").lower()
     if s in {"critical", "high"}:
         return "High"
     if s in {"medium", "moderate"}:
@@ -71,268 +99,143 @@ def _map_severity(sev: str) -> str:
     return "Low"
 
 
-def _coerce_timestamp(value: Any) -> str:
-    if not value:
-        return ""
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        if ts > 1_000_000_000_000:
-            ts = ts / 1000.0
-        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-    if isinstance(value, str):
-        return value
-    return str(value)
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
-def _format_asset_identifier() -> str:
-    if GH_OWNER and GH_REPO:
-        return f"{GH_OWNER}/{GH_REPO}"
-    if GH_OWNER:
-        return GH_OWNER
-    return "GitHub Audit Log"
-
-
-def _load_findings(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not path.exists():
-        return [], f"Finding file not found: {path}"
-
-    try:
-        if path.suffix.lower() == ".jsonl":
-            findings: List[Dict[str, Any]] = []
-            with path.open("r", encoding="utf-8") as f:
-                for line_no, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        findings.append(json.loads(line))
-                    except json.JSONDecodeError as exc:
-                        return [], f"Invalid JSON on line {line_no} of {path}: {exc}"
-            return findings, None
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data, None
-        if isinstance(data, dict):
-            if "findings" in data and isinstance(data["findings"], list):
-                return data["findings"], None
-            return [data], None
-
-        return [], f"Unsupported findings file format: {path}"
-    except Exception as exc:
-        return [], f"Failed to load findings from {path}: {exc}"
-
-
-def _remediation_for_category(category: str, action: str, reason: str) -> str:
-    c = (category or "").strip().lower()
-    a = (action or "").strip().lower()
-    r = (reason or "").strip().lower()
-
-    if c == "token_exposure" or "token" in r or "pat" in r:
-        return "Investigate the exposed credential, rotate or revoke the token, and review repository and audit log activity."
-    if c == "auth_failure" or ("failed" in r and any(x in r for x in ("token", "pat", "oauth", "ssh"))):
-        return "Review repeated authentication failures, confirm whether they are expected, and investigate for brute force or misuse."
-    if c == "privilege_or_security_change" or any(
-        x in a for x in ("branch_protection", "visibility", "remove_required_reviews", "disable_secret_scanning", "disable_code_scanning")
-    ):
-        return "Review the security or privilege change, verify authorization, and restore required protections if needed."
-    if c == "suspicious_content":
-        return "Validate the event for malicious or policy-bypass activity and preserve evidence for investigation."
-    if c == "internal_network_activity":
-        return "Confirm the source context for the internal network activity and validate whether the event is expected."
-    return "Review the audit log finding and implement the required remediation or compensating control."
-
-
-def _weakness_name(category: str, action: str) -> str:
-    cat = (category or "general_review").replace("_", " ").title()
-    act = action or "audit event"
-    return f"GitHub audit log finding: {cat} ({act})"[:120]
-
-
-def _weakness_description(finding: Dict[str, Any]) -> str:
-    parts = []
-    if finding.get("timestamp"):
-        parts.append(f"Timestamp: {finding.get('timestamp')}")
-    if finding.get("actor"):
-        parts.append(f"Actor: {finding.get('actor')}")
-    if finding.get("action"):
-        parts.append(f"Action: {finding.get('action')}")
-    if finding.get("category"):
-        parts.append(f"Category: {finding.get('category')}")
-    if finding.get("reason"):
-        parts.append(f"Reason: {finding.get('reason')}")
-    return " | ".join(parts) if parts else "GitHub audit log finding."
-
-
-def findings_to_poam_rows(findings: List[Dict[str, Any]]) -> List[PoamRow]:
+def collect_rows() -> Tuple[List[PoamRow], List[str]]:
     rows: List[PoamRow] = []
+    errors: List[str] = []
     today = _today()
-    completion = _plus_30_days()
-    asset_identifier = _format_asset_identifier()
 
-    for idx, finding in enumerate(findings, 1):
-        severity = _map_severity(str(finding.get("severity", "Low")))
-        category = str(finding.get("category", "") or "general_review")
-        actor = str(finding.get("actor", "") or "")
-        action = str(finding.get("action", "") or "")
-        timestamp = _coerce_timestamp(finding.get("timestamp", ""))
-        reason = str(finding.get("reason", "") or "")
-        raw_json = json.dumps(finding.get("raw", finding), ensure_ascii=False, default=str)
+    if GH_REPO:
+        alerts_url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/code-scanning/alerts"
+        advisories_url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/security-advisories"
+    else:
+        alerts_url = f"https://api.github.com/orgs/{GH_OWNER}/code-scanning/alerts"
+        advisories_url = None
+
+    alerts, err = _safe_list(alerts_url, {"state": "open", "per_page": 100}, "code scanning alerts")
+    if err:
+        errors.append(err)
+
+    advisories: List[Dict[str, Any]] = []
+    if advisories_url:
+        advisories, err = _safe_list(advisories_url, {"state": "open", "per_page": 100}, "security advisories")
+        if err:
+            errors.append(err)
+
+    for alert in alerts:
+        severity = _map_severity(
+            alert.get("rule", {}).get("security_severity_level")
+            or alert.get("most_recent_instance", {}).get("severity")
+        )
+
+        title = (
+            alert.get("rule", {}).get("description")
+            or alert.get("rule", {}).get("id")
+            or "Code scanning alert"
+        )
 
         rows.append(
             PoamRow(
-                poam_id=f"AUD-{idx:05d}",
-                weakness_name=_weakness_name(category, action),
-                weakness_description=_weakness_description(finding),
-                source_identifying_weakness="GitHub Audit Log / Automated Detection",
-                asset_identifier=asset_identifier,
+                poam_id=f"GHA-{alert.get('number', '')}",
+                weakness_name=title[:120],
+                weakness_description=title,
+                source_identifying_weakness="GitHub Code Scanning",
+                asset_identifier=f"{GH_OWNER}/{GH_REPO}" if GH_REPO else GH_OWNER,
                 severity=severity,
                 risk_rating=severity,
                 date_identified=today,
-                scheduled_completion_date=completion,
+                scheduled_completion_date=today,
                 actual_completion_date="",
                 status="Open",
-                owner="Security Operations",
-                remediation_action=_remediation_for_category(category, action, reason),
-                source_url="",
-                finding_category=category,
-                finding_actor=actor,
-                finding_action=action,
-                finding_timestamp=timestamp,
-                finding_reason=reason,
-                finding_raw_json=raw_json,
+                owner="DevSecOps",
+                remediation_action="Fix vulnerability",
+                source_url=alert.get("html_url", ""),
             )
         )
 
-    return rows
+    for adv in advisories:
+        sev = (adv.get("severity") or "moderate").capitalize()
+        rows.append(
+            PoamRow(
+                poam_id=f"GHA-ADV-{adv.get('ghsa_id', '')}",
+                weakness_name=adv.get("summary", "")[:120],
+                weakness_description=adv.get("description", ""),
+                source_identifying_weakness="GitHub Advisory",
+                asset_identifier=f"{GH_OWNER}/{GH_REPO}" if GH_REPO else GH_OWNER,
+                severity=sev,
+                risk_rating=_map_severity(sev),
+                date_identified=today,
+                scheduled_completion_date=today,
+                actual_completion_date="",
+                status="Open",
+                owner="DevSecOps",
+                remediation_action="Patch dependency",
+                source_url=adv.get("html_url", ""),
+            )
+        )
+
+    return rows, errors
 
 
-def _write_csv(path: Path, rows: List[PoamRow]) -> None:
+def write_outputs(rows: List[PoamRow], errors: List[str]) -> None:
+    csv_path = Path(OUTPUT_CSV)
+    json_path = Path(OUTPUT_JSON)
+    summary_path = Path(OUTPUT_SUMMARY)
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+
     fields = list(asdict(rows[0]).keys()) if rows else list(
         asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
     )
-    with path.open("w", newline="", encoding="utf-8") as f:
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
             writer.writerow(asdict(row))
 
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump([asdict(r) for r in rows], f, indent=2)
 
-def _write_json(path: Path, rows: List[PoamRow]) -> None:
-    path.write_text(json.dumps([asdict(r) for r in rows], indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _write_summary(path: Path, rows: List[PoamRow], source_errors: List[str], findings_file: Path) -> None:
     summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
         "owner": GH_OWNER,
         "repo": GH_REPO,
-        "findings_file": str(findings_file),
         "total_count": len(rows),
-        "high_count": sum(1 for r in rows if r.severity == "High"),
-        "moderate_count": sum(1 for r in rows if r.severity == "Moderate"),
-        "low_count": sum(1 for r in rows if r.severity == "Low"),
-        "source_errors": source_errors,
-        "high_rows": [asdict(r) for r in rows if r.severity == "High"],
+        "high_count": len([r for r in rows if r.severity.lower() == "high"]),
+        "source_errors": errors,
     }
-    path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    high_rows = [asdict(r) for r in rows if r.severity.lower() == "high"]
+    summary["high_rows"] = high_rows
 
-def _style_sheet(ws) -> None:
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9E2F3")
-    border = Border(bottom=thin)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    widths = {
-        1: 12, 2: 28, 3: 44, 4: 28, 5: 22, 6: 10, 7: 10, 8: 14, 9: 18, 10: 18,
-        11: 12, 12: 18, 13: 38, 14: 36, 15: 20, 16: 20, 17: 20, 18: 24, 19: 48, 20: 40
-    }
-    for idx, width in widths.items():
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-
-def _write_workbook(path: Path, rows: List[PoamRow], source_errors: List[str], findings_file: Path) -> None:
-    wb = Workbook()
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
-    ws_poam = wb.create_sheet("POAM")
-
-    ws_summary["A1"] = "FedRAMP POA&M Export Summary"
-    ws_summary["A1"].font = Font(bold=True, size=14)
-    ws_summary["A3"] = "Generated At"
-    ws_summary["B3"] = datetime.now(timezone.utc).isoformat()
-    ws_summary["A4"] = "Owner"
-    ws_summary["B4"] = GH_OWNER
-    ws_summary["A5"] = "Repository"
-    ws_summary["B5"] = GH_REPO
-    ws_summary["A6"] = "Findings File"
-    ws_summary["B6"] = str(findings_file)
-    ws_summary["A8"] = "Total Findings"
-    ws_summary["B8"] = len(rows)
-    ws_summary["A9"] = "High Findings"
-    ws_summary["B9"] = sum(1 for r in rows if r.severity == "High")
-    ws_summary["A10"] = "Moderate Findings"
-    ws_summary["B10"] = sum(1 for r in rows if r.severity == "Moderate")
-    ws_summary["A11"] = "Low Findings"
-    ws_summary["B11"] = sum(1 for r in rows if r.severity == "Low")
-    ws_summary["A13"] = "Source Errors"
-
-    if source_errors:
-        for i, err in enumerate(source_errors, 14):
-            ws_summary[f"A{i}"] = f"- {err}"
-    else:
-        ws_summary["A14"] = "(none)"
-
-    ws_summary.column_dimensions["A"].width = 22
-    ws_summary.column_dimensions["B"].width = 80
-
-    headers = [
-        "poam_id", "weakness_name", "weakness_description", "source_identifying_weakness", "asset_identifier",
-        "severity", "risk_rating", "date_identified", "scheduled_completion_date", "actual_completion_date",
-        "status", "owner", "remediation_action", "source_url", "finding_category", "finding_actor",
-        "finding_action", "finding_timestamp", "finding_reason", "finding_raw_json"
-    ]
-    ws_poam.append(headers)
-    for row in rows:
-        d = asdict(row)
-        ws_poam.append([d.get(h, "") for h in headers])
-
-    _style_sheet(ws_poam)
-    _style_sheet(ws_summary)
-    wb.save(path)
+    print(f"Wrote CSV: {csv_path.resolve()}")
+    print(f"Wrote JSON: {json_path.resolve()}")
+    print(f"Wrote summary: {summary_path.resolve()}")
 
 
 def main() -> int:
-    findings, err = _load_findings(AUDIT_FINDINGS_JSON)
-    source_errors: List[str] = []
-    if err:
-        source_errors.append(err)
+    rows, errors = collect_rows()
+    write_outputs(rows, errors)
 
-    rows = findings_to_poam_rows(findings) if findings else []
+    print(f"Wrote {len(rows)} POA&M rows")
+    print(f"Owner: {GH_OWNER}")
+    if GH_REPO:
+        print(f"Repository: {GH_REPO}")
+    else:
+        print("Repository: org-level scan")
 
-    _write_csv(OUTPUT_CSV, rows)
-    _write_json(OUTPUT_JSON, rows)
-    _write_summary(OUTPUT_SUMMARY, rows, source_errors, AUDIT_FINDINGS_JSON)
-    _write_workbook(OUTPUT_XLSX, rows, source_errors, AUDIT_FINDINGS_JSON)
+    if errors:
+        print("Source errors detected:")
+        for err in errors:
+            print(f"- {err}")
 
-    print(f"Wrote {len(rows)} POA&M rows from {AUDIT_FINDINGS_JSON}")
-    print(f"CSV: {OUTPUT_CSV}")
-    print(f"JSON: {OUTPUT_JSON}")
-    print(f"Workbook: {OUTPUT_XLSX}")
-    if source_errors:
-        print("Source errors:")
-        for e in source_errors:
-            print(f"- {e}")
     return 0
 
 
