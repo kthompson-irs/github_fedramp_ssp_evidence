@@ -1,21 +1,37 @@
-name: GitHub Audit Log Risk Scan
+name: GitHub Security Alerts to POA&M
 
 on:
   workflow_dispatch:
+    inputs:
+      gh_owner:
+        description: "GitHub owner or organization login"
+        required: false
+        type: string
+      gh_repo:
+        description: "Optional repository name; leave blank for org-level code scanning alerts"
+        required: false
+        type: string
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 5 * * 1"
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
-  scan:
+  generate-poam:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
-      ORG_NAME: ${{ vars.ORG_NAME }}
-      GH_TOKEN: ${{ secrets.GH_ORG_AUDIT_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
+      GH_OWNER: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_owner || vars.GH_OWNER }}
+      GH_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_repo || vars.GH_REPO }}
+      GH_API_VERSION: 2022-11-28
+      OUTPUT_DIR: poam-output
+      OUTPUT_CSV: poam-output/poam_github.csv
+      OUTPUT_JSON: poam-output/poam_github.json
+      OUTPUT_SUMMARY: poam-output/poam_summary.json
 
     steps:
       - name: Check out repository
@@ -26,84 +42,163 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch GitHub audit log
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Validate required inputs
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_GITHUB_TOKEN secret is missing." >&2
+            exit 1
+          fi
+
+          if [ -z "$GH_OWNER" ]; then
+            echo "GH_OWNER is missing. Set vars.GH_OWNER or pass gh_owner on workflow_dispatch." >&2
+            exit 1
+          fi
+
+      - name: Run POA&M generator
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          python ./github_to_poam_sync.py
+          echo "Output directory contents:"
+          ls -lah "$OUTPUT_DIR"
+
+      - name: Create issue for HIGH findings
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = process.env.OUTPUT_SUMMARY;
+            if (!fs.existsSync(path)) {
+              core.info(`Summary file not found at ${path}; skipping issue creation.`);
+              return;
+            }
+
+            const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
+            const highCount = Number(summary.high_count || 0);
+
+            if (highCount <= 0) {
+              core.info('No HIGH findings; skipping issue creation.');
+              return;
+            }
+
+            const owner = process.env.GITHUB_REPOSITORY.split('/')[0];
+            const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
+            const title = `High POA&M findings from GitHub security alerts (${summary.owner}${summary.repo ? '/' + summary.repo : ''})`;
+
+            const lines = [];
+            lines.push(`# High POA&M findings from GitHub security alerts`);
+            lines.push('');
+            lines.push(`- Owner: \`${summary.owner}\``);
+            lines.push(`- Repository: \`${summary.repo || 'org-level scan'}\``);
+            lines.push(`- Total POA&M rows: ${summary.total_count}`);
+            lines.push(`- HIGH rows: ${summary.high_count}`);
+            lines.push('');
+
+            if ((summary.source_errors || []).length > 0) {
+              lines.push('## Source errors');
+              lines.push('');
+              for (const err of summary.source_errors) {
+                lines.push(`- ${err}`);
+              }
+              lines.push('');
+            }
+
+            lines.push('## HIGH findings');
+            lines.push('');
+
+            for (const row of (summary.high_rows || []).slice(0, 25)) {
+              lines.push(`- **${row.poam_id}** | ${row.weakness_name} | severity=${row.severity} | asset=${row.asset_identifier} | source=${row.source_url}`);
+            }
+
+            if ((summary.high_rows || []).length > 25) {
+              lines.push('');
+              lines.push(`_Showing first 25 of ${summary.high_rows.length} HIGH findings._`);
+            }
+
+            const body = lines.join('\n');
+
+            const search = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`
+            });
+
+            if (search.data.total_count > 0) {
+              const existing = search.data.items[0];
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body
+              });
+              core.notice(`Commented on existing issue #${existing.number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body
+              });
+              core.notice(`Created issue #${created.data.number}`);
+            }
+
+      - name: Summarize output
+        if: always()
+        run: |
+          {
+            echo "## GitHub POA&M output"
+            echo
+            echo "Owner: $GH_OWNER"
+            if [ -n "$GH_REPO" ]; then
+              echo "Repository: $GH_REPO"
+            else
+              echo "Repository: org-level scan"
+            fi
+            echo
+            echo "Files created:"
+            [ -f "$OUTPUT_CSV" ] && echo "- $OUTPUT_CSV"
+            [ -f "$OUTPUT_JSON" ] && echo "- $OUTPUT_JSON"
+            [ -f "$OUTPUT_SUMMARY" ] && echo "- $OUTPUT_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload POA&M artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poam-github-output
+          path: poam-output/
+          if-no-files-found: error
+
+      - name: Fail when no alerts or source access is unavailable
+        if: always()
         run: |
           python - <<'PY'
           import json
           import os
-          from urllib import request, error
+          import sys
+          from pathlib import Path
 
-          org = os.environ["ORG_NAME"].strip()
-          token = os.environ["GH_TOKEN"].strip()
+          summary_path = Path(os.environ["OUTPUT_SUMMARY"])
+          if not summary_path.exists():
+              print(f"Summary file not found: {summary_path}", file=sys.stderr)
+              sys.exit(1)
 
-          if not org:
-              raise SystemExit("ORG_NAME is empty. Set it as a repository variable.")
-          if not token:
-              raise SystemExit("GH_ORG_AUDIT_TOKEN is empty. Set it as a repository secret.")
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          total = int(summary.get("total_count", 0))
+          source_errors = summary.get("source_errors", []) or []
 
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "X-GitHub-Api-Version": "2022-11-28",
-              "User-Agent": "github-audit-log-parser",
-          }
+          if source_errors:
+              print("One or more sources could not be collected:", file=sys.stderr)
+              for err in source_errors:
+                  print(f"- {err}", file=sys.stderr)
+              sys.exit(1)
 
-          next_url = f"https://api.github.com/orgs/{org}/audit-log?per_page=100"
-          total = 0
+          if total == 0:
+              print("No alerts were found; failing the workflow as requested.", file=sys.stderr)
+              sys.exit(1)
 
-          with open("audit.log.jsonl", "w", encoding="utf-8") as out:
-              while next_url:
-                  req = request.Request(next_url, headers=headers)
-                  try:
-                      with request.urlopen(req) as resp:
-                          payload = json.load(resp)
-                          if not isinstance(payload, list):
-                              payload = [payload]
-
-                          for event in payload:
-                              out.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-                              total += 1
-
-                          link = resp.headers.get("Link", "")
-                  except error.HTTPError as e:
-                      body = e.read().decode("utf-8", errors="replace")
-                      raise SystemExit(f"Failed to fetch audit log: {e.code} {e.reason}\n{body}") from e
-
-                  next_url = None
-                  for part in link.split(","):
-                      part = part.strip()
-                      if 'rel="next"' in part and "<" in part and ">" in part:
-                          next_url = part[part.find("<") + 1 : part.find(">")]
-                          break
-
-          print(f"Fetched {total} audit log events")
+          print(f"Alerts found: {total}")
           PY
-
-      - name: Run parser
-        run: |
-          python github_audit_log_parser.py --input audit.log.jsonl --output findings.json | tee parser.log
-
-      - name: Summarize results
-        if: always()
-        run: |
-          {
-            echo "## GitHub audit log scan"
-            echo
-            echo "Repository: $GITHUB_REPOSITORY"
-            echo "Organization: $ORG_NAME"
-            echo
-            echo "### Parser output"
-            echo '```'
-            sed -n '1,200p' parser.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload audit log and findings
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: github-audit-log-findings
-          path: |
-            audit.log.jsonl
-            findings.json
-            parser.log
