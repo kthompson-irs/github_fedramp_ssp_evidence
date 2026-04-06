@@ -64,47 +64,121 @@ class GitHubClient:
             }
         )
 
-    def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
         url = self.cfg.api_url.rstrip("/") + "/" + path.lstrip("/")
         backoff = 2
-        for attempt in range(6):
-            resp = self.session.request(method, url, params=params, timeout=self.cfg.timeout)
+        last_resp: Optional[requests.Response] = None
+
+        for _attempt in range(6):
+            resp = self.session.request(
+                method,
+                url,
+                params=params,
+                timeout=self.cfg.timeout,
+            )
+            last_resp = resp
+
             if resp.status_code not in (403, 429):
                 return resp
+
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
-                sleep_for = min(int(retry_after), 60)
+                try:
+                    sleep_for = min(int(retry_after), 60)
+                except ValueError:
+                    sleep_for = min(backoff, 60)
+                    backoff *= 2
             else:
                 sleep_for = min(backoff, 60)
                 backoff *= 2
+
             time.sleep(sleep_for)
-        return resp
+
+        return last_resp if last_resp is not None else resp
 
     def get_json(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.request("GET", path, params=params)
+
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"GET {path} failed: 404 Not Found. "
+                f"Check the org name '{self.cfg.org}' and the API URL '{self.cfg.api_url}'. "
+                f"Response: {resp.text[:400]}"
+            )
+
+        if resp.status_code == 401:
+            raise RuntimeError(
+                f"GET {path} failed: 401 Unauthorized. "
+                f"Check the token and whether it is valid for the target GitHub host. "
+                f"Response: {resp.text[:400]}"
+            )
+
+        if resp.status_code == 403:
+            raise RuntimeError(
+                f"GET {path} failed: 403 Forbidden. "
+                f"Check token permissions and whether the token is authorized for SSO. "
+                f"Response: {resp.text[:400]}"
+            )
+
         if resp.status_code >= 400:
-            raise RuntimeError(f"GET {path} failed: {resp.status_code} {resp.text[:400]}")
+            raise RuntimeError(
+                f"GET {path} failed: {resp.status_code} {resp.text[:400]}"
+            )
+
         return resp.json()
 
     def paginate(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Iterable[Any]:
         params = dict(params or {})
         params.setdefault("per_page", 100)
         page = 1
+
         while True:
             page_params = dict(params)
             page_params["page"] = page
+
             resp = self.request("GET", path, params=page_params)
+
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"GET {path} page {page} failed: 404 Not Found. "
+                    f"Check the org name '{self.cfg.org}' and the API URL '{self.cfg.api_url}'. "
+                    f"Response: {resp.text[:400]}"
+                )
+
+            if resp.status_code == 401:
+                raise RuntimeError(
+                    f"GET {path} page {page} failed: 401 Unauthorized. "
+                    f"Check token validity and host. Response: {resp.text[:400]}"
+                )
+
+            if resp.status_code == 403:
+                raise RuntimeError(
+                    f"GET {path} page {page} failed: 403 Forbidden. "
+                    f"Check token permissions and SSO authorization. Response: {resp.text[:400]}"
+                )
+
             if resp.status_code >= 400:
-                raise RuntimeError(f"GET {path} page {page} failed: {resp.status_code} {resp.text[:400]}")
+                raise RuntimeError(
+                    f"GET {path} page {page} failed: {resp.status_code} {resp.text[:400]}"
+                )
+
             data = resp.json()
             if isinstance(data, list):
                 for item in data:
                     yield item
             else:
                 yield data
+
             link = resp.headers.get("Link", "")
             if 'rel="next"' not in link:
                 break
+
             page += 1
 
 
@@ -115,9 +189,16 @@ def iso_date_days_ago(days: int) -> str:
 def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
     created_at = event.get("created_at")
     if isinstance(created_at, (int, float)):
-        created_iso = dt.datetime.fromtimestamp(created_at / 1000.0, tz=dt.timezone.utc).isoformat()
+        created_iso = dt.datetime.fromtimestamp(
+            created_at / 1000.0, tz=dt.timezone.utc
+        ).isoformat()
     else:
         created_iso = created_at
+
+    country_code = event.get("actor_location.country_code")
+    if country_code is None and isinstance(event.get("actor_location"), dict):
+        country_code = event["actor_location"].get("country_code")
+
     return {
         "created_at": created_iso,
         "action": event.get("action"),
@@ -128,7 +209,7 @@ def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "team": event.get("team"),
         "visibility": event.get("visibility"),
         "ip": event.get("ip_address") or event.get("client_ip_address"),
-        "country_code": event.get("actor_location.country_code"),
+        "country_code": country_code,
         "raw": event,
     }
 
@@ -157,18 +238,26 @@ def build_manifest(output_dir: Path, files: List[Path]) -> None:
 
 def collect(cfg: GitHubConfig) -> Path:
     client = GitHubClient(cfg)
+
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = Path.cwd() / f"github_ia208_evidence_{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     files: List[Path] = []
 
+    if cfg.enterprise and "api.github.com" in cfg.api_url:
+        print(
+            f"WARNING: GITHUB_ENTERPRISE is set to '{cfg.enterprise}' but GITHUB_API_URL "
+            f"is still '{cfg.api_url}'. If you are targeting GitHub Enterprise Server, "
+            f"point GITHUB_API_URL at that host's API root.",
+            file=sys.stderr,
+        )
+
     org = client.get_json(f"/orgs/{cfg.org}")
     org_path = output_dir / "org.json"
     write_json(org_path, org)
     files.append(org_path)
 
-    # Organization SAML credential authorizations are useful evidence when SAML SSO is enabled.
     try:
         cred_auths = list(client.paginate(f"/orgs/{cfg.org}/credential-authorizations"))
     except RuntimeError as exc:
@@ -185,13 +274,18 @@ def collect(cfg: GitHubConfig) -> Path:
     write_json(inst_path, installations)
     files.append(inst_path)
 
-    # Collect audit log for the last N days. Use include=all so both web and git events are available.
     created_filter = f"created:>={iso_date_days_ago(cfg.days)}"
     audit_events: List[Dict[str, Any]] = []
+
     try:
         for event in client.paginate(
             f"/orgs/{cfg.org}/audit-log",
-            params={"include": "all", "phrase": created_filter, "per_page": 100, "order": "desc"},
+            params={
+                "include": "all",
+                "phrase": created_filter,
+                "per_page": 100,
+                "order": "desc",
+            },
         ):
             audit_events.append(normalize_audit_event(event))
     except RuntimeError as exc:
@@ -206,13 +300,25 @@ def collect(cfg: GitHubConfig) -> Path:
 
     audit_csv = output_dir / "audit_log.csv"
     rows_for_csv = [e for e in audit_events if "error" not in e]
-    csv_fields = ["created_at", "action", "actor", "user", "org", "repo", "team", "visibility", "ip", "country_code"]
+    csv_fields = [
+        "created_at",
+        "action",
+        "actor",
+        "user",
+        "org",
+        "repo",
+        "team",
+        "visibility",
+        "ip",
+        "country_code",
+    ]
     write_csv(audit_csv, rows_for_csv, csv_fields)
     files.append(audit_csv)
 
     summary: Dict[str, Any] = {
         "org": cfg.org,
         "api_url": cfg.api_url,
+        "enterprise": cfg.enterprise,
         "days_collected": cfg.days,
         "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "org_two_factor_requirement_enabled": org.get("two_factor_requirement_enabled"),
@@ -222,14 +328,20 @@ def collect(cfg: GitHubConfig) -> Path:
         "audit_event_count": len(rows_for_csv),
         "potential_gaps": [],
     }
+
     if not org.get("two_factor_requirement_enabled"):
         summary["potential_gaps"].append("Organization 2FA requirement is not enabled.")
-    if isinstance(cred_auths, dict) and cred_auths.get("error"):
-        summary["potential_gaps"].append("Could not retrieve credential authorizations; verify org owner permissions and SAML SSO configuration.")
-    if isinstance(audit_events, list) and audit_events and "error" in audit_events[0]:
-        summary["potential_gaps"].append("Could not retrieve audit log; verify owner permissions and token scope.")
 
-    # Filter for auth-related events useful for IA-2(8).
+    if isinstance(cred_auths, dict) and cred_auths.get("error"):
+        summary["potential_gaps"].append(
+            "Could not retrieve credential authorizations; verify org owner permissions and SAML SSO configuration."
+        )
+
+    if isinstance(audit_events, list) and audit_events and "error" in audit_events[0]:
+        summary["potential_gaps"].append(
+            "Could not retrieve audit log; verify owner permissions, token scope, and API host."
+        )
+
     auth_related = [
         e for e in rows_for_csv
         if any(
@@ -250,19 +362,36 @@ def collect(cfg: GitHubConfig) -> Path:
 def main() -> int:
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     org = os.environ.get("GITHUB_ORG", "").strip()
+
     if not token or not org:
         print("Set GITHUB_TOKEN and GITHUB_ORG before running.", file=sys.stderr)
+        return 2
+
+    api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com").strip()
+    api_version = os.environ.get("GITHUB_API_VERSION", "2022-11-28").strip()
+    enterprise = os.environ.get("GITHUB_ENTERPRISE") or None
+
+    try:
+        days = int(os.environ.get("GITHUB_DAYS", "90"))
+    except ValueError:
+        print("GITHUB_DAYS must be an integer.", file=sys.stderr)
         return 2
 
     cfg = GitHubConfig(
         token=token,
         org=org,
-        api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com").strip(),
-        api_version=os.environ.get("GITHUB_API_VERSION", "2022-11-28").strip(),
-        enterprise=os.environ.get("GITHUB_ENTERPRISE") or None,
-        days=int(os.environ.get("GITHUB_DAYS", "90")),
+        api_url=api_url,
+        api_version=api_version,
+        enterprise=enterprise,
+        days=days,
     )
-    output_dir = collect(cfg)
+
+    try:
+        output_dir = collect(cfg)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     print(str(output_dir))
     return 0
 
