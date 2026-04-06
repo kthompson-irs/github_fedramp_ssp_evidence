@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import requests
 
@@ -63,15 +63,21 @@ class GitHubClient:
                 "User-Agent": "fedramp-ia208-evidence-collector/1.0",
             }
         )
+        self._root_metadata: Optional[Dict[str, Any]] = None
+
+    def _url(self, path_or_url: str) -> str:
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            return path_or_url
+        return self.cfg.api_url.rstrip("/") + "/" + path_or_url.lstrip("/")
 
     def request(
         self,
         method: str,
-        path: str,
+        path_or_url: str,
         *,
         params: Optional[Dict[str, Any]] = None,
     ) -> requests.Response:
-        url = self.cfg.api_url.rstrip("/") + "/" + path.lstrip("/")
+        url = self._url(path_or_url)
         backoff = 2
         last_resp: Optional[requests.Response] = None
 
@@ -102,38 +108,48 @@ class GitHubClient:
 
         return last_resp if last_resp is not None else resp
 
-    def get_json(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
-        resp = self.request("GET", path, params=params)
+    def get_json(
+        self,
+        path_or_url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        resp = self.request("GET", path_or_url, params=params)
 
         if resp.status_code == 404:
             raise RuntimeError(
-                f"GET {path} failed: 404 Not Found. "
-                f"Check the org name '{self.cfg.org}' and the API URL '{self.cfg.api_url}'. "
+                f"GET {path_or_url} failed: 404 Not Found. "
+                f"Verify the exact org login, token visibility, and API host. "
                 f"Response: {resp.text[:400]}"
             )
 
         if resp.status_code == 401:
             raise RuntimeError(
-                f"GET {path} failed: 401 Unauthorized. "
+                f"GET {path_or_url} failed: 401 Unauthorized. "
                 f"Check the token and whether it is valid for the target GitHub host. "
                 f"Response: {resp.text[:400]}"
             )
 
         if resp.status_code == 403:
             raise RuntimeError(
-                f"GET {path} failed: 403 Forbidden. "
+                f"GET {path_or_url} failed: 403 Forbidden. "
                 f"Check token permissions and whether the token is authorized for SSO. "
                 f"Response: {resp.text[:400]}"
             )
 
         if resp.status_code >= 400:
             raise RuntimeError(
-                f"GET {path} failed: {resp.status_code} {resp.text[:400]}"
+                f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}"
             )
 
         return resp.json()
 
-    def paginate(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Iterable[Any]:
+    def paginate(
+        self,
+        path_or_url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Iterable[Any]:
         params = dict(params or {})
         params.setdefault("per_page", 100)
         page = 1
@@ -142,30 +158,31 @@ class GitHubClient:
             page_params = dict(params)
             page_params["page"] = page
 
-            resp = self.request("GET", path, params=page_params)
+            resp = self.request("GET", path_or_url, params=page_params)
 
             if resp.status_code == 404:
                 raise RuntimeError(
-                    f"GET {path} page {page} failed: 404 Not Found. "
-                    f"Check the org name '{self.cfg.org}' and the API URL '{self.cfg.api_url}'. "
+                    f"GET {path_or_url} page {page} failed: 404 Not Found. "
+                    f"Verify the exact org login and API host. "
                     f"Response: {resp.text[:400]}"
                 )
 
             if resp.status_code == 401:
                 raise RuntimeError(
-                    f"GET {path} page {page} failed: 401 Unauthorized. "
+                    f"GET {path_or_url} page {page} failed: 401 Unauthorized. "
                     f"Check token validity and host. Response: {resp.text[:400]}"
                 )
 
             if resp.status_code == 403:
                 raise RuntimeError(
-                    f"GET {path} page {page} failed: 403 Forbidden. "
-                    f"Check token permissions and SSO authorization. Response: {resp.text[:400]}"
+                    f"GET {path_or_url} page {page} failed: 403 Forbidden. "
+                    f"Check token permissions and SSO authorization. "
+                    f"Response: {resp.text[:400]}"
                 )
 
             if resp.status_code >= 400:
                 raise RuntimeError(
-                    f"GET {path} page {page} failed: {resp.status_code} {resp.text[:400]}"
+                    f"GET {path_or_url} page {page} failed: {resp.status_code} {resp.text[:400]}"
                 )
 
             data = resp.json()
@@ -180,6 +197,27 @@ class GitHubClient:
                 break
 
             page += 1
+
+    def root_metadata(self) -> Dict[str, Any]:
+        if self._root_metadata is None:
+            self._root_metadata = self.get_json("/")
+        return self._root_metadata
+
+    def org_url(self, org: str) -> str:
+        root = self.root_metadata()
+        template = root.get("organization_url", "/orgs/{org}")
+        try:
+            return template.format(org=org)
+        except Exception:
+            return f"/orgs/{org}"
+
+    def user_orgs_url(self) -> str:
+        root = self.root_metadata()
+        return root.get("user_organizations_url", "/user/orgs")
+
+    def current_user_url(self) -> str:
+        root = self.root_metadata()
+        return root.get("current_user_url", "/user")
 
 
 def iso_date_days_ago(days: int) -> str:
@@ -236,6 +274,17 @@ def build_manifest(output_dir: Path, files: List[Path]) -> None:
     (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def visible_org_logins(client: GitHubClient) -> List[str]:
+    try:
+        return [
+            item.get("login", "")
+            for item in client.paginate(client.user_orgs_url())
+            if isinstance(item, dict)
+        ]
+    except Exception:
+        return []
+
+
 def collect(cfg: GitHubConfig) -> Path:
     client = GitHubClient(cfg)
 
@@ -253,7 +302,26 @@ def collect(cfg: GitHubConfig) -> Path:
             file=sys.stderr,
         )
 
-    org = client.get_json(f"/orgs/{cfg.org}")
+    root = client.root_metadata()
+    org_url = client.org_url(cfg.org)
+
+    try:
+        org = client.get_json(org_url)
+    except RuntimeError as exc:
+        if "404 Not Found" in str(exc):
+            visible_orgs = visible_org_logins(client)
+            if visible_orgs:
+                raise RuntimeError(
+                    f"Organization '{cfg.org}' was not found or is not visible to this token. "
+                    f"Visible orgs for the current token: {', '.join(sorted(set(visible_orgs)))}. "
+                    f"Check the org login and whether the token is authorized for that org."
+                ) from exc
+            raise RuntimeError(
+                f"Organization '{cfg.org}' was not found or is not visible to this token. "
+                f"Check the org login, the token's access, and the API host."
+            ) from exc
+        raise
+
     org_path = output_dir / "org.json"
     write_json(org_path, org)
     files.append(org_path)
@@ -321,6 +389,8 @@ def collect(cfg: GitHubConfig) -> Path:
         "enterprise": cfg.enterprise,
         "days_collected": cfg.days,
         "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "root_organization_url_template": root.get("organization_url"),
+        "root_user_organizations_url_template": root.get("user_organizations_url"),
         "org_two_factor_requirement_enabled": org.get("two_factor_requirement_enabled"),
         "org_has_saml_sso_authorizations_endpoint": True,
         "credential_authorization_count": len(cred_auths) if isinstance(cred_auths, list) else None,
