@@ -9,11 +9,15 @@ permissions:
 jobs:
   generate-poam:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       GH_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
       GH_OWNER: ${{ vars.GH_OWNER }}
       GH_REPO: ${{ vars.GH_REPO }}
+      GH_ENTERPRISE_SLUG: ${{ vars.GH_ENTERPRISE_SLUG }}
+      GH_API_URL: https://api.github.com
+      GH_API_VERSION: 2022-11-28
       OUTPUT_DIR: poam-output
       OUTPUT_CSV: poam-output/poam_github.csv
       OUTPUT_JSON: poam-output/poam_github.json
@@ -22,47 +26,62 @@ jobs:
       AUDIT_FINDINGS_JSON: findings.json
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
-          pip install openpyxl
+          python -m pip install --upgrade pip
+          python -m pip install openpyxl
 
       - name: Verify findings file exists
         run: |
           if [ ! -f "$AUDIT_FINDINGS_JSON" ]; then
-            echo "Missing findings.json — audit parser must run first"
+            echo "Missing findings file: $AUDIT_FINDINGS_JSON" >&2
             exit 1
           fi
 
       - name: Run POA&M export
         run: |
           mkdir -p "$OUTPUT_DIR"
-          python github_to_poam_sync.py
-          echo "Output directory:"
+          python ./github_to_poam_sync.py
+          echo "Output directory contents:"
           ls -lah "$OUTPUT_DIR"
 
-      - name: Summarize output (safe)
+      - name: Summarize output
         if: always()
         run: |
           {
             echo "## FedRAMP POA&M output"
             echo
             echo "Owner: $GH_OWNER"
-            echo "Repository: ${GH_REPO:-org-level}"
+            if [ -n "$GH_REPO" ]; then
+              echo "Repository: $GH_REPO"
+            else
+              echo "Repository: org-level scan"
+            fi
+            if [ -n "$GH_ENTERPRISE_SLUG" ]; then
+              echo "Enterprise slug: $GH_ENTERPRISE_SLUG"
+            fi
             echo
-            echo "Files:"
-            for f in "$OUTPUT_CSV" "$OUTPUT_JSON" "$OUTPUT_SUMMARY" "$OUTPUT_XLSX"; do
-              if [ -f "$f" ]; then
-                echo "✔ $f"
-              else
-                echo "✖ $f (missing)"
-              fi
-            done
+            echo "Files created:"
+            if [ -f "$OUTPUT_CSV" ]; then
+              echo "- $OUTPUT_CSV"
+            fi
+            if [ -f "$OUTPUT_JSON" ]; then
+              echo "- $OUTPUT_JSON"
+            fi
+            if [ -f "$OUTPUT_SUMMARY" ]; then
+              echo "- $OUTPUT_SUMMARY"
+            fi
+            if [ -f "$OUTPUT_XLSX" ]; then
+              echo "- $OUTPUT_XLSX"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
@@ -71,3 +90,4 @@ jobs:
         with:
           name: poam-output
           path: poam-output/
+          if-no-files-found: error
