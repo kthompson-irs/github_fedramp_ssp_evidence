@@ -1,204 +1,366 @@
-name: GitHub Security Alerts to POA&M
+#!/usr/bin/env python3
+"""Parse GitHub audit logs and emit a reduced set of security-relevant findings."""
 
-on:
-  workflow_dispatch:
-    inputs:
-      gh_owner:
-        description: "GitHub owner or organization login"
-        required: false
-        type: string
-      gh_repo:
-        description: "Optional repository name; leave blank for org-level code scanning alerts"
-        required: false
-        type: string
-  schedule:
-    - cron: "0 5 * * 1"
+from __future__ import annotations
 
-permissions:
-  contents: read
-  issues: write
+import argparse
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
-jobs:
-  generate-poam:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
 
-    env:
-      GH_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
-      GH_OWNER: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_owner || vars.GH_OWNER }}
-      GH_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_repo || vars.GH_REPO }}
-      GH_API_VERSION: 2022-11-28
-      OUTPUT_DIR: poam-output
-      OUTPUT_CSV: poam-output/poam_github.csv
-      OUTPUT_JSON: poam-output/poam_github.json
-      OUTPUT_SUMMARY: poam-output/poam_summary.json
+HIGH_RISK_ACTIONS = {
+    "oauth_authorization.create",
+    "oauth_authorization.destroy",
+    "personal_access_token.create",
+    "personal_access_token.update",
+    "personal_access_token.delete",
+    "personal_access_token.grant",
+    "github_app.authorized",
+    "github_app.revoked",
+    "org.add_member",
+    "org.remove_member",
+    "team.add_member",
+    "team.remove_member",
+    "repo.config.disable_branch_protection",
+    "repo.config.remove_required_reviews",
+    "repo.config.disable_secret_scanning",
+    "repo.config.disable_code_scanning",
+    "repo.config.change_visibility",
+    "repo.config.disable_forking",
+    "repo.config.allow_actions_disabled",
+}
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+ROUTINE_ACTION_PREFIXES = (
+    "repo.download_zip",
+    "workflows.",
+    "issue_comment.",
+    "pull_request.",
+    "pull_request_review.",
+    "pull_request_review_comment.",
+)
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+SUSPICIOUS_PHRASES = (
+    "impossible travel",
+    "unusual location",
+    "policy bypass",
+    "token exposure",
+    "token leak",
+    "secret leak",
+    "credential leak",
+    "exfiltration",
+    "password spray",
+    "credential stuffing",
+    "unauthorized access",
+    "suspicious oauth",
+    "branch protection disabled",
+    "required reviews removed",
+    "secret scanning disabled",
+    "code scanning disabled",
+)
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests
+AUTH_FAILURE_TERMS = (
+    "token",
+    "pat",
+    "oauth",
+    "ssh",
+    "password",
+    "credential",
+)
 
-      - name: Validate required inputs
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "GH_GITHUB_TOKEN secret is missing." >&2
-            exit 1
-          fi
+SENSITIVE_KEY_HINTS = (
+    "token",
+    "secret",
+    "oauth",
+    "credential",
+    "authorization",
+    "auth",
+    "password",
+    "bearer",
+    "pat",
+    "key",
+)
 
-          if [ -z "$GH_OWNER" ]; then
-            echo "GH_OWNER is missing. Set vars.GH_OWNER or pass gh_owner on workflow_dispatch." >&2
-            exit 1
-          fi
+SEARCH_KEY_HINTS = (
+    "action",
+    "event",
+    "operation",
+    "type",
+    "actor",
+    "user",
+    "login",
+    "repo",
+    "team",
+    "message",
+    "reason",
+    "description",
+    "details",
+    "note",
+    "comment",
+    "ip",
+    "ip_address",
+    "source_ip",
+    "client_ip",
+    "location",
+    "country_code",
+    "visibility",
+    "status",
+    "state",
+    "programmatic_access_type",
+)
 
-      - name: Run POA&M generator
-        run: |
-          mkdir -p "$OUTPUT_DIR"
-          python ./github_to_poam_sync.py
-          echo "Output directory contents:"
-          ls -lah "$OUTPUT_DIR"
+TOKEN_REGEXES = [
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgho_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bghs_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bghu_[A-Za-z0-9_]{20,}\b"),
+]
 
-      - name: Create issue for HIGH findings
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = process.env.OUTPUT_SUMMARY;
-            if (!fs.existsSync(path)) {
-              core.info(`Summary file not found at ${path}; skipping issue creation.`);
-              return;
-            }
+PRIVATE_IP_PREFIXES = (
+    "10.",
+    "192.168.",
+    "127.",
+)
 
-            const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
-            const highCount = Number(summary.high_count || 0);
 
-            if (highCount <= 0) {
-              core.info('No HIGH findings; skipping issue creation.');
-              return;
-            }
+@dataclass
+class Finding:
+    severity: str
+    category: str
+    timestamp: str
+    actor: str
+    action: str
+    reason: str
+    raw: dict[str, Any]
 
-            const owner = process.env.GITHUB_REPOSITORY.split('/')[0];
-            const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
-            const title = `High POA&M findings from GitHub security alerts (${summary.owner}${summary.repo ? '/' + summary.repo : ''})`;
 
-            const lines = [];
-            lines.push(`# High POA&M findings from GitHub security alerts`);
-            lines.push('');
-            lines.push(`- Owner: \`${summary.owner}\``);
-            lines.push(`- Repository: \`${summary.repo || 'org-level scan'}\``);
-            lines.push(`- Total POA&M rows: ${summary.total_count}`);
-            lines.push(`- HIGH rows: ${summary.high_count}`);
-            lines.push('');
+def _normalize_ts(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1_000_000_000_000:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    if isinstance(value, str):
+        return value
+    return str(value)
 
-            if ((summary.source_errors || []).length > 0) {
-              lines.push('## Source errors');
-              lines.push('');
-              for (const err of summary.source_errors) {
-                lines.push(`- ${err}`);
-              }
-              lines.push('');
-            }
 
-            lines.push('## HIGH findings');
-            lines.push('');
+def _get_first(d: dict[str, Any], keys: Iterable[str], default: str = "") -> str:
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return default
 
-            for (const row of (summary.high_rows || []).slice(0, 25)) {
-              lines.push(`- **${row.poam_id}** | ${row.weakness_name} | severity=${row.severity} | asset=${row.asset_identifier} | source=${row.source_url}`);
-            }
 
-            if ((summary.high_rows || []).length > 25) {
-              lines.push('');
-              lines.push(`_Showing first 25 of ${summary.high_rows.length} HIGH findings._`);
-            }
+def _is_routine_noise(action: str) -> bool:
+    return any(action.startswith(prefix) for prefix in ROUTINE_ACTION_PREFIXES)
 
-            const body = lines.join('\n');
 
-            const search = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`
-            });
+def _iter_leaf_strings(obj: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[str, str]]:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_leaf_strings(v, path + (str(k),))
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_leaf_strings(item, path)
+    else:
+        if obj not in (None, ""):
+            yield (".".join(path).lower(), str(obj))
 
-            if (search.data.total_count > 0) {
-              const existing = search.data.items[0];
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: existing.number,
-                body
-              });
-              core.notice(`Commented on existing issue #${existing.number}`);
-            } else {
-              const created = await github.rest.issues.create({
-                owner,
-                repo,
-                title,
-                body
-              });
-              core.notice(`Created issue #${created.data.number}`);
-            }
 
-      - name: Summarize output
-        if: always()
-        run: |
-          {
-            echo "## GitHub POA&M output"
-            echo
-            echo "Owner: $GH_OWNER"
-            if [ -n "$GH_REPO" ]; then
-              echo "Repository: $GH_REPO"
-            else
-              echo "Repository: org-level scan"
-            fi
-            echo
-            echo "Files created:"
-            [ -f "$OUTPUT_CSV" ] && echo "- $OUTPUT_CSV"
-            [ -f "$OUTPUT_JSON" ] && echo "- $OUTPUT_JSON"
-            [ -f "$OUTPUT_SUMMARY" ] && echo "- $OUTPUT_SUMMARY"
-          } >> "$GITHUB_STEP_SUMMARY"
+def _gather_text(event: dict[str, Any]) -> tuple[str, str]:
+    search_parts: list[str] = []
+    sensitive_parts: list[str] = []
 
-      - name: Upload POA&M artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: poam-github-output
-          path: poam-output/
-          if-no-files-found: error
+    action = _get_first(event, ("action", "event", "operation", "type"), "unknown")
+    actor = _get_first(event, ("actor", "user", "username", "login", "actor_login"), "unknown")
+    ts = _normalize_ts(_get_first(event, ("created_at", "timestamp", "time", "occurred_at"), ""))
 
-      - name: Fail when no alerts or source access is unavailable
-        if: always()
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
+    search_parts.extend([action, actor, ts])
 
-          summary_path = Path(os.environ["OUTPUT_SUMMARY"])
-          if not summary_path.exists():
-              print(f"Summary file not found: {summary_path}", file=sys.stderr)
-              sys.exit(1)
+    for path, value in _iter_leaf_strings(event):
+        if any(hint in path for hint in SEARCH_KEY_HINTS):
+            search_parts.append(value)
+        if any(hint in path for hint in SENSITIVE_KEY_HINTS):
+            sensitive_parts.append(value)
 
-          summary = json.loads(summary_path.read_text(encoding="utf-8"))
-          total = int(summary.get("total_count", 0))
-          source_errors = summary.get("source_errors", []) or []
+    return " ".join(search_parts).lower(), " ".join(sensitive_parts)
 
-          if source_errors:
-              print("One or more sources could not be collected:", file=sys.stderr)
-              for err in source_errors:
-                  print(f"- {err}", file=sys.stderr)
-              sys.exit(1)
 
-          if total == 0:
-              print("No alerts were found; failing the workflow as requested.", file=sys.stderr)
-              sys.exit(1)
+def _contains_phrase(text: str, phrases: Iterable[str]) -> Optional[str]:
+    for phrase in phrases:
+        if phrase in text:
+            return phrase
+    return None
 
-          print(f"Alerts found: {total}")
-          PY
+
+def _contains_token_like_text(text: str) -> bool:
+    return any(rx.search(text) for rx in TOKEN_REGEXES)
+
+
+def _private_ip_present(event: dict[str, Any]) -> Optional[str]:
+    for key in ("ip", "ip_address", "source_ip", "client_ip"):
+        v = _get_first(event, (key,), "")
+        if v:
+            lv = v.lower()
+            if lv.startswith(PRIVATE_IP_PREFIXES):
+                return v
+    return None
+
+
+def score_event(event: dict[str, Any], include_routine_actions: bool = False) -> Optional[Finding]:
+    action = _get_first(event, ("action", "event", "operation", "type"), "unknown")
+    actor = _get_first(event, ("actor", "user", "username", "login", "actor_login"), "unknown")
+    ts = _normalize_ts(_get_first(event, ("created_at", "timestamp", "time", "occurred_at"), ""))
+
+    if not include_routine_actions and _is_routine_noise(action) and action not in HIGH_RISK_ACTIONS:
+        return None
+
+    search_blob, sensitive_blob = _gather_text(event)
+
+    reasons: list[str] = []
+    severity: Optional[str] = None
+    category: Optional[str] = None
+
+    if action in HIGH_RISK_ACTIONS:
+        severity = "HIGH"
+        category = "privilege_or_security_change"
+        reasons.append(f"High-risk action '{action}' is in the watch list.")
+
+    if _contains_token_like_text(sensitive_blob):
+        severity = "HIGH"
+        category = category or "token_exposure"
+        reasons.append("Token-like value detected in a sensitive field.")
+
+    phrase = _contains_phrase(search_blob, SUSPICIOUS_PHRASES)
+    if phrase:
+        if severity is None:
+            severity = "MEDIUM"
+            category = "suspicious_content"
+        reasons.append(f"Event contains suspicious phrase '{phrase}'.")
+
+    if "failed" in search_blob and any(term in search_blob for term in AUTH_FAILURE_TERMS):
+        severity = "HIGH" if severity != "HIGH" else severity
+        category = category or "auth_failure"
+        reasons.append("Authentication or token failure pattern detected.")
+
+    private_ip = _private_ip_present(event)
+    if private_ip and "vpn" not in search_blob and "corp" not in search_blob and severity is None:
+        severity = "LOW"
+        category = "internal_network_activity"
+        reasons.append(f"Private/internal IP observed: {private_ip}.")
+
+    if not reasons:
+        return None
+
+    return Finding(
+        severity=severity or "LOW",
+        category=category or "general_review",
+        timestamp=ts,
+        actor=actor,
+        action=action,
+        reason=" ".join(reasons),
+        raw=event,
+    )
+
+
+def iter_events(path: Path) -> Iterable[dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            yield from data
+        else:
+            yield data
+        return
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_no}: {exc}") from exc
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Parse GitHub audit logs for security-relevant findings.")
+    parser.add_argument("--input", required=True, help="Path to GitHub audit log JSON or JSONL file")
+    parser.add_argument("--output", required=True, help="Path to findings JSON output file")
+    parser.add_argument(
+        "--include-routine-actions",
+        action="store_true",
+        help="Include routine workflow/comment/PR actions instead of skipping them by default",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not input_path.exists():
+        print(f"Input file not found: {input_path}", file=sys.stderr)
+        return 2
+
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    total = 0
+    skipped = 0
+
+    for event in iter_events(input_path):
+        total += 1
+        finding = score_event(event, include_routine_actions=args.include_routine_actions)
+        if not finding:
+            if not args.include_routine_actions and _is_routine_noise(_get_first(event, ("action", "event", "operation", "type"), "unknown")):
+                skipped += 1
+            continue
+
+        dedupe_key = json.dumps(
+            {
+                "severity": finding.severity,
+                "category": finding.category,
+                "timestamp": finding.timestamp,
+                "actor": finding.actor,
+                "action": finding.action,
+                "reason": finding.reason,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        findings.append(finding)
+
+    output_path.write_text(
+        json.dumps([asdict(f) for f in findings], indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+    print(f"Processed events: {total}")
+    print(f"Findings: {len(findings)}")
+    print(f"Skipped routine events: {skipped}")
+    for f in findings[:100]:
+        print(
+            f"[{f.severity}] {f.timestamp} actor={f.actor} action={f.action} "
+            f"category={f.category} reason={f.reason}"
+        )
+
+    if len(findings) > 100:
+        print(f"... truncated {len(findings) - 100} additional findings")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
