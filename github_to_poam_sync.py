@@ -1,78 +1,146 @@
 #!/usr/bin/env python3
-"""Convert audit log findings into POA&M rows and export CSV, JSON, summary, and XLSX."""
+"""Parse GitHub audit logs and emit a reduced set of security-relevant findings."""
 
 from __future__ import annotations
 
-import csv
+import argparse
 import json
-import os
+import re
+import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Iterable, Optional
 
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
-GH_OWNER = os.getenv("GH_OWNER") or os.getenv("GITHUB_OWNER") or ""
-GH_REPO = os.getenv("GH_REPO") or os.getenv("GITHUB_REPO") or ""
-GH_ENTERPRISE_SLUG = os.getenv("GH_ENTERPRISE_SLUG") or os.getenv("GITHUB_ENTERPRISE") or ""
+HIGH_RISK_ACTIONS = {
+    "oauth_authorization.create",
+    "oauth_authorization.destroy",
+    "personal_access_token.create",
+    "personal_access_token.update",
+    "personal_access_token.delete",
+    "personal_access_token.grant",
+    "github_app.authorized",
+    "github_app.revoked",
+    "org.add_member",
+    "org.remove_member",
+    "team.add_member",
+    "team.remove_member",
+    "repo.config.disable_branch_protection",
+    "repo.config.remove_required_reviews",
+    "repo.config.disable_secret_scanning",
+    "repo.config.disable_code_scanning",
+    "repo.config.change_visibility",
+    "repo.config.disable_forking",
+    "repo.config.allow_actions_disabled",
+}
 
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "poam-output"))
-AUDIT_FINDINGS_JSON = Path(os.getenv("AUDIT_FINDINGS_JSON", str(OUTPUT_DIR / "findings.json")))
-AUDIT_SOURCE_ERRORS_JSON = Path(os.getenv("AUDIT_SOURCE_ERRORS_JSON", str(OUTPUT_DIR / "audit_source_errors.json")))
+# Routine collaboration / workflow noise that tends to flood audit logs.
+ROUTINE_ACTION_PREFIXES = (
+    "repo.download_zip",
+    "workflows.",
+    "issue_comment.",
+    "pull_request.",
+    "pull_request_review.",
+    "pull_request_review_comment.",
+)
 
-OUTPUT_CSV = Path(os.getenv("OUTPUT_CSV", str(OUTPUT_DIR / "poam_github.csv")))
-OUTPUT_JSON = Path(os.getenv("OUTPUT_JSON", str(OUTPUT_DIR / "poam_github.json")))
-OUTPUT_SUMMARY = Path(os.getenv("OUTPUT_SUMMARY", str(OUTPUT_DIR / "poam_summary.json")))
-OUTPUT_XLSX = Path(os.getenv("OUTPUT_XLSX", str(OUTPUT_DIR / "fedramp_poam_populated.xlsx")))
+SUSPICIOUS_PHRASES = (
+    "impossible travel",
+    "unusual location",
+    "policy bypass",
+    "token exposure",
+    "token leak",
+    "secret leak",
+    "credential leak",
+    "exfiltration",
+    "password spray",
+    "credential stuffing",
+    "unauthorized access",
+    "suspicious oauth",
+    "branch protection disabled",
+    "required reviews removed",
+    "secret scanning disabled",
+    "code scanning disabled",
+)
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+AUTH_FAILURE_TERMS = (
+    "token",
+    "pat",
+    "oauth",
+    "ssh",
+    "password",
+    "credential",
+)
+
+SENSITIVE_KEY_HINTS = (
+    "token",
+    "secret",
+    "oauth",
+    "credential",
+    "authorization",
+    "auth",
+    "password",
+    "bearer",
+    "pat",
+    "key",
+)
+
+SEARCH_KEY_HINTS = (
+    "action",
+    "event",
+    "operation",
+    "type",
+    "actor",
+    "user",
+    "login",
+    "repo",
+    "team",
+    "message",
+    "reason",
+    "description",
+    "details",
+    "note",
+    "comment",
+    "ip",
+    "ip_address",
+    "source_ip",
+    "client_ip",
+    "location",
+    "country_code",
+    "visibility",
+    "status",
+    "state",
+    "programmatic_access_type",
+)
+
+TOKEN_REGEXES = [
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgho_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bghs_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bghu_[A-Za-z0-9_]{20,}\b"),
+]
+
+PRIVATE_IP_PREFIXES = (
+    "10.",
+    "192.168.",
+    "127.",
+)
 
 
 @dataclass
-class PoamRow:
-    poam_id: str
-    weakness_name: str
-    weakness_description: str
-    source_identifying_weakness: str
-    asset_identifier: str
+class Finding:
     severity: str
-    risk_rating: str
-    date_identified: str
-    scheduled_completion_date: str
-    actual_completion_date: str
-    status: str
-    owner: str
-    remediation_action: str
-    source_url: str
-    finding_category: str = ""
-    finding_actor: str = ""
-    finding_action: str = ""
-    finding_timestamp: str = ""
-    finding_reason: str = ""
-    finding_raw_json: str = ""
+    category: str
+    timestamp: str
+    actor: str
+    action: str
+    reason: str
+    raw: dict[str, Any]
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-def _plus_30_days() -> str:
-    return (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
-
-
-def _map_severity(sev: str) -> str:
-    s = (sev or "").strip().lower()
-    if s in {"critical", "high"}:
-        return "High"
-    if s in {"medium", "moderate"}:
-        return "Moderate"
-    return "Low"
-
-
-def _coerce_timestamp(value: Any) -> str:
+def _normalize_ts(value: Any) -> str:
     if not value:
         return ""
     if isinstance(value, (int, float)):
@@ -85,276 +153,213 @@ def _coerce_timestamp(value: Any) -> str:
     return str(value)
 
 
-def _asset_identifier() -> str:
-    if GH_OWNER and GH_REPO:
-        return f"{GH_OWNER}/{GH_REPO}"
-    if GH_OWNER:
-        return GH_OWNER
-    return "GitHub Audit Log"
+def _get_first(d: dict[str, Any], keys: Iterable[str], default: str = "") -> str:
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, ""):
+            return str(v)
+    return default
 
 
-def _load_findings(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    if not path.exists():
-        return [], f"Finding file not found: {path}"
-
-    try:
-        if path.suffix.lower() == ".jsonl":
-            findings: List[Dict[str, Any]] = []
-            with path.open("r", encoding="utf-8") as f:
-                for line_no, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        findings.append(json.loads(line))
-                    except json.JSONDecodeError as exc:
-                        return [], f"Invalid JSON on line {line_no} of {path}: {exc}"
-            return findings, None
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data, None
-        if isinstance(data, dict):
-            if "findings" in data and isinstance(data["findings"], list):
-                return data["findings"], None
-            return [data], None
-
-        return [], f"Unsupported findings file format: {path}"
-    except Exception as exc:
-        return [], f"Failed to load findings from {path}: {exc}"
+def _is_routine_noise(action: str) -> bool:
+    return any(action.startswith(prefix) for prefix in ROUTINE_ACTION_PREFIXES)
 
 
-def _load_source_errors(path: Path) -> List[str]:
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [str(x) for x in data if str(x).strip()]
-        if isinstance(data, dict):
-            if "errors" in data and isinstance(data["errors"], list):
-                return [str(x) for x in data["errors"] if str(x).strip()]
-            return [json.dumps(data, ensure_ascii=False)]
-        return [str(data)]
-    except Exception as exc:
-        return [f"Failed to read source errors from {path}: {exc}"]
-
-
-def _remediation_for_category(category: str, action: str, reason: str) -> str:
-    c = (category or "").strip().lower()
-    a = (action or "").strip().lower()
-    r = (reason or "").strip().lower()
-
-    if c == "token_exposure" or "token" in r or "pat" in r:
-        return "Investigate the exposed credential, rotate or revoke the token, and review repository and audit log activity."
-    if c == "auth_failure" or ("failed" in r and any(x in r for x in ("token", "pat", "oauth", "ssh"))):
-        return "Review repeated authentication failures, confirm whether they are expected, and investigate for misuse or brute force."
-    if c == "privilege_or_security_change" or any(
-        x in a for x in ("branch_protection", "visibility", "remove_required_reviews", "disable_secret_scanning", "disable_code_scanning")
-    ):
-        return "Review the security or privilege change, verify authorization, and restore required protections if needed."
-    if c == "suspicious_content":
-        return "Validate the event for malicious or policy-bypass activity and preserve evidence for investigation."
-    if c == "internal_network_activity":
-        return "Confirm the source context for the internal network activity and validate whether the event is expected."
-    return "Review the audit log finding and implement the required remediation or compensating control."
-
-
-def _weakness_name(category: str, action: str) -> str:
-    cat = (category or "general_review").replace("_", " ").title()
-    act = action or "audit event"
-    return f"GitHub audit log finding: {cat} ({act})"[:120]
-
-
-def _weakness_description(finding: Dict[str, Any]) -> str:
-    parts = []
-    if finding.get("timestamp"):
-        parts.append(f"Timestamp: {finding.get('timestamp')}")
-    if finding.get("actor"):
-        parts.append(f"Actor: {finding.get('actor')}")
-    if finding.get("action"):
-        parts.append(f"Action: {finding.get('action')}")
-    if finding.get("category"):
-        parts.append(f"Category: {finding.get('category')}")
-    if finding.get("reason"):
-        parts.append(f"Reason: {finding.get('reason')}")
-    return " | ".join(parts) if parts else "GitHub audit log finding."
-
-
-def findings_to_poam_rows(findings: List[Dict[str, Any]]) -> List[PoamRow]:
-    rows: List[PoamRow] = []
-    today = _today()
-    completion = _plus_30_days()
-    asset = _asset_identifier()
-
-    for idx, finding in enumerate(findings, 1):
-        severity = _map_severity(str(finding.get("severity", "Low")))
-        category = str(finding.get("category", "") or "general_review")
-        actor = str(finding.get("actor", "") or "")
-        action = str(finding.get("action", "") or "")
-        timestamp = _coerce_timestamp(finding.get("timestamp", ""))
-        reason = str(finding.get("reason", "") or "")
-        raw_json = json.dumps(finding.get("raw", finding), ensure_ascii=False, default=str)
-
-        rows.append(
-            PoamRow(
-                poam_id=f"AUD-{idx:05d}",
-                weakness_name=_weakness_name(category, action),
-                weakness_description=_weakness_description(finding),
-                source_identifying_weakness="GitHub Audit Log / Automated Detection",
-                asset_identifier=asset,
-                severity=severity,
-                risk_rating=severity,
-                date_identified=today,
-                scheduled_completion_date=completion,
-                actual_completion_date="",
-                status="Open",
-                owner="Security Operations",
-                remediation_action=_remediation_for_category(category, action, reason),
-                source_url="",
-                finding_category=category,
-                finding_actor=actor,
-                finding_action=action,
-                finding_timestamp=timestamp,
-                finding_reason=reason,
-                finding_raw_json=raw_json,
-            )
-        )
-
-    return rows
-
-
-def _write_csv(path: Path, rows: List[PoamRow]) -> None:
-    fields = list(asdict(rows[0]).keys()) if rows else list(
-        asdict(PoamRow("", "", "", "", "", "", "", "", "", "", "", "", "", "")).keys()
-    )
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(asdict(row))
-
-
-def _write_json(path: Path, rows: List[PoamRow]) -> None:
-    path.write_text(json.dumps([asdict(r) for r in rows], indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _write_summary(path: Path, rows: List[PoamRow], source_errors: List[str], findings_file: Path) -> None:
-    summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "owner": GH_OWNER,
-        "repo": GH_REPO,
-        "enterprise_slug": GH_ENTERPRISE_SLUG,
-        "findings_file": str(findings_file),
-        "total_count": len(rows),
-        "high_count": sum(1 for r in rows if r.severity == "High"),
-        "moderate_count": sum(1 for r in rows if r.severity == "Moderate"),
-        "low_count": sum(1 for r in rows if r.severity == "Low"),
-        "source_errors": source_errors,
-        "high_rows": [asdict(r) for r in rows if r.severity == "High"],
-    }
-    path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _style_sheet(ws) -> None:
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9E2F3")
-    border = Border(bottom=thin)
-
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    widths = {
-        1: 12, 2: 30, 3: 50, 4: 30, 5: 24, 6: 10, 7: 10, 8: 14, 9: 18, 10: 18,
-        11: 12, 12: 18, 13: 40, 14: 36, 15: 20, 16: 20, 17: 20, 18: 24, 19: 48, 20: 48
-    }
-    for idx, width in widths.items():
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-
-def _write_workbook(path: Path, rows: List[PoamRow], source_errors: List[str], findings_file: Path) -> None:
-    wb = Workbook()
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
-    ws_poam = wb.create_sheet("POAM")
-
-    ws_summary["A1"] = "FedRAMP POA&M Export Summary"
-    ws_summary["A1"].font = Font(bold=True, size=14)
-    ws_summary["A3"] = "Generated At"
-    ws_summary["B3"] = datetime.now(timezone.utc).isoformat()
-    ws_summary["A4"] = "Owner"
-    ws_summary["B4"] = GH_OWNER
-    ws_summary["A5"] = "Repository"
-    ws_summary["B5"] = GH_REPO
-    ws_summary["A6"] = "Enterprise Slug"
-    ws_summary["B6"] = GH_ENTERPRISE_SLUG
-    ws_summary["A7"] = "Findings File"
-    ws_summary["B7"] = str(findings_file)
-    ws_summary["A9"] = "Total Findings"
-    ws_summary["B9"] = len(rows)
-    ws_summary["A10"] = "High Findings"
-    ws_summary["B10"] = sum(1 for r in rows if r.severity == "High")
-    ws_summary["A11"] = "Moderate Findings"
-    ws_summary["B11"] = sum(1 for r in rows if r.severity == "Moderate")
-    ws_summary["A12"] = "Low Findings"
-    ws_summary["B12"] = sum(1 for r in rows if r.severity == "Low")
-    ws_summary["A14"] = "Source Errors"
-
-    if source_errors:
-        for i, err in enumerate(source_errors, 15):
-            ws_summary[f"A{i}"] = f"- {err}"
+def _iter_leaf_strings(obj: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[str, str]]:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _iter_leaf_strings(v, path + (str(k),))
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_leaf_strings(item, path)
     else:
-        ws_summary["A15"] = "(none)"
+        if obj not in (None, ""):
+            yield (".".join(path).lower(), str(obj))
 
-    ws_summary.column_dimensions["A"].width = 22
-    ws_summary.column_dimensions["B"].width = 90
 
-    headers = [
-        "poam_id", "weakness_name", "weakness_description", "source_identifying_weakness", "asset_identifier",
-        "severity", "risk_rating", "date_identified", "scheduled_completion_date", "actual_completion_date",
-        "status", "owner", "remediation_action", "source_url", "finding_category", "finding_actor",
-        "finding_action", "finding_timestamp", "finding_reason", "finding_raw_json"
-    ]
-    ws_poam.append(headers)
-    for row in rows:
-        d = asdict(row)
-        ws_poam.append([d.get(h, "") for h in headers])
+def _gather_text(event: dict[str, Any]) -> tuple[str, str]:
+    search_parts: list[str] = []
+    sensitive_parts: list[str] = []
 
-    _style_sheet(ws_poam)
-    _style_sheet(ws_summary)
-    wb.save(path)
+    action = _get_first(event, ("action", "event", "operation", "type"), "unknown")
+    actor = _get_first(event, ("actor", "user", "username", "login", "actor_login"), "unknown")
+    ts = _normalize_ts(_get_first(event, ("created_at", "timestamp", "time", "occurred_at"), ""))
+
+    search_parts.extend([action, actor, ts])
+
+    for path, value in _iter_leaf_strings(event):
+        if any(hint in path for hint in SEARCH_KEY_HINTS):
+            search_parts.append(value)
+        if any(hint in path for hint in SENSITIVE_KEY_HINTS):
+            sensitive_parts.append(value)
+
+    return " ".join(search_parts).lower(), " ".join(sensitive_parts)
+
+
+def _contains_phrase(text: str, phrases: Iterable[str]) -> Optional[str]:
+    for phrase in phrases:
+        if phrase in text:
+            return phrase
+    return None
+
+
+def _contains_token_like_text(text: str) -> bool:
+    return any(rx.search(text) for rx in TOKEN_REGEXES)
+
+
+def _private_ip_present(event: dict[str, Any]) -> Optional[str]:
+    for key in ("ip", "ip_address", "source_ip", "client_ip"):
+        v = _get_first(event, (key,), "")
+        if v:
+            lv = v.lower()
+            if lv.startswith(PRIVATE_IP_PREFIXES):
+                return v
+    return None
+
+
+def score_event(event: dict[str, Any], include_routine_actions: bool = False) -> Optional[Finding]:
+    action = _get_first(event, ("action", "event", "operation", "type"), "unknown")
+    actor = _get_first(event, ("actor", "user", "username", "login", "actor_login"), "unknown")
+    ts = _normalize_ts(_get_first(event, ("created_at", "timestamp", "time", "occurred_at"), ""))
+
+    if not include_routine_actions and _is_routine_noise(action) and action not in HIGH_RISK_ACTIONS:
+        return None
+
+    search_blob, sensitive_blob = _gather_text(event)
+
+    reasons: list[str] = []
+    severity: Optional[str] = None
+    category: Optional[str] = None
+
+    if action in HIGH_RISK_ACTIONS:
+        severity = "HIGH"
+        category = "privilege_or_security_change"
+        reasons.append(f"High-risk action '{action}' is in the watch list.")
+
+    if _contains_token_like_text(sensitive_blob):
+        severity = "HIGH"
+        category = category or "token_exposure"
+        reasons.append("Token-like value detected in a sensitive field.")
+
+    phrase = _contains_phrase(search_blob, SUSPICIOUS_PHRASES)
+    if phrase:
+        if severity is None:
+            severity = "MEDIUM"
+            category = "suspicious_content"
+        reasons.append(f"Event contains suspicious phrase '{phrase}'.")
+
+    if "failed" in search_blob and any(term in search_blob for term in AUTH_FAILURE_TERMS):
+        severity = "HIGH" if severity != "HIGH" else severity
+        category = category or "auth_failure"
+        reasons.append("Authentication or token failure pattern detected.")
+
+    private_ip = _private_ip_present(event)
+    if private_ip and "vpn" not in search_blob and "corp" not in search_blob and severity is None:
+        severity = "LOW"
+        category = "internal_network_activity"
+        reasons.append(f"Private/internal IP observed: {private_ip}.")
+
+    if not reasons:
+        return None
+
+    return Finding(
+        severity=severity or "LOW",
+        category=category or "general_review",
+        timestamp=ts,
+        actor=actor,
+        action=action,
+        reason=" ".join(reasons),
+        raw=event,
+    )
+
+
+def iter_events(path: Path) -> Iterable[dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            yield from data
+        else:
+            yield data
+        return
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_no}: {exc}") from exc
 
 
 def main() -> int:
-    findings, err = _load_findings(AUDIT_FINDINGS_JSON)
-    source_errors: List[str] = []
-    if err:
-        source_errors.append(err)
+    parser = argparse.ArgumentParser(description="Parse GitHub audit logs for security-relevant findings.")
+    parser.add_argument("--input", required=True, help="Path to GitHub audit log JSON or JSONL file")
+    parser.add_argument("--output", required=True, help="Path to findings JSON output file")
+    parser.add_argument(
+        "--include-routine-actions",
+        action="store_true",
+        help="Include routine workflow/comment/PR actions instead of skipping them by default",
+    )
+    args = parser.parse_args()
 
-    source_errors.extend(_load_source_errors(AUDIT_SOURCE_ERRORS_JSON))
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = findings_to_poam_rows(findings) if findings else []
+    if not input_path.exists():
+        print(f"Input file not found: {input_path}", file=sys.stderr)
+        return 2
 
-    _write_csv(OUTPUT_CSV, rows)
-    _write_json(OUTPUT_JSON, rows)
-    _write_summary(OUTPUT_SUMMARY, rows, source_errors, AUDIT_FINDINGS_JSON)
-    _write_workbook(OUTPUT_XLSX, rows, source_errors, AUDIT_FINDINGS_JSON)
+    findings: list[Finding] = []
+    seen: set[str] = set()
+    total = 0
+    skipped = 0
 
-    print(f"Wrote {len(rows)} POA&M rows from {AUDIT_FINDINGS_JSON}")
-    print(f"CSV: {OUTPUT_CSV}")
-    print(f"JSON: {OUTPUT_JSON}")
-    print(f"Workbook: {OUTPUT_XLSX}")
-    if source_errors:
-        print("Source errors:")
-        for e in source_errors:
-            print(f"- {e}")
+    for event in iter_events(input_path):
+        total += 1
+        finding = score_event(event, include_routine_actions=args.include_routine_actions)
+        if not finding:
+            if not args.include_routine_actions and _is_routine_noise(_get_first(event, ("action", "event", "operation", "type"), "unknown")):
+                skipped += 1
+            continue
+
+        dedupe_key = json.dumps(
+            {
+                "severity": finding.severity,
+                "category": finding.category,
+                "timestamp": finding.timestamp,
+                "actor": finding.actor,
+                "action": finding.action,
+                "reason": finding.reason,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        findings.append(finding)
+
+    output_path.write_text(
+        json.dumps([asdict(f) for f in findings], indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+    print(f"Processed events: {total}")
+    print(f"Findings: {len(findings)}")
+    print(f"Skipped routine events: {skipped}")
+    for f in findings[:100]:
+        print(
+            f"[{f.severity}] {f.timestamp} actor={f.actor} action={f.action} "
+            f"category={f.category} reason={f.reason}"
+        )
+
+    if len(findings) > 100:
+        print(f"... truncated {len(findings) - 100} additional findings")
+
     return 0
 
 
