@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
@@ -108,33 +108,39 @@ class GitHubClient:
 
         return last_resp if last_resp is not None else resp
 
-    def get_json(
-        self,
-        path_or_url: str,
-        *,
-        params: Optional[Dict[str, Any]] = None,
-    ) -> Any:
+    def _format_auth_hint(self, resp: requests.Response) -> str:
+        sso = resp.headers.get("X-GitHub-SSO")
+        parts = []
+        if sso:
+            parts.append(f"X-GitHub-SSO={sso}")
+        if resp.headers.get("X-RateLimit-Remaining") is not None:
+            parts.append(
+                f"rate_limit_remaining={resp.headers.get('X-RateLimit-Remaining')}"
+            )
+        return f" ({'; '.join(parts)})" if parts else ""
+
+    def get_json(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.request("GET", path_or_url, params=params)
 
         if resp.status_code == 404:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 404 Not Found. "
                 f"Verify the exact org login, token visibility, and API host. "
-                f"Response: {resp.text[:400]}"
+                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
             )
 
         if resp.status_code == 401:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 401 Unauthorized. "
                 f"Check the token and whether it is valid for the target GitHub host. "
-                f"Response: {resp.text[:400]}"
+                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
             )
 
         if resp.status_code == 403:
             raise RuntimeError(
                 f"GET {path_or_url} failed: 403 Forbidden. "
                 f"Check token permissions and whether the token is authorized for SSO. "
-                f"Response: {resp.text[:400]}"
+                f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
             )
 
         if resp.status_code >= 400:
@@ -164,7 +170,7 @@ class GitHubClient:
                 raise RuntimeError(
                     f"GET {path_or_url} page {page} failed: 404 Not Found. "
                     f"Verify the exact org login and API host. "
-                    f"Response: {resp.text[:400]}"
+                    f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
                 )
 
             if resp.status_code == 401:
@@ -177,7 +183,7 @@ class GitHubClient:
                 raise RuntimeError(
                     f"GET {path_or_url} page {page} failed: 403 Forbidden. "
                     f"Check token permissions and SSO authorization. "
-                    f"Response: {resp.text[:400]}"
+                    f"Response: {resp.text[:400]}{self._format_auth_hint(resp)}"
                 )
 
             if resp.status_code >= 400:
@@ -211,13 +217,13 @@ class GitHubClient:
         except Exception:
             return f"/orgs/{org}"
 
-    def user_orgs_url(self) -> str:
-        root = self.root_metadata()
-        return root.get("user_organizations_url", "/user/orgs")
-
     def current_user_url(self) -> str:
         root = self.root_metadata()
         return root.get("current_user_url", "/user")
+
+    def user_orgs_url(self) -> str:
+        root = self.root_metadata()
+        return root.get("user_organizations_url", "/user/orgs")
 
 
 def iso_date_days_ago(days: int) -> str:
