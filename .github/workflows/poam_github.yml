@@ -2,6 +2,22 @@ name: FedRAMP POA&M from Audit Findings
 
 on:
   workflow_dispatch:
+    inputs:
+      use_enterprise_audit_log:
+        description: "Try enterprise audit log first, then fall back to org audit log"
+        required: false
+        default: false
+        type: boolean
+      include_routine_actions:
+        description: "Include routine workflow/comment/PR actions in the audit findings"
+        required: false
+        default: false
+        type: boolean
+      audit_days:
+        description: "How many days of audit log to collect"
+        required: false
+        default: "90"
+        type: string
 
 permissions:
   contents: read
@@ -9,21 +25,25 @@ permissions:
 jobs:
   generate-poam:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
       GH_TOKEN: ${{ secrets.GH_GITHUB_TOKEN }}
       GH_OWNER: ${{ vars.GH_OWNER }}
       GH_REPO: ${{ vars.GH_REPO }}
       GH_ENTERPRISE_SLUG: ${{ vars.GH_ENTERPRISE_SLUG }}
-      GH_API_URL: https://api.github.com
+      USE_ENTERPRISE_AUDIT_LOG: ${{ inputs.use_enterprise_audit_log }}
+      INCLUDE_ROUTINE_ACTIONS: ${{ inputs.include_routine_actions }}
       GH_API_VERSION: 2022-11-28
+      AUDIT_DAYS: ${{ inputs.audit_days }}
       OUTPUT_DIR: poam-output
+      AUDIT_LOG_JSONL: poam-output/audit.log.jsonl
+      AUDIT_SOURCE_ERRORS_JSON: poam-output/audit_source_errors.json
+      AUDIT_FINDINGS_JSON: poam-output/findings.json
       OUTPUT_CSV: poam-output/poam_github.csv
       OUTPUT_JSON: poam-output/poam_github.json
       OUTPUT_SUMMARY: poam-output/poam_summary.json
       OUTPUT_XLSX: poam-output/fedramp_poam_populated.xlsx
-      AUDIT_FINDINGS_JSON: findings.json
 
     steps:
       - name: Check out repository
@@ -34,21 +54,122 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install openpyxl
+          python -m pip install requests openpyxl
 
-      - name: Verify findings file exists
+      - name: Fetch audit log
         run: |
-          if [ ! -f "$AUDIT_FINDINGS_JSON" ]; then
-            echo "Missing findings file: $AUDIT_FINDINGS_JSON" >&2
-            exit 1
+          mkdir -p "$OUTPUT_DIR"
+
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          import requests
+
+          owner = os.environ.get("GH_OWNER", "").strip()
+          enterprise_slug = os.environ.get("GH_ENTERPRISE_SLUG", "").strip()
+          use_enterprise = os.environ.get("USE_ENTERPRISE_AUDIT_LOG", "false").lower() == "true"
+          token = os.environ.get("GH_TOKEN", "").strip()
+          audit_days = int(os.environ.get("AUDIT_DAYS", "90"))
+          api_version = os.environ.get("GH_API_VERSION", "2022-11-28").strip()
+
+          output_dir = Path(os.environ["OUTPUT_DIR"])
+          audit_path = Path(os.environ["AUDIT_LOG_JSONL"])
+          errors_path = Path(os.environ["AUDIT_SOURCE_ERRORS_JSON"])
+
+          output_dir.mkdir(parents=True, exist_ok=True)
+          audit_path.parent.mkdir(parents=True, exist_ok=True)
+
+          if not token:
+              raise SystemExit("GH_TOKEN is required.")
+          if not owner:
+              raise SystemExit("GH_OWNER is required.")
+
+          cutoff = (datetime.now(timezone.utc) - timedelta(days=audit_days)).date().isoformat()
+
+          session = requests.Session()
+          session.headers.update(
+              {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": api_version,
+                  "User-Agent": "fedramp-poam-audit-fetcher/1.0",
+              }
+          )
+
+          def fetch_events(base_url: str) -> list[dict]:
+              events: list[dict] = []
+              next_url = base_url
+              first = True
+
+              while next_url:
+                  params = {"include": "all", "per_page": 100, "phrase": f"created:>={cutoff}"} if first else None
+                  first = False
+
+                  resp = session.get(next_url, params=params, timeout=30)
+                  if resp.status_code >= 400:
+                      raise RuntimeError(f"GET {resp.url} failed: {resp.status_code} {resp.text[:600]}")
+
+                  data = resp.json()
+                  if isinstance(data, list):
+                      events.extend(data)
+                  else:
+                      events.append(data)
+
+                  next_url = resp.links.get("next", {}).get("url")
+
+              return events
+
+          attempts: list[tuple[str, str]] = []
+          if use_enterprise and enterprise_slug:
+              attempts.append(("enterprise", f"https://api.github.com/enterprises/{enterprise_slug}/audit-log"))
+          attempts.append(("org", f"https://api.github.com/orgs/{owner}/audit-log"))
+
+          errors: list[str] = []
+          events: list[dict] = []
+
+          for label, url in attempts:
+              try:
+                  events = fetch_events(url)
+                  break
+              except Exception as exc:
+                  errors.append(f"{label} audit log unavailable: {exc}")
+
+          with audit_path.open("w", encoding="utf-8") as f:
+              for event in events:
+                  f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+          errors_path.write_text(json.dumps(errors, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          print(f"Fetched {len(events)} audit events")
+          if errors:
+              print("Source errors:")
+              for err in errors:
+                  print(f"- {err}", file=sys.stderr)
+          PY
+
+          echo "Audit log created:"
+          ls -lah "$AUDIT_LOG_JSONL" "$AUDIT_SOURCE_ERRORS_JSON"
+
+      - name: Run audit parser
+        run: |
+          if [ "${INCLUDE_ROUTINE_ACTIONS:-false}" = "true" ]; then
+            python ./github_audit_log_parser.py --input "$AUDIT_LOG_JSONL" --output "$AUDIT_FINDINGS_JSON" --include-routine-actions
+          else
+            python ./github_audit_log_parser.py --input "$AUDIT_LOG_JSONL" --output "$AUDIT_FINDINGS_JSON"
           fi
+
+          echo "Findings created:"
+          ls -lah "$AUDIT_FINDINGS_JSON"
 
       - name: Run POA&M export
         run: |
-          mkdir -p "$OUTPUT_DIR"
           python ./github_to_poam_sync.py
           echo "Output directory contents:"
           ls -lah "$OUTPUT_DIR"
