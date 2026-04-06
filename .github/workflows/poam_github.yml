@@ -104,6 +104,14 @@ jobs:
           echo "POA&M output:"
           ls -lah "$OUTPUT_DIR"
 
+      - name: Verify expected outputs
+        run: |
+          echo "Checking for expected files..."
+          test -f "$OUTPUT_CSV"
+          test -f "$OUTPUT_JSON"
+          test -f "$OUTPUT_SUMMARY"
+          test -f "$OUTPUT_XLSX"
+
       - name: Summarize output
         if: always()
         run: |
