@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      GITHUB_TOKEN: ${{ secrets.GH_ORG_OWNER_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_ORG_AUDIT_TOKEN }}
       GITHUB_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.github_org || vars.GITHUB_ORG }}
       GITHUB_API_URL: https://api.github.com
       GITHUB_API_VERSION: 2022-11-28
