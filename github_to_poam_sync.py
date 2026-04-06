@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Convert GitHub audit log findings into POA&M rows and export CSV, JSON, summary, and XLSX."""
+"""Convert audit log findings into POA&M rows and export CSV, JSON, summary, and XLSX."""
 
 from __future__ import annotations
 
 import csv
 import json
 import os
-import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +20,8 @@ GH_REPO = os.getenv("GH_REPO") or os.getenv("GITHUB_REPO") or ""
 GH_ENTERPRISE_SLUG = os.getenv("GH_ENTERPRISE_SLUG") or os.getenv("GITHUB_ENTERPRISE") or ""
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "poam-output"))
-AUDIT_FINDINGS_JSON = Path(os.getenv("AUDIT_FINDINGS_JSON", "findings.json"))
+AUDIT_FINDINGS_JSON = Path(os.getenv("AUDIT_FINDINGS_JSON", str(OUTPUT_DIR / "findings.json")))
+AUDIT_SOURCE_ERRORS_JSON = Path(os.getenv("AUDIT_SOURCE_ERRORS_JSON", str(OUTPUT_DIR / "audit_source_errors.json")))
 
 OUTPUT_CSV = Path(os.getenv("OUTPUT_CSV", str(OUTPUT_DIR / "poam_github.csv")))
 OUTPUT_JSON = Path(os.getenv("OUTPUT_JSON", str(OUTPUT_DIR / "poam_github.json")))
@@ -124,6 +124,22 @@ def _load_findings(path: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         return [], f"Failed to load findings from {path}: {exc}"
 
 
+def _load_source_errors(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+        if isinstance(data, dict):
+            if "errors" in data and isinstance(data["errors"], list):
+                return [str(x) for x in data["errors"] if str(x).strip()]
+            return [json.dumps(data, ensure_ascii=False)]
+        return [str(data)]
+    except Exception as exc:
+        return [f"Failed to read source errors from {path}: {exc}"]
+
+
 def _remediation_for_category(category: str, action: str, reason: str) -> str:
     c = (category or "").strip().lower()
     a = (action or "").strip().lower()
@@ -132,7 +148,7 @@ def _remediation_for_category(category: str, action: str, reason: str) -> str:
     if c == "token_exposure" or "token" in r or "pat" in r:
         return "Investigate the exposed credential, rotate or revoke the token, and review repository and audit log activity."
     if c == "auth_failure" or ("failed" in r and any(x in r for x in ("token", "pat", "oauth", "ssh"))):
-        return "Review repeated authentication failures, confirm whether they are expected, and investigate for brute force or misuse."
+        return "Review repeated authentication failures, confirm whether they are expected, and investigate for misuse or brute force."
     if c == "privilege_or_security_change" or any(
         x in a for x in ("branch_protection", "visibility", "remove_required_reviews", "disable_secret_scanning", "disable_code_scanning")
     ):
@@ -321,6 +337,8 @@ def main() -> int:
     source_errors: List[str] = []
     if err:
         source_errors.append(err)
+
+    source_errors.extend(_load_source_errors(AUDIT_SOURCE_ERRORS_JSON))
 
     rows = findings_to_poam_rows(findings) if findings else []
 
