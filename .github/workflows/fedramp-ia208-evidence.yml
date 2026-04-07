@@ -53,6 +53,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests pyjwt cryptography
 
+      - name: Validate required env vars
+        run: |
+          test -n "$GH_APP_ID"
+          test -n "$GH_APP_PRIVATE_KEY"
+          test -n "$GH_ORG"
+
       - name: Write evidence collector
         run: |
           cat > fedramp_ia208_evidence.py <<'PY'
@@ -437,6 +443,7 @@ jobs:
 
               created_filter = f"created:>={iso_date_days_ago(cfg.days)}"
               audit_events: List[Dict[str, Any]] = []
+
               try:
                   for event in client.paginate(
                       f"/orgs/{cfg.org}/audit-log",
