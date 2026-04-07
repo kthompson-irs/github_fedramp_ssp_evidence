@@ -419,8 +419,8 @@ def collect(cfg: GitHubConfig) -> Path:
             f.write("\n")
     files.append(audit_jsonl)
 
-    rows_for_csv = [e for e in audit_events if "error" not in e]
     audit_csv = output_dir / "audit_log.csv"
+    rows_for_csv = [e for e in audit_events if "error" not in e]
     csv_fields = [
         "created_at",
         "action",
