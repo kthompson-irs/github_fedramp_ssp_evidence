@@ -3,11 +3,15 @@ name: FedRAMP IA-2(8) Evidence Collection
 on:
   workflow_dispatch:
     inputs:
-      github_org:
+      gh_org:
         description: "GitHub organization login"
         required: false
         type: string
-      github_days:
+      gh_enterprise:
+        description: "Enterprise slug for optional reporting"
+        required: false
+        type: string
+      gh_days:
         description: "How many days of audit log to collect"
         required: false
         default: "90"
@@ -24,14 +28,16 @@ jobs:
     timeout-minutes: 60
 
     env:
-      GITHUB_TOKEN: ${{ secrets.GH_ORG_OWNER_TOKEN }}
-      GITHUB_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.github_org || vars.GITHUB_ORG }}
-      GITHUB_API_URL: https://api.github.com
-      GITHUB_API_VERSION: 2022-11-28
-      GITHUB_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.github_days || vars.GITHUB_DAYS || '90' }}
-      GITHUB_REQUEST_DELAY_SECONDS: ${{ vars.GITHUB_REQUEST_DELAY_SECONDS || '0.25' }}
-      GITHUB_MAX_RETRIES: ${{ vars.GITHUB_MAX_RETRIES || '5' }}
-      GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
+      GH_API_URL: https://api.github.com
+      GH_API_VERSION: 2022-11-28
+      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
+      GH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_days || vars.GH_DAYS || '90' }}
+      GH_REQUEST_DELAY_SECONDS: ${{ vars.GH_REQUEST_DELAY_SECONDS || '0.25' }}
+      GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
+      GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
 
     steps:
       - name: Check out repository
@@ -59,29 +65,12 @@ jobs:
           - Sleeps briefly before each request.
           - Honors Retry-After and x-ratelimit-reset.
           - Uses bounded retries with exponential backoff.
-          - Keeps the audit-log window narrow via GITHUB_DAYS.
-
-          Outputs a timestamped folder containing:
-          - org.json
-          - audit_log.jsonl
-          - audit_log.csv
-          - credential_authorizations.json
-          - installations.json
-          - summary.json
-          - manifest.md
+          - Keeps the audit-log window narrow via GH_DAYS.
 
           Required env vars:
-          - GITHUB_APP_ID: GitHub App ID
-          - GITHUB_APP_PRIVATE_KEY: GitHub App private key in PEM format
-          - GITHUB_ORG: organization name
-
-          Optional env vars:
-          - GITHUB_API_URL: default https://api.github.com
-          - GITHUB_API_VERSION: default 2022-11-28
-          - GITHUB_DAYS: default 90
-          - GITHUB_REQUEST_DELAY_SECONDS: default 0.25
-          - GITHUB_MAX_RETRIES: default 5
-          - GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS: default 3600
+          - GH_APP_ID
+          - GH_APP_PRIVATE_KEY
+          - GH_ORG
           """
           from __future__ import annotations
 
@@ -107,6 +96,7 @@ jobs:
               org: str
               api_url: str = "https://api.github.com"
               api_version: str = "2022-11-28"
+              enterprise: Optional[str] = None
               days: int = 90
               timeout: int = 30
               request_delay_seconds: float = 0.25
@@ -151,7 +141,7 @@ jobs:
                   headers = dict(self.session.headers)
                   headers["Authorization"] = f"Bearer {self._jwt_token()}"
                   url = self._url(path_or_url)
-                  resp = self.session.request(
+                  return self.session.request(
                       method,
                       url,
                       headers=headers,
@@ -159,7 +149,6 @@ jobs:
                       json=json_body,
                       timeout=self.cfg.timeout,
                   )
-                  return resp
 
               def get_installation_id(self) -> int:
                   resp = self.request("GET", f"/orgs/{self.cfg.org}/installation")
@@ -250,7 +239,6 @@ jobs:
                       except ValueError:
                           pass
 
-                  # Secondary limit or ambiguous 403: exponential backoff with cap.
                   return min((2**attempt) * 60, self.cfg.max_rate_limit_sleep_seconds)
 
               def request(
@@ -308,7 +296,9 @@ jobs:
                           f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
                       )
                   if resp.status_code >= 400:
-                      raise RuntimeError(f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}")
+                      raise RuntimeError(
+                          f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}"
+                      )
 
                   return resp.json()
 
@@ -365,7 +355,9 @@ jobs:
           def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
               created_at = event.get("created_at")
               if isinstance(created_at, (int, float)):
-                  created_iso = dt.datetime.fromtimestamp(created_at / 1000.0, tz=dt.timezone.utc).isoformat()
+                  created_iso = dt.datetime.fromtimestamp(
+                      created_at / 1000.0, tz=dt.timezone.utc
+                  ).isoformat()
               else:
                   created_iso = created_at
 
@@ -405,7 +397,8 @@ jobs:
               lines.append(f"Generated: {dt.datetime.now(dt.timezone.utc).isoformat()}")
               lines.append("")
               for file_path in files:
-                  lines.append(f"- {file_path.relative_to(output_dir).as_posix()}")
+                  rel = file_path.relative_to(output_dir)
+                  lines.append(f"- {rel.as_posix()}")
               (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -501,13 +494,14 @@ jobs:
 
               if isinstance(cred_auths, dict) and cred_auths.get("error"):
                   summary["potential_gaps"].append(
-                      "Could not retrieve credential authorizations; verify org owner permissions and SAML SSO configuration."
+                      "Could not retrieve credential authorizations; verify org owner permissions and app installation."
                   )
 
               if isinstance(audit_events, list) and audit_events and "error" in audit_events[0]:
-                  summary["potential_gaps"].append("Could not retrieve audit log; verify owner permissions and token scope.")
+                  summary["potential_gaps"].append(
+                      "Could not retrieve audit log; verify org access, app permissions, and rate limits."
+                  )
 
-              # Filter for auth-related events useful for IA-2(8).
               auth_related = [
                   e for e in rows_for_csv
                   if any(
@@ -526,44 +520,45 @@ jobs:
 
 
           def main() -> int:
-              app_id = os.environ.get("GITHUB_APP_ID", "").strip()
-              private_key = os.environ.get("GITHUB_APP_PRIVATE_KEY", "").strip()
-              org = os.environ.get("GITHUB_ORG", "").strip()
+              app_id = os.environ.get("GH_APP_ID", "").strip()
+              private_key = os.environ.get("GH_APP_PRIVATE_KEY", "").strip()
+              org = os.environ.get("GH_ORG", "").strip()
 
               if not app_id or not private_key or not org:
-                  print("Set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, and GITHUB_ORG before running.", file=sys.stderr)
+                  print("Set GH_APP_ID, GH_APP_PRIVATE_KEY, and GH_ORG before running.", file=sys.stderr)
                   return 2
 
               try:
-                  days = int(os.environ.get("GITHUB_DAYS", "90"))
+                  days = int(os.environ.get("GH_DAYS", "90"))
               except ValueError:
-                  print("GITHUB_DAYS must be an integer.", file=sys.stderr)
+                  print("GH_DAYS must be an integer.", file=sys.stderr)
                   return 2
 
               try:
-                  request_delay_seconds = float(os.environ.get("GITHUB_REQUEST_DELAY_SECONDS", "0.25"))
+                  request_delay_seconds = float(os.environ.get("GH_REQUEST_DELAY_SECONDS", "0.25"))
               except ValueError:
-                  print("GITHUB_REQUEST_DELAY_SECONDS must be a number.", file=sys.stderr)
+                  print("GH_REQUEST_DELAY_SECONDS must be a number.", file=sys.stderr)
                   return 2
 
               try:
-                  max_retries = int(os.environ.get("GITHUB_MAX_RETRIES", "5"))
+                  max_retries = int(os.environ.get("GH_MAX_RETRIES", "5"))
               except ValueError:
-                  print("GITHUB_MAX_RETRIES must be an integer.", file=sys.stderr)
+                  print("GH_MAX_RETRIES must be an integer.", file=sys.stderr)
                   return 2
 
               try:
-                  max_rate_limit_sleep_seconds = int(os.environ.get("GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS", "3600"))
+                  max_rate_limit_sleep_seconds = int(os.environ.get("GH_MAX_RATE_LIMIT_SLEEP_SECONDS", "3600"))
               except ValueError:
-                  print("GITHUB_MAX_RATE_LIMIT_SLEEP_SECONDS must be an integer.", file=sys.stderr)
+                  print("GH_MAX_RATE_LIMIT_SLEEP_SECONDS must be an integer.", file=sys.stderr)
                   return 2
 
               cfg = GitHubConfig(
                   app_id=app_id,
                   private_key=private_key,
                   org=org,
-                  api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com").strip(),
-                  api_version=os.environ.get("GITHUB_API_VERSION", "2022-11-28").strip(),
+                  api_url=os.environ.get("GH_API_URL", "https://api.github.com").strip(),
+                  api_version=os.environ.get("GH_API_VERSION", "2022-11-28").strip(),
+                  enterprise=os.environ.get("GH_ENTERPRISE") or None,
                   days=days,
                   request_delay_seconds=request_delay_seconds,
                   max_retries=max_retries,
@@ -598,8 +593,8 @@ jobs:
           {
             echo "## FedRAMP IA-2(8) evidence collection"
             echo
-            echo "Organization: $GITHUB_ORG"
-            echo "Days collected: $GITHUB_DAYS"
+            echo "Organization: $GH_ORG"
+            echo "Days collected: $GH_DAYS"
             echo "Output directory: ${{ steps.run_collector.outputs.output_dir }}"
             echo
             if [ -f "${{ steps.run_collector.outputs.output_dir }}/manifest.md" ]; then
