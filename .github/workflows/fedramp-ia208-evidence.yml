@@ -26,8 +26,10 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     env:
+      GH_DAYS: 30
+      GH_MAX_AUDIT_PAGES: 25
+      GH_MAX_AUDIT_EVENTS: 2000
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
       GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
