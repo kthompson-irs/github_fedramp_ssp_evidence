@@ -370,7 +370,7 @@ class GitHubClient:
         return min((2**attempt) * 60, self.cfg.max_rate_limit_sleep_seconds)
 
     def _server_error_sleep_seconds(self, attempt: int) -> int:
-        return min((2**attempt) * 5, self.cfg.max_rate_limit_sleep_seconds)
+        return min((2**attempt) * 5, self.cfg.max_server_sleep_seconds)
 
     def request(
         self,
@@ -548,11 +548,6 @@ def collect_audit_day(
 
         page += 1
 
-    if page > max_pages and collected:
-        raise RuntimeError(
-            f"GET /orgs/{org}/audit-log window {created_filter} exceeded max pages ({max_pages})."
-        )
-
     return collected
 
 
@@ -571,15 +566,17 @@ def collect_audit_log(
     today = utc_now().date()
 
     if checkpoint.get("last_processed_day"):
-        start_date = parse_iso_date(str(checkpoint["last_processed_day"]))
+        start_date = parse_iso_date(str(checkpoint["last_processed_day"])) + dt.timedelta(days=1)
     else:
         start_date = iso_date_days_ago(days)
+
+    if start_date > today:
+        return []
 
     windows = date_windows(start_date, today, window_days)
     windows = windows[: max(1, max_windows_per_run)]
 
     collected: List[Dict[str, Any]] = []
-    last_completed_day: Optional[dt.date] = None
 
     for window_start, window_end in windows:
         if len(collected) >= max_events:
@@ -595,7 +592,6 @@ def collect_audit_log(
                 max_events=max_events - len(collected),
             )
             collected.extend(day_events)
-            last_completed_day = day
 
             checkpoint_data = {
                 "org": org,
@@ -617,9 +613,6 @@ def collect_audit_log(
                 break
 
             day += dt.timedelta(days=1)
-
-    if last_completed_day is None and checkpoint:
-        save_checkpoint(checkpoint_path, checkpoint)
 
     return collected
 
