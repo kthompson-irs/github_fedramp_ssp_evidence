@@ -844,15 +844,14 @@ def collect(cfg: GitHubConfig) -> Path:
     summary["persistent_archive_slice_dir"] = str(persistent_slice_dir)
     write_json(summary_path, summary)
 
-    # Refresh the archived copy only. Do not copy summary.json back onto itself in the run dir.
+    # Update only the archived copy; do not copy onto the same run-dir file.
     shutil.copy2(summary_path, persistent_slice_dir / "summary.json")
     shutil.copy2(control_map_path, persistent_slice_dir / "control_map.json")
 
-    # Keep the run directory copies in sync with the final summary values.
-    shutil.copy2(summary_path, output_dir / "summary.json")
-    shutil.copy2(control_map_path, output_dir / "control_map.json")
+    # Keep the run directory copies current after the final summary fields were added.
+    write_json(summary_path, summary)
+    write_json(control_map_path, control_map)
 
-    # Refresh manifest after final summary updates.
     build_manifest(output_dir, files)
 
     if cfg.archive_s3_bucket:
