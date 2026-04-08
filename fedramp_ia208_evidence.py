@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """Collect FedRAMP evidence for GitHub.com IA-2(8) and adjacent controls.
 
-This version is checkpointed so audit-log collection resumes from the last
-successfully processed day instead of starting over.
-
-It does that by:
-- using GitHub App installation auth end-to-end
-- collecting the audit log in 1-day windows by default
-- saving a durable checkpoint after each completed day
-- optionally pushing that checkpoint back to the repository after each day
-- retrying transient server and rate-limit errors with backoff
-- printing helpful debug headers on failures
-
-Outputs a timestamped folder containing:
-- org.json
-- audit_log.jsonl
-- audit_log.csv
-- credential_authorizations.json
-- installations.json
-- summary.json
-- manifest.md
+Features:
+- GitHub App installation auth end-to-end
+- checkpointed audit-log collection
+- daily delta mode after initial backfill
+- append-only archive slices
+- optional S3 sync for archive slices
+- debug output for failing endpoints
 
 Required env vars:
 - GH_APP_ID
@@ -30,7 +18,7 @@ Optional env vars:
 - GH_API_URL: default https://api.github.com
 - GH_API_VERSION: default 2022-11-28
 - GH_ENTERPRISE: retained for reporting only
-- GH_DAYS: default 90
+- GH_DAYS: default 90 (used only for initial backfill when no checkpoint exists)
 - GH_REQUEST_DELAY_SECONDS: default 0.25
 - GH_MAX_RETRIES: default 5
 - GH_MAX_RATE_LIMIT_SLEEP_SECONDS: default 3600
@@ -40,7 +28,11 @@ Optional env vars:
 - GH_AUDIT_MAX_EVENTS: default 10000
 - GH_MAX_WINDOWS_PER_RUN: default 7
 - GH_CHECKPOINT_FILE: default .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
+- GH_ARCHIVE_ROOT: default evidence/archive
 - GH_AUTO_PUSH_CHECKPOINT: default 1
+- GH_ARCHIVE_S3_BUCKET: optional, if set uploads archive slice to S3
+- GH_ARCHIVE_S3_PREFIX: optional, default irsdigitalservice
+- GH_AWS_REGION: optional
 """
 from __future__ import annotations
 
@@ -49,6 +41,7 @@ import datetime as dt
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -58,6 +51,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import jwt
 import requests
+
+
+CONTROL_MAP: Dict[str, List[str]] = {
+    "org.json": ["IA-2(8)", "AC-2"],
+    "credential_authorizations.json": ["IA-2(8)", "AC-2"],
+    "installations.json": ["IA-2(8)", "AC-2"],
+    "audit_log.jsonl": ["IA-2(8)", "AU-2", "AU-6", "AU-12"],
+    "audit_log.csv": ["IA-2(8)", "AU-2", "AU-6", "AU-12"],
+    "summary.json": ["IA-2(8)", "AC-2", "AU-2"],
+    "control_map.json": ["IA-2(8)", "AC-2", "AU-2"],
+    "manifest.md": ["IA-2(8)"],
+}
 
 
 @dataclass
@@ -79,7 +84,11 @@ class GitHubConfig:
     audit_max_events: int = 10000
     max_windows_per_run: int = 7
     checkpoint_file: str = ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json"
+    archive_root: str = "evidence/archive"
     auto_push_checkpoint: bool = True
+    archive_s3_bucket: Optional[str] = None
+    archive_s3_prefix: str = "irsdigitalservice"
+    aws_region: Optional[str] = None
 
 
 def utc_now() -> dt.datetime:
@@ -95,9 +104,7 @@ def parse_iso_date(value: str) -> dt.date:
 
 
 def date_windows(start: dt.date, end: dt.date, window_days: int) -> List[Tuple[dt.date, dt.date]]:
-    if window_days < 1:
-        window_days = 1
-
+    window_days = max(1, window_days)
     windows: List[Tuple[dt.date, dt.date]] = []
     cursor = start
     step = dt.timedelta(days=window_days)
@@ -141,6 +148,14 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True))
+            f.write("\n")
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -159,27 +174,41 @@ def build_manifest(output_dir: Path, files: List[Path]) -> None:
     (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def load_checkpoint(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
+def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True))
+        f.write("\n")
+
+
+def copy_tree(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.rglob("*"):
+        if item.is_file():
+            rel = item.relative_to(src)
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+def sync_directory_to_s3(directory: Path, bucket: str, prefix: str, region: Optional[str]) -> None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("boto3 is required for GH_ARCHIVE_S3_BUCKET uploads") from exc
 
+    client = boto3.client("s3", region_name=region or None)
+    base_prefix = prefix.strip("/")
 
-def save_checkpoint(path: Path, data: Dict[str, Any]) -> None:
-    write_json(path, data)
+    for file_path in directory.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel = file_path.relative_to(directory).as_posix()
+        key = f"{base_prefix}/{rel}" if base_prefix else rel
+        client.upload_file(str(file_path), bucket, key)
 
 
 def maybe_git_push_checkpoint(checkpoint_path: Path, message: str) -> None:
-    """
-    Best-effort push of the checkpoint file back to the repo.
-    This assumes the workflow has configured git auth for the checkout remote.
-    """
     if os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() in {"0", "false", "no"}:
         return
 
@@ -231,7 +260,7 @@ class GitHubAppAuthenticator:
             {
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": cfg.api_version,
-                "User-Agent": "fedramp-ia208-evidence-collector/5.0",
+                "User-Agent": "fedramp-ia208-evidence-collector/6.0",
             }
         )
 
@@ -308,7 +337,7 @@ class GitHubClient:
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {token}",
                 "X-GitHub-Api-Version": cfg.api_version,
-                "User-Agent": "fedramp-ia208-evidence-collector/5.0",
+                "User-Agent": "fedramp-ia208-evidence-collector/6.0",
             }
         )
 
@@ -370,7 +399,7 @@ class GitHubClient:
         return min((2**attempt) * 60, self.cfg.max_rate_limit_sleep_seconds)
 
     def _server_error_sleep_seconds(self, attempt: int) -> int:
-        return min((2**attempt) * 5, self.cfg.max_server_sleep_seconds)
+        return min((2**attempt) * 5, self.cfg.max_rate_limit_sleep_seconds)
 
     def request(
         self,
@@ -481,6 +510,20 @@ class GitHubClient:
             page += 1
 
 
+def load_checkpoint(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_checkpoint(path: Path, data: Dict[str, Any]) -> None:
+    write_json(path, data)
+
+
 def collect_audit_day(
     client: GitHubClient,
     org: str,
@@ -567,8 +610,10 @@ def collect_audit_log(
 
     if checkpoint.get("last_processed_day"):
         start_date = parse_iso_date(str(checkpoint["last_processed_day"])) + dt.timedelta(days=1)
+        collection_mode = "delta" if checkpoint.get("backfill_complete", False) else "backfill"
     else:
         start_date = iso_date_days_ago(days)
+        collection_mode = "backfill"
 
     if start_date > today:
         return []
@@ -600,6 +645,8 @@ def collect_audit_log(
                 "window_days": window_days,
                 "max_pages_per_window": max_pages_per_window,
                 "max_events": max_events,
+                "backfill_complete": day >= today,
+                "collection_mode": collection_mode if day < today else "delta",
             }
             save_checkpoint(checkpoint_path, checkpoint_data)
 
@@ -617,18 +664,46 @@ def collect_audit_log(
     return collected
 
 
+def archive_run(
+    run_dir: Path,
+    archive_root: Path,
+    run_stamp: str,
+    files_to_archive: List[str],
+    index_record: Dict[str, Any],
+) -> Path:
+    today = utc_now()
+    rel_slice = Path(today.strftime("%Y")) / today.strftime("%m") / today.strftime("%d") / f"run-{run_stamp}"
+    persistent_slice_dir = archive_root / rel_slice
+    run_slice_dir = run_dir / "archive" / rel_slice
+
+    for dest in (persistent_slice_dir, run_slice_dir):
+        dest.mkdir(parents=True, exist_ok=True)
+        for filename in files_to_archive:
+            src = run_dir / filename
+            if src.exists():
+                shutil.copy2(src, dest / filename)
+
+    append_jsonl(archive_root / "index.jsonl", index_record)
+    append_jsonl(run_dir / "archive" / "index.jsonl", index_record)
+
+    return persistent_slice_dir
+
+
 def collect(cfg: GitHubConfig) -> Path:
     auth = GitHubAppAuthenticator(cfg)
     installation_id = auth.get_installation_id()
     installation_token = auth.get_installation_token(installation_id)
     client = GitHubClient(cfg, installation_token)
 
-    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
-    output_dir = Path.cwd() / f"github_ia208_evidence_{stamp}"
+    run_stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    output_dir = Path.cwd() / f"github_ia208_evidence_{run_stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = Path(cfg.checkpoint_file)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    archive_root = Path.cwd() / cfg.archive_root
+    archive_root.mkdir(parents=True, exist_ok=True)
 
     files: List[Path] = []
 
@@ -669,10 +744,7 @@ def collect(cfg: GitHubConfig) -> Path:
         audit_events = [{"error": str(exc)}]
 
     audit_jsonl = output_dir / "audit_log.jsonl"
-    with audit_jsonl.open("w", encoding="utf-8") as f:
-        for event in audit_events:
-            f.write(json.dumps(event, sort_keys=True))
-            f.write("\n")
+    write_jsonl(audit_jsonl, audit_events)
     files.append(audit_jsonl)
 
     audit_csv = output_dir / "audit_log.csv"
@@ -693,6 +765,8 @@ def collect(cfg: GitHubConfig) -> Path:
     files.append(audit_csv)
 
     checkpoint = load_checkpoint(checkpoint_path)
+    control_map = {name: CONTROL_MAP[name] for name in CONTROL_MAP if name != "manifest.md"}
+    controls_covered = sorted({c for vals in control_map.values() for c in vals})
 
     summary: Dict[str, Any] = {
         "org": cfg.org,
@@ -703,6 +777,7 @@ def collect(cfg: GitHubConfig) -> Path:
         "audit_max_pages_per_window": cfg.audit_max_pages_per_window,
         "audit_max_events": cfg.audit_max_events,
         "max_windows_per_run": cfg.max_windows_per_run,
+        "collection_mode": checkpoint.get("collection_mode", "backfill" if not checkpoint else "delta"),
         "collected_at": utc_now().isoformat(),
         "org_two_factor_requirement_enabled": org.get("two_factor_requirement_enabled"),
         "org_has_saml_sso_authorizations_endpoint": True,
@@ -711,6 +786,12 @@ def collect(cfg: GitHubConfig) -> Path:
         "audit_event_count": len(rows_for_csv),
         "checkpoint_file": str(checkpoint_path),
         "checkpoint_last_processed_day": checkpoint.get("last_processed_day"),
+        "checkpoint_backfill_complete": bool(checkpoint.get("backfill_complete", False)),
+        "archive_root": str(archive_root),
+        "run_stamp": run_stamp,
+        "run_dir": str(output_dir),
+        "controls_covered": controls_covered,
+        "control_map": control_map,
         "potential_gaps": [],
     }
 
@@ -740,7 +821,53 @@ def collect(cfg: GitHubConfig) -> Path:
     write_json(summary_path, summary)
     files.append(summary_path)
 
+    control_map_path = output_dir / "control_map.json"
+    write_json(control_map_path, control_map)
+    files.append(control_map_path)
+
     build_manifest(output_dir, files)
+
+    archive_index_record = {
+        "run_stamp": run_stamp,
+        "org": cfg.org,
+        "run_dir": str(output_dir),
+        "archive_root": str(archive_root),
+        "archive_slice_rel": f"{dt.datetime.now(dt.timezone.utc).strftime('%Y/%m/%d')}/run-{run_stamp}",
+        "checkpoint_file": str(checkpoint_path),
+        "checkpoint_last_processed_day": summary["checkpoint_last_processed_day"],
+        "collection_mode": summary["collection_mode"],
+        "controls_covered": controls_covered,
+        "files": [p.name for p in files],
+        "record_type": "evidence_slice",
+        "created_at": utc_now().isoformat(),
+    }
+
+    persistent_slice_dir = archive_run(
+        run_dir=output_dir,
+        archive_root=archive_root,
+        run_stamp=run_stamp,
+        files_to_archive=[p.name for p in files],
+        index_record=archive_index_record,
+    )
+
+    summary["archive_slice_dir"] = str(output_dir / "archive" / archive_index_record["archive_slice_rel"])
+    summary["persistent_archive_slice_dir"] = str(persistent_slice_dir)
+    write_json(summary_path, summary)
+
+    # Update copies after adding archive path info.
+    shutil.copy2(summary_path, output_dir / "summary.json")
+    shutil.copy2(control_map_path, output_dir / "control_map.json")
+    shutil.copy2(summary_path, persistent_slice_dir / "summary.json")
+    shutil.copy2(control_map_path, persistent_slice_dir / "control_map.json")
+
+    # Refresh manifest to include no extra files, but keep it aligned with summary location.
+    build_manifest(output_dir, files)
+
+    # Optional S3 sync of the persistent archive slice.
+    if cfg.archive_s3_bucket:
+        s3_prefix = f"{cfg.archive_s3_prefix.strip('/')}/{archive_index_record['archive_slice_rel']}".strip("/")
+        sync_directory_to_s3(persistent_slice_dir, cfg.archive_s3_bucket, s3_prefix, cfg.aws_region)
+
     return output_dir
 
 
@@ -753,90 +880,53 @@ def main() -> int:
         print("Set GH_APP_ID, GH_APP_PRIVATE_KEY, and GH_ORG before running.", file=sys.stderr)
         return 2
 
-    try:
-        days = int(os.environ.get("GH_DAYS", "90"))
-    except ValueError:
-        print("GH_DAYS must be an integer.", file=sys.stderr)
-        return 2
+    def read_int(name: str, default: str) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            print(f"{name} must be an integer.", file=sys.stderr)
+            raise
+
+    def read_float(name: str, default: str) -> float:
+        try:
+            return float(os.environ.get(name, default))
+        except ValueError:
+            print(f"{name} must be a number.", file=sys.stderr)
+            raise
 
     try:
-        request_delay_seconds = float(os.environ.get("GH_REQUEST_DELAY_SECONDS", "0.25"))
-    except ValueError:
-        print("GH_REQUEST_DELAY_SECONDS must be a number.", file=sys.stderr)
+        cfg = GitHubConfig(
+            app_id=app_id,
+            private_key=private_key,
+            org=org,
+            api_url=os.environ.get("GH_API_URL", "https://api.github.com").strip(),
+            api_version=os.environ.get("GH_API_VERSION", "2022-11-28").strip(),
+            enterprise=os.environ.get("GH_ENTERPRISE") or None,
+            days=read_int("GH_DAYS", "90"),
+            request_delay_seconds=read_float("GH_REQUEST_DELAY_SECONDS", "0.25"),
+            max_retries=read_int("GH_MAX_RETRIES", "5"),
+            max_rate_limit_sleep_seconds=read_int("GH_MAX_RATE_LIMIT_SLEEP_SECONDS", "3600"),
+            max_server_sleep_seconds=read_int("GH_MAX_SERVER_SLEEP_SECONDS", "300"),
+            audit_window_days=read_int("GH_AUDIT_WINDOW_DAYS", "1"),
+            audit_max_pages_per_window=read_int("GH_AUDIT_MAX_PAGES_PER_WINDOW", "50"),
+            audit_max_events=read_int("GH_AUDIT_MAX_EVENTS", "10000"),
+            max_windows_per_run=read_int("GH_MAX_WINDOWS_PER_RUN", "7"),
+            checkpoint_file=os.environ.get(
+                "GH_CHECKPOINT_FILE",
+                ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json",
+            ).strip(),
+            archive_root=os.environ.get("GH_ARCHIVE_ROOT", "evidence/archive").strip(),
+            auto_push_checkpoint=os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            },
+            archive_s3_bucket=os.environ.get("GH_ARCHIVE_S3_BUCKET") or None,
+            archive_s3_prefix=os.environ.get("GH_ARCHIVE_S3_PREFIX", "irsdigitalservice").strip(),
+            aws_region=os.environ.get("GH_AWS_REGION") or None,
+        )
+    except Exception:
         return 2
-
-    try:
-        max_retries = int(os.environ.get("GH_MAX_RETRIES", "5"))
-    except ValueError:
-        print("GH_MAX_RETRIES must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        max_rate_limit_sleep_seconds = int(os.environ.get("GH_MAX_RATE_LIMIT_SLEEP_SECONDS", "3600"))
-    except ValueError:
-        print("GH_MAX_RATE_LIMIT_SLEEP_SECONDS must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        max_server_sleep_seconds = int(os.environ.get("GH_MAX_SERVER_SLEEP_SECONDS", "300"))
-    except ValueError:
-        print("GH_MAX_SERVER_SLEEP_SECONDS must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        audit_window_days = int(os.environ.get("GH_AUDIT_WINDOW_DAYS", "1"))
-    except ValueError:
-        print("GH_AUDIT_WINDOW_DAYS must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        audit_max_pages_per_window = int(os.environ.get("GH_AUDIT_MAX_PAGES_PER_WINDOW", "50"))
-    except ValueError:
-        print("GH_AUDIT_MAX_PAGES_PER_WINDOW must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        audit_max_events = int(os.environ.get("GH_AUDIT_MAX_EVENTS", "10000"))
-    except ValueError:
-        print("GH_AUDIT_MAX_EVENTS must be an integer.", file=sys.stderr)
-        return 2
-
-    try:
-        max_windows_per_run = int(os.environ.get("GH_MAX_WINDOWS_PER_RUN", "7"))
-    except ValueError:
-        print("GH_MAX_WINDOWS_PER_RUN must be an integer.", file=sys.stderr)
-        return 2
-
-    checkpoint_file = os.environ.get(
-        "GH_CHECKPOINT_FILE",
-        ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json",
-    ).strip()
-
-    auto_push_checkpoint = os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-    }
-
-    cfg = GitHubConfig(
-        app_id=app_id,
-        private_key=private_key,
-        org=org,
-        api_url=os.environ.get("GH_API_URL", "https://api.github.com").strip(),
-        api_version=os.environ.get("GH_API_VERSION", "2022-11-28").strip(),
-        enterprise=os.environ.get("GH_ENTERPRISE") or None,
-        days=days,
-        request_delay_seconds=request_delay_seconds,
-        max_retries=max_retries,
-        max_rate_limit_sleep_seconds=max_rate_limit_sleep_seconds,
-        max_server_sleep_seconds=max_server_sleep_seconds,
-        audit_window_days=audit_window_days,
-        audit_max_pages_per_window=audit_max_pages_per_window,
-        audit_max_events=audit_max_events,
-        max_windows_per_run=max_windows_per_run,
-        checkpoint_file=checkpoint_file,
-        auto_push_checkpoint=auto_push_checkpoint,
-    )
 
     try:
         output_dir = collect(cfg)
