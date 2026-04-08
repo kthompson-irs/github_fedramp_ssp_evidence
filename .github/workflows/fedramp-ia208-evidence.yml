@@ -53,7 +53,7 @@ jobs:
       GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
       GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
       GH_MAX_SERVER_SLEEP_SECONDS: ${{ vars.GH_MAX_SERVER_SLEEP_SECONDS || '300' }}
-      GH_CHECKPOINT_FILE: .github/evidence_state/irsdigitalservice_audit_checkpoint.json
+      GH_CHECKPOINT_FILE: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
       GH_AUTO_PUSH_CHECKPOINT: "1"
 
     steps:
@@ -138,7 +138,7 @@ jobs:
               audit_max_pages_per_window: int = 50
               audit_max_events: int = 10000
               max_windows_per_run: int = 7
-              checkpoint_file: str = ".github/evidence_state/irsdigitalservice_audit_checkpoint.json"
+              checkpoint_file: str = ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json"
               auto_push_checkpoint: bool = True
 
 
@@ -562,26 +562,31 @@ jobs:
                   resp = client.request("GET", f"/orgs/{org}/audit-log", params=params)
 
                   if resp.status_code in (500, 502, 503, 504):
+                      client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
                       raise RuntimeError(
                           f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                           f"{resp.status_code} {resp.text[:400]}"
                       )
                   if resp.status_code == 404:
+                      client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
                       raise RuntimeError(
                           f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                           f"404 Not Found. Response: {resp.text[:400]}"
                       )
                   if resp.status_code == 401:
+                      client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
                       raise RuntimeError(
                           f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                           f"401 Unauthorized. Response: {resp.text[:400]}"
                       )
                   if resp.status_code == 403 and not client._is_rate_limit_response(resp):
+                      client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
                       raise RuntimeError(
                           f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                           f"403 Forbidden. Response: {resp.text[:400]}"
                       )
                   if resp.status_code >= 400 and not client._is_rate_limit_response(resp):
+                      client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
                       raise RuntimeError(
                           f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                           f"{resp.status_code} {resp.text[:400]}"
@@ -869,7 +874,7 @@ jobs:
 
               checkpoint_file = os.environ.get(
                   "GH_CHECKPOINT_FILE",
-                  ".github/evidence_state/irsdigitalservice_audit_checkpoint.json",
+                  ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json",
               ).strip()
 
               auto_push_checkpoint = os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() not in {
@@ -953,6 +958,14 @@ jobs:
         with:
           name: fedramp-ia208-evidence
           path: ${{ steps.run_collector.outputs.output_dir }}
+          if-no-files-found: error
+
+      - name: Upload checkpoint artifact
+        if: always() && hashFiles('.github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-ia208-checkpoint
+          path: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
           if-no-files-found: error
 
       - name: Commit updated checkpoint
