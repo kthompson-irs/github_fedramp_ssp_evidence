@@ -14,7 +14,7 @@ on:
       gh_days:
         description: "How many days of audit log to collect"
         required: false
-        default: "90"
+        default: "30"
         type: string
   schedule:
     - cron: "0 4 * * 1"
@@ -27,7 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      GH_DAYS: 30
       GH_MAX_AUDIT_PAGES: 25
       GH_MAX_AUDIT_EVENTS: 2000
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
