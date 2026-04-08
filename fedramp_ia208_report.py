@@ -1,0 +1,173 @@
+name: FedRAMP IA-2(8) Evidence Collection
+
+on:
+  workflow_dispatch:
+    inputs:
+      gh_org:
+        description: "GitHub organization login"
+        required: false
+        type: string
+      gh_enterprise:
+        description: "Enterprise slug for optional reporting"
+        required: false
+        type: string
+      gh_days:
+        description: "How many days of audit log history to backfill if no checkpoint exists"
+        required: false
+        default: "90"
+        type: string
+      gh_audit_window_days:
+        description: "How many days to include per audit-log window"
+        required: false
+        default: "1"
+        type: string
+      gh_max_windows_per_run:
+        description: "How many day windows to process per run"
+        required: false
+        default: "7"
+        type: string
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
+      GH_API_URL: https://api.github.com
+      GH_API_VERSION: 2022-11-28
+      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
+      GH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_days || vars.GH_DAYS || '90' }}
+      GH_AUDIT_WINDOW_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_audit_window_days || vars.GH_AUDIT_WINDOW_DAYS || '1' }}
+      GH_MAX_WINDOWS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_max_windows_per_run || vars.GH_MAX_WINDOWS_PER_RUN || '7' }}
+      GH_AUDIT_MAX_PAGES_PER_WINDOW: ${{ vars.GH_AUDIT_MAX_PAGES_PER_WINDOW || '50' }}
+      GH_AUDIT_MAX_EVENTS: ${{ vars.GH_AUDIT_MAX_EVENTS || '10000' }}
+      GH_REQUEST_DELAY_SECONDS: ${{ vars.GH_REQUEST_DELAY_SECONDS || '0.25' }}
+      GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
+      GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
+      GH_MAX_SERVER_SLEEP_SECONDS: ${{ vars.GH_MAX_SERVER_SLEEP_SECONDS || '300' }}
+      GH_CHECKPOINT_FILE: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
+      GH_ARCHIVE_ROOT: evidence/archive
+      GH_AUTO_PUSH_CHECKPOINT: "1"
+      GH_ARCHIVE_S3_BUCKET: ${{ vars.GH_ARCHIVE_S3_BUCKET }}
+      GH_ARCHIVE_S3_PREFIX: ${{ vars.GH_ARCHIVE_S3_PREFIX || 'irsdigitalservice' }}
+      GH_AWS_REGION: ${{ vars.GH_AWS_REGION }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git for checkpoint pushes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pyjwt cryptography reportlab boto3
+
+      - name: Validate required env vars
+        run: |
+          test -n "$GH_APP_ID"
+          test -n "$GH_APP_PRIVATE_KEY"
+          test -n "$GH_ORG"
+
+      - name: Write evidence collector
+        run: |
+          cat > fedramp_ia208_evidence.py <<'PY'
+          <PASTE THE FULL fedramp_ia208_evidence.py SCRIPT FROM ABOVE HERE>
+          PY
+          chmod +x fedramp_ia208_evidence.py
+
+      - name: Write report generator
+        run: |
+          cat > fedramp_ia208_report.py <<'PY'
+          <PASTE THE FULL fedramp_ia208_report.py SCRIPT FROM ABOVE HERE>
+          PY
+          chmod +x fedramp_ia208_report.py
+
+      - name: Run collector
+        id: run_collector
+        run: |
+          set -euo pipefail
+          output_dir="$(python fedramp_ia208_evidence.py)"
+          echo "output_dir=$output_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SSP report
+        id: report
+        run: |
+          set -euo pipefail
+          python fedramp_ia208_report.py --run-dir "${{ steps.run_collector.outputs.output_dir }}"
+
+      - name: Add summary
+        if: always()
+        run: |
+          {
+            echo "## FedRAMP IA-2(8) evidence collection"
+            echo
+            echo "Organization: $GH_ORG"
+            echo "Days collected: $GH_DAYS"
+            echo "Audit window days: $GH_AUDIT_WINDOW_DAYS"
+            echo "Max windows per run: $GH_MAX_WINDOWS_PER_RUN"
+            echo "Checkpoint file: $GH_CHECKPOINT_FILE"
+            echo "Archive root: $GH_ARCHIVE_ROOT"
+            echo "Output directory: ${{ steps.run_collector.outputs.output_dir }}"
+            echo
+            if [ -f "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md" ]; then
+              echo "### SSP-ready Markdown"
+              echo '```'
+              cat "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md"
+              echo '```'
+            fi
+            if [ -f "${{ steps.run_collector.outputs.output_dir }}/summary.json" ]; then
+              echo "### Summary"
+              echo '```json'
+              cat "${{ steps.run_collector.outputs.output_dir }}/summary.json"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence artifact
+        if: always() && steps.run_collector.outputs.output_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-ia208-evidence
+          path: ${{ steps.run_collector.outputs.output_dir }}
+          if-no-files-found: error
+
+      - name: Upload checkpoint artifact
+        if: always() && hashFiles('.github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-ia208-checkpoint
+          path: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
+          if-no-files-found: error
+
+      - name: Commit updated checkpoint
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f "$GH_CHECKPOINT_FILE" ]; then
+            if ! git diff --quiet -- "$GH_CHECKPOINT_FILE"; then
+              git add "$GH_CHECKPOINT_FILE"
+              git commit -m "Update audit checkpoint" || true
+              git push || true
+            fi
+          fi
