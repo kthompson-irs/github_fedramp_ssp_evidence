@@ -181,16 +181,6 @@ def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
         f.write("\n")
 
 
-def copy_tree(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=True)
-    for item in src.rglob("*"):
-        if item.is_file():
-            rel = item.relative_to(src)
-            target = dst / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, target)
-
-
 def sync_directory_to_s3(directory: Path, bucket: str, prefix: str, region: Optional[str]) -> None:
     try:
         import boto3  # type: ignore
@@ -399,7 +389,7 @@ class GitHubClient:
         return min((2**attempt) * 60, self.cfg.max_rate_limit_sleep_seconds)
 
     def _server_error_sleep_seconds(self, attempt: int) -> int:
-        return min((2**attempt) * 5, self.cfg.max_rate_limit_sleep_seconds)
+        return min((2**attempt) * 5, self.cfg.max_server_sleep_seconds)
 
     def request(
         self,
@@ -854,16 +844,13 @@ def collect(cfg: GitHubConfig) -> Path:
     summary["persistent_archive_slice_dir"] = str(persistent_slice_dir)
     write_json(summary_path, summary)
 
-    # Update copies after adding archive path info.
     shutil.copy2(summary_path, output_dir / "summary.json")
     shutil.copy2(control_map_path, output_dir / "control_map.json")
     shutil.copy2(summary_path, persistent_slice_dir / "summary.json")
     shutil.copy2(control_map_path, persistent_slice_dir / "control_map.json")
 
-    # Refresh manifest to include no extra files, but keep it aligned with summary location.
     build_manifest(output_dir, files)
 
-    # Optional S3 sync of the persistent archive slice.
     if cfg.archive_s3_bucket:
         s3_prefix = f"{cfg.archive_s3_prefix.strip('/')}/{archive_index_record['archive_slice_rel']}".strip("/")
         sync_directory_to_s3(persistent_slice_dir, cfg.archive_s3_bucket, s3_prefix, cfg.aws_region)
@@ -881,15 +868,17 @@ def main() -> int:
         return 2
 
     def read_int(name: str, default: str) -> int:
+        value = os.environ.get(name, default)
         try:
-            return int(os.environ.get(name, default))
+            return int(value)
         except ValueError:
             print(f"{name} must be an integer.", file=sys.stderr)
             raise
 
     def read_float(name: str, default: str) -> float:
+        value = os.environ.get(name, default)
         try:
-            return float(os.environ.get(name, default))
+            return float(value)
         except ValueError:
             print(f"{name} must be a number.", file=sys.stderr)
             raise
