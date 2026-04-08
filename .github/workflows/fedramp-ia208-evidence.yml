@@ -14,7 +14,12 @@ on:
       gh_days:
         description: "How many days of audit log to collect"
         required: false
-        default: "30"
+        default: "90"
+        type: string
+      gh_audit_window_days:
+        description: "How many days to include per audit-log window"
+        required: false
+        default: "1"
         type: string
   schedule:
     - cron: "0 4 * * 1"
@@ -26,9 +31,8 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     env:
-      GH_MAX_AUDIT_PAGES: 25
-      GH_MAX_AUDIT_EVENTS: 2000
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
       GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
@@ -36,9 +40,13 @@ jobs:
       GH_API_VERSION: 2022-11-28
       GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
       GH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_days || vars.GH_DAYS || '90' }}
+      GH_AUDIT_WINDOW_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_audit_window_days || vars.GH_AUDIT_WINDOW_DAYS || '1' }}
+      GH_AUDIT_MAX_PAGES_PER_WINDOW: ${{ vars.GH_AUDIT_MAX_PAGES_PER_WINDOW || '50' }}
+      GH_AUDIT_MAX_EVENTS: ${{ vars.GH_AUDIT_MAX_EVENTS || '10000' }}
       GH_REQUEST_DELAY_SECONDS: ${{ vars.GH_REQUEST_DELAY_SECONDS || '0.25' }}
       GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
       GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
+      GH_MAX_SERVER_SLEEP_SECONDS: ${{ vars.GH_MAX_SERVER_SLEEP_SECONDS || '300' }}
 
     steps:
       - name: Check out repository
@@ -66,18 +74,12 @@ jobs:
           #!/usr/bin/env python3
           """Collect FedRAMP evidence for GitHub.com IA-2(8) and adjacent controls.
 
-          This version is tuned to avoid hammering the API:
-          - Uses a GitHub App installation token end-to-end.
-          - Sends requests serially.
-          - Sleeps briefly before each request.
-          - Honors Retry-After and x-ratelimit-reset.
-          - Uses bounded retries with exponential backoff.
-          - Keeps the audit-log window narrow via GH_DAYS.
-
-          Required env vars:
-          - GH_APP_ID
-          - GH_APP_PRIVATE_KEY
-          - GH_ORG
+          This version reduces deep-pagination failures by:
+          - using GitHub App installation auth end-to-end
+          - retrying transient server errors with backoff
+          - printing helpful debug headers on failures
+          - querying the audit log in small time windows instead of one huge crawl
+          - capping pages per window and total events
           """
           from __future__ import annotations
 
@@ -90,7 +92,7 @@ jobs:
           import time
           from dataclasses import dataclass
           from pathlib import Path
-          from typing import Any, Dict, Iterable, List, Optional
+          from typing import Any, Dict, Iterable, List, Optional, Tuple
 
           import jwt
           import requests
@@ -109,6 +111,81 @@ jobs:
               request_delay_seconds: float = 0.25
               max_retries: int = 5
               max_rate_limit_sleep_seconds: int = 3600
+              max_server_sleep_seconds: int = 300
+              audit_window_days: int = 1
+              audit_max_pages_per_window: int = 50
+              audit_max_events: int = 10000
+
+
+          def utc_now() -> dt.datetime:
+              return dt.datetime.now(dt.timezone.utc)
+
+
+          def iso_date_days_ago(days: int) -> dt.date:
+              return (utc_now() - dt.timedelta(days=days)).date()
+
+
+          def date_windows(start: dt.date, end: dt.date, window_days: int) -> List[Tuple[dt.date, dt.date]]:
+              if window_days < 1:
+                  window_days = 1
+
+              windows: List[Tuple[dt.date, dt.date]] = []
+              cursor = start
+              step = dt.timedelta(days=window_days)
+
+              while cursor <= end:
+                  window_end = min(cursor + step - dt.timedelta(days=1), end)
+                  windows.append((cursor, window_end))
+                  cursor = window_end + dt.timedelta(days=1)
+
+              return windows
+
+
+          def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
+              created_at = event.get("created_at")
+              if isinstance(created_at, (int, float)):
+                  created_iso = dt.datetime.fromtimestamp(created_at / 1000.0, tz=dt.timezone.utc).isoformat()
+              else:
+                  created_iso = created_at
+
+              country_code = event.get("actor_location.country_code")
+              if country_code is None and isinstance(event.get("actor_location"), dict):
+                  country_code = event["actor_location"].get("country_code")
+
+              return {
+                  "created_at": created_iso,
+                  "action": event.get("action"),
+                  "actor": event.get("actor"),
+                  "user": event.get("user"),
+                  "org": event.get("org"),
+                  "repo": event.get("repo"),
+                  "team": event.get("team"),
+                  "visibility": event.get("visibility"),
+                  "ip": event.get("ip_address") or event.get("client_ip_address"),
+                  "country_code": country_code,
+                  "raw": event,
+              }
+
+
+          def write_json(path: Path, data: Any) -> None:
+              path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+          def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for row in rows:
+                      writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+          def build_manifest(output_dir: Path, files: List[Path]) -> None:
+              lines = ["# Evidence Manifest", ""]
+              lines.append(f"Generated: {utc_now().isoformat()}")
+              lines.append("")
+              for file_path in files:
+                  lines.append(f"- {file_path.relative_to(output_dir).as_posix()}")
+              (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
           class GitHubAppAuthenticator:
@@ -119,7 +196,7 @@ jobs:
                       {
                           "Accept": "application/vnd.github+json",
                           "X-GitHub-Api-Version": cfg.api_version,
-                          "User-Agent": "fedramp-ia208-evidence-collector/3.0",
+                          "User-Agent": "fedramp-ia208-evidence-collector/4.0",
                       }
                   )
 
@@ -147,10 +224,9 @@ jobs:
               ) -> requests.Response:
                   headers = dict(self.session.headers)
                   headers["Authorization"] = f"Bearer {self._jwt_token()}"
-                  url = self._url(path_or_url)
                   return self.session.request(
                       method,
-                      url,
+                      self._url(path_or_url),
                       headers=headers,
                       params=params,
                       json=json_body,
@@ -197,7 +273,7 @@ jobs:
                           "Accept": "application/vnd.github+json",
                           "Authorization": f"Bearer {token}",
                           "X-GitHub-Api-Version": cfg.api_version,
-                          "User-Agent": "fedramp-ia208-evidence-collector/3.0",
+                          "User-Agent": "fedramp-ia208-evidence-collector/4.0",
                       }
                   )
 
@@ -210,6 +286,19 @@ jobs:
                   delay = self.cfg.request_delay_seconds
                   if delay > 0:
                       time.sleep(delay + random.uniform(0.0, min(0.25, delay)))
+
+              def _debug_failure(self, resp: requests.Response, path_or_url: str) -> None:
+                  print("\n=== DEBUG: API FAILURE ===", file=sys.stderr)
+                  print(f"Endpoint: {path_or_url}", file=sys.stderr)
+                  print(f"Status: {resp.status_code}", file=sys.stderr)
+                  print(
+                      "X-Accepted-GitHub-Permissions:",
+                      resp.headers.get("X-Accepted-GitHub-Permissions"),
+                      file=sys.stderr,
+                  )
+                  print("X-OAuth-Scopes:", resp.headers.get("X-OAuth-Scopes"), file=sys.stderr)
+                  print("Response:", resp.text[:500], file=sys.stderr)
+                  print("=== END DEBUG ===\n", file=sys.stderr)
 
               def _is_rate_limit_response(self, resp: requests.Response) -> bool:
                   if resp.status_code == 429:
@@ -225,7 +314,7 @@ jobs:
                       return True
                   return False
 
-              def _rate_limit_sleep_seconds(self, resp: requests.Response, attempt: int) -> int:
+              def _retry_sleep_seconds(self, resp: requests.Response, attempt: int) -> int:
                   retry_after = resp.headers.get("Retry-After")
                   if retry_after:
                       try:
@@ -239,14 +328,14 @@ jobs:
                       try:
                           reset_epoch = int(reset)
                           now = int(time.time())
-                          return max(
-                              60,
-                              min(reset_epoch - now + 2, self.cfg.max_rate_limit_sleep_seconds),
-                          )
+                          return max(60, min(reset_epoch - now + 2, self.cfg.max_rate_limit_sleep_seconds))
                       except ValueError:
                           pass
 
                   return min((2**attempt) * 60, self.cfg.max_rate_limit_sleep_seconds)
+
+              def _server_error_sleep_seconds(self, attempt: int) -> int:
+                  return min((2**attempt) * 5, self.cfg.max_server_sleep_seconds)
 
               def request(
                   self,
@@ -268,18 +357,18 @@ jobs:
                       )
                       last_resp = resp
 
+                      if resp.status_code in (500, 502, 503, 504):
+                          self._debug_failure(resp, path_or_url)
+                          time.sleep(self._server_error_sleep_seconds(attempt))
+                          continue
+
                       if not self._is_rate_limit_response(resp):
                           return resp
 
-                      sleep_for = self._rate_limit_sleep_seconds(resp, attempt)
-                      if sleep_for > 0:
-                          time.sleep(sleep_for)
+                      self._debug_failure(resp, path_or_url)
+                      time.sleep(self._retry_sleep_seconds(resp, attempt))
 
                   return last_resp if last_resp is not None else resp
-
-              def _auth_hint(self, resp: requests.Response) -> str:
-                  sso = resp.headers.get("X-GitHub-SSO")
-                  return f" X-GitHub-SSO={sso}" if sso else ""
 
               def get_json(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
                   resp = self.request("GET", path_or_url, params=params)
@@ -288,24 +377,22 @@ jobs:
                       raise RuntimeError(
                           f"GET {path_or_url} failed: 404 Not Found. "
                           f"Verify the org login and that the app installation can see it. "
-                          f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                          f"Response: {resp.text[:400]}"
                       )
                   if resp.status_code == 401:
                       raise RuntimeError(
                           f"GET {path_or_url} failed: 401 Unauthorized. "
                           f"Check the app credentials and generated installation token. "
-                          f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                          f"Response: {resp.text[:400]}"
                       )
                   if resp.status_code == 403:
                       raise RuntimeError(
                           f"GET {path_or_url} failed: 403 Forbidden. "
                           f"Check the app's granted permissions and installation access. "
-                          f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                          f"Response: {resp.text[:400]}"
                       )
                   if resp.status_code >= 400:
-                      raise RuntimeError(
-                          f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}"
-                      )
+                      raise RuntimeError(f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}")
 
                   return resp.json()
 
@@ -319,23 +406,28 @@ jobs:
                       page_params["page"] = page
                       resp = self.request("GET", path_or_url, params=page_params)
 
+                      if resp.status_code in (500, 502, 503, 504):
+                          raise RuntimeError(
+                              f"GET {path_or_url} page {page} failed: {resp.status_code} {resp.text[:400]}"
+                          )
+
                       if resp.status_code == 404:
                           raise RuntimeError(
                               f"GET {path_or_url} page {page} failed: 404 Not Found. "
                               f"Verify the org login and that the app installation can see it. "
-                              f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                              f"Response: {resp.text[:400]}"
                           )
                       if resp.status_code == 401:
                           raise RuntimeError(
                               f"GET {path_or_url} page {page} failed: 401 Unauthorized. "
                               f"Check the app credentials and generated installation token. "
-                              f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                              f"Response: {resp.text[:400]}"
                           )
                       if resp.status_code == 403 and not self._is_rate_limit_response(resp):
                           raise RuntimeError(
                               f"GET {path_or_url} page {page} failed: 403 Forbidden. "
                               f"Check the app's granted permissions and installation access. "
-                              f"Response: {resp.text[:400]}{self._auth_hint(resp)}"
+                              f"Response: {resp.text[:400]}"
                           )
                       if resp.status_code >= 400 and not self._is_rate_limit_response(resp):
                           raise RuntimeError(
@@ -355,58 +447,91 @@ jobs:
                       page += 1
 
 
-          def iso_date_days_ago(days: int) -> str:
-              return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).date().isoformat()
+          def collect_audit_log(
+              client: GitHubClient,
+              org: str,
+              days: int,
+              window_days: int,
+              max_pages_per_window: int,
+              max_events: int,
+          ) -> List[Dict[str, Any]]:
+              start_date = iso_date_days_ago(days)
+              end_date = utc_now().date()
+              windows = date_windows(start_date, end_date, window_days)
 
+              collected: List[Dict[str, Any]] = []
+              seen_keys: set[Tuple[str, str, str, str]] = set()
 
-          def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
-              created_at = event.get("created_at")
-              if isinstance(created_at, (int, float)):
-                  created_iso = dt.datetime.fromtimestamp(
-                      created_at / 1000.0, tz=dt.timezone.utc
-                  ).isoformat()
-              else:
-                  created_iso = created_at
+              for w_start, w_end in windows:
+                  if len(collected) >= max_events:
+                      break
 
-              country_code = event.get("actor_location.country_code")
-              if country_code is None and isinstance(event.get("actor_location"), dict):
-                  country_code = event["actor_location"].get("country_code")
+                  created_filter = f"created:{w_start.isoformat()}..{w_end.isoformat()}"
+                  page = 1
 
-              return {
-                  "created_at": created_iso,
-                  "action": event.get("action"),
-                  "actor": event.get("actor"),
-                  "user": event.get("user"),
-                  "org": event.get("org"),
-                  "repo": event.get("repo"),
-                  "team": event.get("team"),
-                  "visibility": event.get("visibility"),
-                  "ip": event.get("ip_address") or event.get("client_ip_address"),
-                  "country_code": country_code,
-                  "raw": event,
-              }
+                  while page <= max_pages_per_window and len(collected) < max_events:
+                      params = {
+                          "include": "all",
+                          "phrase": created_filter,
+                          "per_page": 100,
+                          "order": "desc",
+                          "page": page,
+                      }
 
+                      resp = client.request("GET", f"/orgs/{org}/audit-log", params=params)
 
-          def write_json(path: Path, data: Any) -> None:
-              path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+                      if resp.status_code in (500, 502, 503, 504):
+                          raise RuntimeError(
+                              f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
+                              f"{resp.status_code} {resp.text[:400]}"
+                          )
 
+                      if resp.status_code == 404:
+                          raise RuntimeError(
+                              f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
+                              f"404 Not Found. Response: {resp.text[:400]}"
+                          )
+                      if resp.status_code == 401:
+                          raise RuntimeError(
+                              f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
+                              f"401 Unauthorized. Response: {resp.text[:400]}"
+                          )
+                      if resp.status_code == 403 and not client._is_rate_limit_response(resp):
+                          raise RuntimeError(
+                              f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
+                              f"403 Forbidden. Response: {resp.text[:400]}"
+                          )
+                      if resp.status_code >= 400 and not client._is_rate_limit_response(resp):
+                          raise RuntimeError(
+                              f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
+                              f"{resp.status_code} {resp.text[:400]}"
+                          )
 
-          def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-              with path.open("w", newline="", encoding="utf-8") as f:
-                  writer = csv.DictWriter(f, fieldnames=fieldnames)
-                  writer.writeheader()
-                  for row in rows:
-                      writer.writerow({k: row.get(k, "") for k in fieldnames})
+                      data = resp.json()
+                      if not isinstance(data, list) or not data:
+                          break
 
+                      for event in data:
+                          normalized = normalize_audit_event(event)
+                          key = (
+                              str(normalized.get("created_at")),
+                              str(normalized.get("action")),
+                              str(normalized.get("actor")),
+                              str(normalized.get("org")),
+                          )
+                          if key in seen_keys:
+                              continue
+                          seen_keys.add(key)
+                          collected.append(normalized)
+                          if len(collected) >= max_events:
+                              break
 
-          def build_manifest(output_dir: Path, files: List[Path]) -> None:
-              lines = ["# Evidence Manifest", ""]
-              lines.append(f"Generated: {dt.datetime.now(dt.timezone.utc).isoformat()}")
-              lines.append("")
-              for file_path in files:
-                  rel = file_path.relative_to(output_dir)
-                  lines.append(f"- {rel.as_posix()}")
-              (output_dir / "manifest.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                      if 'rel="next"' not in resp.headers.get("Link", ""):
+                          break
+
+                      page += 1
+
+              return collected
 
 
           def collect(cfg: GitHubConfig) -> Path:
@@ -415,7 +540,7 @@ jobs:
               installation_token = auth.get_installation_token(installation_id)
               client = GitHubClient(cfg, installation_token)
 
-              stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+              stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
               output_dir = Path.cwd() / f"github_ia208_evidence_{stamp}"
               output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -442,20 +567,15 @@ jobs:
               write_json(inst_path, installations)
               files.append(inst_path)
 
-              created_filter = f"created:>={iso_date_days_ago(cfg.days)}"
-              audit_events: List[Dict[str, Any]] = []
-
               try:
-                  for event in client.paginate(
-                      f"/orgs/{cfg.org}/audit-log",
-                      params={
-                          "include": "all",
-                          "phrase": created_filter,
-                          "per_page": 100,
-                          "order": "desc",
-                      },
-                  ):
-                      audit_events.append(normalize_audit_event(event))
+                  audit_events = collect_audit_log(
+                      client=client,
+                      org=cfg.org,
+                      days=cfg.days,
+                      window_days=cfg.audit_window_days,
+                      max_pages_per_window=cfg.audit_max_pages_per_window,
+                      max_events=cfg.audit_max_events,
+                  )
               except RuntimeError as exc:
                   audit_events = [{"error": str(exc)}]
 
@@ -488,7 +608,10 @@ jobs:
                   "api_url": cfg.api_url,
                   "enterprise": cfg.enterprise,
                   "days_collected": cfg.days,
-                  "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                  "audit_window_days": cfg.audit_window_days,
+                  "audit_max_pages_per_window": cfg.audit_max_pages_per_window,
+                  "audit_max_events": cfg.audit_max_events,
+                  "collected_at": utc_now().isoformat(),
                   "org_two_factor_requirement_enabled": org.get("two_factor_requirement_enabled"),
                   "org_has_saml_sso_authorizations_endpoint": True,
                   "credential_authorization_count": len(cred_auths) if isinstance(cred_auths, list) else None,
@@ -560,6 +683,30 @@ jobs:
                   print("GH_MAX_RATE_LIMIT_SLEEP_SECONDS must be an integer.", file=sys.stderr)
                   return 2
 
+              try:
+                  audit_window_days = int(os.environ.get("GH_AUDIT_WINDOW_DAYS", "1"))
+              except ValueError:
+                  print("GH_AUDIT_WINDOW_DAYS must be an integer.", file=sys.stderr)
+                  return 2
+
+              try:
+                  audit_max_pages_per_window = int(os.environ.get("GH_AUDIT_MAX_PAGES_PER_WINDOW", "50"))
+              except ValueError:
+                  print("GH_AUDIT_MAX_PAGES_PER_WINDOW must be an integer.", file=sys.stderr)
+                  return 2
+
+              try:
+                  audit_max_events = int(os.environ.get("GH_AUDIT_MAX_EVENTS", "10000"))
+              except ValueError:
+                  print("GH_AUDIT_MAX_EVENTS must be an integer.", file=sys.stderr)
+                  return 2
+
+              try:
+                  max_server_sleep_seconds = int(os.environ.get("GH_MAX_SERVER_SLEEP_SECONDS", "300"))
+              except ValueError:
+                  print("GH_MAX_SERVER_SLEEP_SECONDS must be an integer.", file=sys.stderr)
+                  return 2
+
               cfg = GitHubConfig(
                   app_id=app_id,
                   private_key=private_key,
@@ -571,6 +718,10 @@ jobs:
                   request_delay_seconds=request_delay_seconds,
                   max_retries=max_retries,
                   max_rate_limit_sleep_seconds=max_rate_limit_sleep_seconds,
+                  max_server_sleep_seconds=max_server_sleep_seconds,
+                  audit_window_days=audit_window_days,
+                  audit_max_pages_per_window=audit_max_pages_per_window,
+                  audit_max_events=audit_max_events,
               )
 
               try:
@@ -603,6 +754,7 @@ jobs:
             echo
             echo "Organization: $GH_ORG"
             echo "Days collected: $GH_DAYS"
+            echo "Audit window days: $GH_AUDIT_WINDOW_DAYS"
             echo "Output directory: ${{ steps.run_collector.outputs.output_dir }}"
             echo
             if [ -f "${{ steps.run_collector.outputs.output_dir }}/manifest.md" ]; then
