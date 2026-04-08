@@ -39,7 +39,7 @@ Optional env vars:
 - GH_AUDIT_MAX_PAGES_PER_WINDOW: default 50
 - GH_AUDIT_MAX_EVENTS: default 10000
 - GH_MAX_WINDOWS_PER_RUN: default 7
-- GH_CHECKPOINT_FILE: default .github/evidence_state/irsdigitalservice_audit_checkpoint.json
+- GH_CHECKPOINT_FILE: default .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
 - GH_AUTO_PUSH_CHECKPOINT: default 1
 """
 from __future__ import annotations
@@ -78,7 +78,7 @@ class GitHubConfig:
     audit_max_pages_per_window: int = 50
     audit_max_events: int = 10000
     max_windows_per_run: int = 7
-    checkpoint_file: str = ".github/evidence_state/irsdigitalservice_audit_checkpoint.json"
+    checkpoint_file: str = ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json"
     auto_push_checkpoint: bool = True
 
 
@@ -113,9 +113,7 @@ def date_windows(start: dt.date, end: dt.date, window_days: int) -> List[Tuple[d
 def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
     created_at = event.get("created_at")
     if isinstance(created_at, (int, float)):
-        created_iso = dt.datetime.fromtimestamp(
-            created_at / 1000.0, tz=dt.timezone.utc
-        ).isoformat()
+        created_iso = dt.datetime.fromtimestamp(created_at / 1000.0, tz=dt.timezone.utc).isoformat()
     else:
         created_iso = created_at
 
@@ -185,9 +183,6 @@ def maybe_git_push_checkpoint(checkpoint_path: Path, message: str) -> None:
     if os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() in {"0", "false", "no"}:
         return
 
-    if not (checkpoint_path.exists() or checkpoint_path.parent.exists()):
-        return
-
     try:
         subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
@@ -216,7 +211,6 @@ def maybe_git_push_checkpoint(checkpoint_path: Path, message: str) -> None:
             text=True,
         )
         if commit.returncode != 0:
-            # Nothing to commit or commit failed; keep going.
             return
 
         push = subprocess.run(["git", "push"], check=False, capture_output=True, text=True)
@@ -510,26 +504,31 @@ def collect_audit_day(
         resp = client.request("GET", f"/orgs/{org}/audit-log", params=params)
 
         if resp.status_code in (500, 502, 503, 504):
+            client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
             raise RuntimeError(
                 f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                 f"{resp.status_code} {resp.text[:400]}"
             )
         if resp.status_code == 404:
+            client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
             raise RuntimeError(
                 f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                 f"404 Not Found. Response: {resp.text[:400]}"
             )
         if resp.status_code == 401:
+            client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
             raise RuntimeError(
                 f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                 f"401 Unauthorized. Response: {resp.text[:400]}"
             )
         if resp.status_code == 403 and not client._is_rate_limit_response(resp):
+            client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
             raise RuntimeError(
                 f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                 f"403 Forbidden. Response: {resp.text[:400]}"
             )
         if resp.status_code >= 400 and not client._is_rate_limit_response(resp):
+            client._debug_failure(resp, f"/orgs/{org}/audit-log window {created_filter} page {page}")
             raise RuntimeError(
                 f"GET /orgs/{org}/audit-log window {created_filter} page {page} failed: "
                 f"{resp.status_code} {resp.text[:400]}"
@@ -586,7 +585,6 @@ def collect_audit_log(
         if len(collected) >= max_events:
             break
 
-        # One-day windows by default. If window_days > 1, process each day inside.
         day = window_start
         while day <= window_end:
             day_events = collect_audit_day(
@@ -620,7 +618,6 @@ def collect_audit_log(
 
             day += dt.timedelta(days=1)
 
-    # If we processed nothing new but already had a checkpoint, preserve it.
     if last_completed_day is None and checkpoint:
         save_checkpoint(checkpoint_path, checkpoint)
 
@@ -685,8 +682,8 @@ def collect(cfg: GitHubConfig) -> Path:
             f.write("\n")
     files.append(audit_jsonl)
 
-    rows_for_csv = [e for e in audit_events if "error" not in e]
     audit_csv = output_dir / "audit_log.csv"
+    rows_for_csv = [e for e in audit_events if "error" not in e]
     csv_fields = [
         "created_at",
         "action",
@@ -819,7 +816,7 @@ def main() -> int:
 
     checkpoint_file = os.environ.get(
         "GH_CHECKPOINT_FILE",
-        ".github/evidence_state/irsdigitalservice_audit_checkpoint.json",
+        ".github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json",
     ).strip()
 
     auto_push_checkpoint = os.environ.get("GH_AUTO_PUSH_CHECKPOINT", "1").strip().lower() not in {
