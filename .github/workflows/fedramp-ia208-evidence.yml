@@ -89,20 +89,6 @@ jobs:
           test -n "$GH_APP_PRIVATE_KEY"
           test -n "$GH_ORG"
 
-      - name: Write evidence collector
-        run: |
-          cat > fedramp_ia208_evidence.py <<'PY'
-          <PASTE THE FULL fedramp_ia208_evidence.py SCRIPT FROM ABOVE HERE>
-          PY
-          chmod +x fedramp_ia208_evidence.py
-
-      - name: Write report generator
-        run: |
-          cat > fedramp_ia208_report.py <<'PY'
-          <PASTE THE FULL fedramp_ia208_report.py SCRIPT FROM ABOVE HERE>
-          PY
-          chmod +x fedramp_ia208_report.py
-
       - name: Run collector
         id: run_collector
         run: |
@@ -111,7 +97,6 @@ jobs:
           echo "output_dir=$output_dir" >> "$GITHUB_OUTPUT"
 
       - name: Generate SSP report
-        id: report
         run: |
           set -euo pipefail
           python fedramp_ia208_report.py --run-dir "${{ steps.run_collector.outputs.output_dir }}"
