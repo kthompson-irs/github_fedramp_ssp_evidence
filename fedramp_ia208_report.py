@@ -1,173 +1,261 @@
-name: FedRAMP IA-2(8) Evidence Collection
+#!/usr/bin/env python3
+"""Generate SSP-ready Markdown and PDF summaries from a collector run directory."""
+from __future__ import annotations
 
-on:
-  workflow_dispatch:
-    inputs:
-      gh_org:
-        description: "GitHub organization login"
-        required: false
-        type: string
-      gh_enterprise:
-        description: "Enterprise slug for optional reporting"
-        required: false
-        type: string
-      gh_days:
-        description: "How many days of audit log history to backfill if no checkpoint exists"
-        required: false
-        default: "90"
-        type: string
-      gh_audit_window_days:
-        description: "How many days to include per audit-log window"
-        required: false
-        default: "1"
-        type: string
-      gh_max_windows_per_run:
-        description: "How many day windows to process per run"
-        required: false
-        default: "7"
-        type: string
-  schedule:
-    - cron: "0 4 * * 1"
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
 
-permissions:
-  contents: write
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+from xml.sax.saxutils import escape
 
-jobs:
-  collect:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
 
-    env:
-      GH_APP_ID: ${{ secrets.GH_APP_ID }}
-      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-      GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
-      GH_API_URL: https://api.github.com
-      GH_API_VERSION: 2022-11-28
-      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
-      GH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_days || vars.GH_DAYS || '90' }}
-      GH_AUDIT_WINDOW_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_audit_window_days || vars.GH_AUDIT_WINDOW_DAYS || '1' }}
-      GH_MAX_WINDOWS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_max_windows_per_run || vars.GH_MAX_WINDOWS_PER_RUN || '7' }}
-      GH_AUDIT_MAX_PAGES_PER_WINDOW: ${{ vars.GH_AUDIT_MAX_PAGES_PER_WINDOW || '50' }}
-      GH_AUDIT_MAX_EVENTS: ${{ vars.GH_AUDIT_MAX_EVENTS || '10000' }}
-      GH_REQUEST_DELAY_SECONDS: ${{ vars.GH_REQUEST_DELAY_SECONDS || '0.25' }}
-      GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
-      GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
-      GH_MAX_SERVER_SLEEP_SECONDS: ${{ vars.GH_MAX_SERVER_SLEEP_SECONDS || '300' }}
-      GH_CHECKPOINT_FILE: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
-      GH_ARCHIVE_ROOT: evidence/archive
-      GH_AUTO_PUSH_CHECKPOINT: "1"
-      GH_ARCHIVE_S3_BUCKET: ${{ vars.GH_ARCHIVE_S3_BUCKET }}
-      GH_ARCHIVE_S3_PREFIX: ${{ vars.GH_ARCHIVE_S3_PREFIX || 'irsdigitalservice' }}
-      GH_AWS_REGION: ${{ vars.GH_AWS_REGION }}
+def load_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+def read_manifest_entries(path: Path) -> List[str]:
+    entries: List[str] = []
+    if not path.exists():
+        return entries
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            entries.append(line[2:].strip())
+    return entries
 
-      - name: Configure git for checkpoint pushes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install requests pyjwt cryptography reportlab boto3
+def build_markdown(summary: Dict[str, Any], manifest_entries: List[str]) -> str:
+    controls = summary.get("controls_covered", [])
+    control_map = summary.get("control_map", {})
+    potential_gaps = summary.get("potential_gaps", [])
 
-      - name: Validate required env vars
-        run: |
-          test -n "$GH_APP_ID"
-          test -n "$GH_APP_PRIVATE_KEY"
-          test -n "$GH_ORG"
+    lines: List[str] = []
+    lines.append("# FedRAMP IA-2(8) Evidence Summary")
+    lines.append("")
+    lines.append(f"- Organization: {summary.get('org')}")
+    lines.append(f"- Collection mode: {summary.get('collection_mode')}")
+    lines.append(f"- Collected at: {summary.get('collected_at')}")
+    lines.append(f"- Days collected: {summary.get('days_collected')}")
+    lines.append(f"- Checkpoint file: {summary.get('checkpoint_file')}")
+    lines.append(f"- Checkpoint last processed day: {summary.get('checkpoint_last_processed_day')}")
+    lines.append(f"- Backfill complete: {summary.get('checkpoint_backfill_complete')}")
+    lines.append(f"- Archive slice: {summary.get('persistent_archive_slice_dir')}")
+    lines.append("")
 
-      - name: Write evidence collector
-        run: |
-          cat > fedramp_ia208_evidence.py <<'PY'
-          <PASTE THE FULL fedramp_ia208_evidence.py SCRIPT FROM ABOVE HERE>
-          PY
-          chmod +x fedramp_ia208_evidence.py
+    lines.append("## Control coverage")
+    for control in controls:
+        lines.append(f"- {control}")
+    lines.append("")
 
-      - name: Write report generator
-        run: |
-          cat > fedramp_ia208_report.py <<'PY'
-          <PASTE THE FULL fedramp_ia208_report.py SCRIPT FROM ABOVE HERE>
-          PY
-          chmod +x fedramp_ia208_report.py
+    lines.append("## Evidence inventory")
+    for item in manifest_entries:
+        lines.append(f"- {item}")
+    lines.append("")
 
-      - name: Run collector
-        id: run_collector
-        run: |
-          set -euo pipefail
-          output_dir="$(python fedramp_ia208_evidence.py)"
-          echo "output_dir=$output_dir" >> "$GITHUB_OUTPUT"
+    lines.append("## File-to-control mapping")
+    for filename, mapped in control_map.items():
+        lines.append(f"- {filename}: {', '.join(mapped)}")
+    lines.append("")
 
-      - name: Generate SSP report
-        id: report
-        run: |
-          set -euo pipefail
-          python fedramp_ia208_report.py --run-dir "${{ steps.run_collector.outputs.output_dir }}"
+    lines.append("## Key findings")
+    lines.append(f"- Organization 2FA requirement enabled: {summary.get('org_two_factor_requirement_enabled')}")
+    lines.append(f"- Audit events collected this run: {summary.get('audit_event_count')}")
+    lines.append(f"- Auth-related audit events: {summary.get('auth_related_event_count')}")
+    lines.append(f"- Credential authorizations count: {summary.get('credential_authorization_count')}")
+    lines.append(f"- Installations count: {summary.get('installation_count')}")
+    lines.append("")
 
-      - name: Add summary
-        if: always()
-        run: |
-          {
-            echo "## FedRAMP IA-2(8) evidence collection"
-            echo
-            echo "Organization: $GH_ORG"
-            echo "Days collected: $GH_DAYS"
-            echo "Audit window days: $GH_AUDIT_WINDOW_DAYS"
-            echo "Max windows per run: $GH_MAX_WINDOWS_PER_RUN"
-            echo "Checkpoint file: $GH_CHECKPOINT_FILE"
-            echo "Archive root: $GH_ARCHIVE_ROOT"
-            echo "Output directory: ${{ steps.run_collector.outputs.output_dir }}"
-            echo
-            if [ -f "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md" ]; then
-              echo "### SSP-ready Markdown"
-              echo '```'
-              cat "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md"
-              echo '```'
-            fi
-            if [ -f "${{ steps.run_collector.outputs.output_dir }}/summary.json" ]; then
-              echo "### Summary"
-              echo '```json'
-              cat "${{ steps.run_collector.outputs.output_dir }}/summary.json"
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+    lines.append("## Potential gaps")
+    if potential_gaps:
+        for gap in potential_gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- None noted")
+    lines.append("")
 
-      - name: Upload evidence artifact
-        if: always() && steps.run_collector.outputs.output_dir != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: fedramp-ia208-evidence
-          path: ${{ steps.run_collector.outputs.output_dir }}
-          if-no-files-found: error
+    lines.append("## Notes for SSP insertion")
+    lines.append("- IA-2(8): evidence shows GitHub App installation + audit-log collection workflow.")
+    lines.append("- AC-2: organization-level context and installation visibility.")
+    lines.append("- AU-2 / AU-6 / AU-12: audit event capture, review, and retention slice.")
+    lines.append("")
 
-      - name: Upload checkpoint artifact
-        if: always() && hashFiles('.github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: fedramp-ia208-checkpoint
-          path: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
-          if-no-files-found: error
+    return "\n".join(lines).rstrip() + "\n"
 
-      - name: Commit updated checkpoint
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ -f "$GH_CHECKPOINT_FILE" ]; then
-            if ! git diff --quiet -- "$GH_CHECKPOINT_FILE"; then
-              git add "$GH_CHECKPOINT_FILE"
-              git commit -m "Update audit checkpoint" || true
-              git push || true
-            fi
-          fi
+
+def build_pdf(run_dir: Path, summary: Dict[str, Any], manifest_entries: List[str]) -> Path:
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = reports_dir / "ssp_evidence_summary.pdf"
+
+    styles = getSampleStyleSheet()
+    styles.add(
+        ParagraphStyle(
+            name="BodySmall",
+            parent=styles["BodyText"],
+            fontSize=9,
+            leading=12,
+            spaceAfter=6,
+            alignment=TA_LEFT,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="Section",
+            parent=styles["Heading2"],
+            spaceBefore=10,
+            spaceAfter=6,
+        )
+    )
+
+    story: List[Any] = []
+    story.append(Paragraph("FedRAMP IA-2(8) Evidence Summary", styles["Title"]))
+    story.append(Spacer(1, 0.15 * inch))
+    story.append(Paragraph(f"Organization: {escape(str(summary.get('org', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Collection mode: {escape(str(summary.get('collection_mode', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Collected at: {escape(str(summary.get('collected_at', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Days collected: {escape(str(summary.get('days_collected', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Checkpoint: {escape(str(summary.get('checkpoint_file', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Checkpoint last day: {escape(str(summary.get('checkpoint_last_processed_day', '')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"Archive slice: {escape(str(summary.get('persistent_archive_slice_dir', '')))}", styles["BodySmall"]))
+
+    story.append(Paragraph("Control coverage", styles["Section"]))
+    for control in summary.get("controls_covered", []):
+        story.append(Paragraph(f"• {escape(str(control))}", styles["BodySmall"]))
+
+    story.append(Paragraph("Evidence inventory", styles["Section"]))
+    for item in manifest_entries:
+        story.append(Paragraph(f"• {escape(item)}", styles["BodySmall"]))
+
+    story.append(Paragraph("File-to-control mapping", styles["Section"]))
+    for filename, mapped in summary.get("control_map", {}).items():
+        story.append(Paragraph(f"• {escape(filename)}: {escape(', '.join(mapped))}", styles["BodySmall"]))
+
+    story.append(Paragraph("Key findings", styles["Section"]))
+    story.append(Paragraph(f"• Organization 2FA requirement enabled: {escape(str(summary.get('org_two_factor_requirement_enabled')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"• Audit events collected this run: {escape(str(summary.get('audit_event_count')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"• Auth-related audit events: {escape(str(summary.get('auth_related_event_count')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"• Credential authorizations count: {escape(str(summary.get('credential_authorization_count')))}", styles["BodySmall"]))
+    story.append(Paragraph(f"• Installations count: {escape(str(summary.get('installation_count')))}", styles["BodySmall"]))
+
+    story.append(Paragraph("Potential gaps", styles["Section"]))
+    gaps = summary.get("potential_gaps") or []
+    if gaps:
+        for gap in gaps:
+            story.append(Paragraph(f"• {escape(str(gap))}", styles["BodySmall"]))
+    else:
+        story.append(Paragraph("• None noted", styles["BodySmall"]))
+
+    story.append(Paragraph("SSP insertion notes", styles["Section"]))
+    story.append(Paragraph("• IA-2(8): GitHub App installation and audit-log evidence.", styles["BodySmall"]))
+    story.append(Paragraph("• AC-2: organization-level context and installation visibility.", styles["BodySmall"]))
+    story.append(Paragraph("• AU-2 / AU-6 / AU-12: audit event capture, review, and retention slice.", styles["BodySmall"]))
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=letter,
+        rightMargin=0.7 * inch,
+        leftMargin=0.7 * inch,
+        topMargin=0.7 * inch,
+        bottomMargin=0.7 * inch,
+    )
+    doc.build(story)
+
+    return pdf_path
+
+
+def append_report_index(archive_slice_dir: Path, record: Dict[str, Any]) -> None:
+    index_path = archive_slice_dir.parent.parent.parent.parent / "index.jsonl"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with index_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True))
+        f.write("\n")
+
+
+def sync_directory_to_s3(directory: Path, bucket: str, prefix: str, region: str | None) -> None:
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("boto3 is required for GH_ARCHIVE_S3_BUCKET uploads") from exc
+
+    client = boto3.client("s3", region_name=region or None)
+    base_prefix = prefix.strip("/")
+
+    for file_path in directory.rglob("*"):
+        if not file_path.is_file():
+            continue
+        rel = file_path.relative_to(directory).as_posix()
+        key = f"{base_prefix}/{rel}" if base_prefix else rel
+        client.upload_file(str(file_path), bucket, key)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", required=True, help="Collector output directory")
+    args = parser.parse_args()
+
+    run_dir = Path(args.run_dir).resolve()
+    summary_path = run_dir / "summary.json"
+    manifest_path = run_dir / "manifest.md"
+
+    if not summary_path.exists():
+        print(f"Missing summary.json in {run_dir}", file=sys.stderr)
+        return 1
+
+    summary = load_json(summary_path)
+    manifest_entries = read_manifest_entries(manifest_path)
+
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    markdown_text = build_markdown(summary, manifest_entries)
+    markdown_path = reports_dir / "ssp_evidence_summary.md"
+    markdown_path.write_text(markdown_text, encoding="utf-8")
+
+    pdf_path = build_pdf(run_dir, summary, manifest_entries)
+
+    archive_slice = summary.get("persistent_archive_slice_dir")
+    if archive_slice:
+        archive_slice_dir = Path(str(archive_slice))
+        archive_slice_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(markdown_path, archive_slice_dir / markdown_path.name)
+        shutil.copy2(pdf_path, archive_slice_dir / pdf_path.name)
+
+        archive_index_record = {
+            "run_stamp": summary.get("run_stamp"),
+            "org": summary.get("org"),
+            "run_dir": str(run_dir),
+            "archive_slice_dir": str(archive_slice_dir),
+            "record_type": "report",
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "report_files": [markdown_path.name, pdf_path.name],
+        }
+        append_report_index(archive_slice_dir, archive_index_record)
+
+        bucket = os.environ.get("GH_ARCHIVE_S3_BUCKET") or None
+        if bucket:
+            prefix = os.environ.get("GH_ARCHIVE_S3_PREFIX", "irsdigitalservice").strip("/")
+            region = os.environ.get("GH_AWS_REGION") or None
+            sync_directory_to_s3(
+                archive_slice_dir,
+                bucket,
+                f"{prefix}/{archive_slice_dir.as_posix().split('archive/', 1)[-1]}",
+                region,
+            )
+
+    print(str(markdown_path))
+    print(str(pdf_path))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
