@@ -47,16 +47,16 @@ jobs:
     timeout-minutes: 60
 
     env:
-      GITHUB_TOKEN: ${{ secrets.GH_ORG_READ_TOKEN }}
-      GITHUB_ORG: ${{ inputs.github_org || vars.GITHUB_ORG }}
-      GITHUB_API_URL: https://api.github.com
-      GITHUB_API_VERSION: 2022-11-28
-      OUTPUT_DIR: evidence
-      INCLUDE_REPO_WEBHOOKS: ${{ inputs.include_repo_webhooks || vars.INCLUDE_REPO_WEBHOOKS || 'false' }}
-      INCLUDE_COLLABORATORS: ${{ inputs.include_collaborators || vars.INCLUDE_COLLABORATORS || 'false' }}
-      GITHUB_ENTERPRISE: ${{ inputs.github_enterprise || vars.GITHUB_ENTERPRISE }}
-      AUDIT_LOG_INCLUDE: ${{ inputs.audit_log_include || vars.AUDIT_LOG_INCLUDE || 'web' }}
-      AUDIT_LOG_PHRASE: ${{ inputs.audit_log_phrase || vars.AUDIT_LOG_PHRASE }}
+      GH_TOKEN: ${{ secrets.GH_ORG_READ_TOKEN }}
+      GH_ORG: ${{ inputs.github_org || vars.GITHUB_ORG }}
+      GH_API_URL: https://api.github.com
+      GH_API_VERSION: 2022-11-28
+      GH_OUTPUT_DIR: evidence
+      GH_INCLUDE_REPO_WEBHOOKS: ${{ inputs.include_repo_webhooks || vars.INCLUDE_REPO_WEBHOOKS || 'false' }}
+      GH_INCLUDE_COLLABORATORS: ${{ inputs.include_collaborators || vars.INCLUDE_COLLABORATORS || 'false' }}
+      GH_ENTERPRISE: ${{ inputs.github_enterprise || vars.GITHUB_ENTERPRISE }}
+      GH_AUDIT_LOG_INCLUDE: ${{ inputs.audit_log_include || vars.AUDIT_LOG_INCLUDE || 'web' }}
+      GH_AUDIT_LOG_PHRASE: ${{ inputs.audit_log_phrase || vars.AUDIT_LOG_PHRASE }}
 
     steps:
       - name: Check out repository
@@ -72,13 +72,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${GITHUB_TOKEN:-}" ]; then
-            echo "ERROR: GITHUB_TOKEN is empty. Set repository secret GH_ORG_READ_TOKEN." >&2
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "ERROR: GH_TOKEN is empty. Set repository secret GH_ORG_READ_TOKEN." >&2
             exit 1
           fi
 
-          if [ -z "${GITHUB_ORG:-}" ]; then
-            echo "ERROR: GITHUB_ORG is empty. Set vars.GITHUB_ORG or pass workflow_dispatch input github_org." >&2
+          if [ -z "${GH_ORG:-}" ]; then
+            echo "ERROR: GH_ORG is empty. Set vars.GITHUB_ORG or pass workflow_dispatch input github_org." >&2
             exit 1
           fi
 
@@ -108,16 +108,16 @@ jobs:
           - summary.md
 
           Environment variables:
-            GITHUB_TOKEN          Required. Token with access to the organization.
-            GITHUB_ORG            Required. Organization login.
-            GITHUB_API_URL        Optional. Defaults to https://api.github.com.
-            GITHUB_API_VERSION    Optional. Defaults to 2022-11-28.
-            OUTPUT_DIR            Optional. Defaults to ./evidence.
-            INCLUDE_REPO_WEBHOOKS Optional. true/false, default false.
-            INCLUDE_COLLABORATORS Optional. true/false, default false.
-            GITHUB_ENTERPRISE     Optional. Enterprise slug for audit log export.
-            AUDIT_LOG_INCLUDE     Optional. web/git/all, default web.
-            AUDIT_LOG_PHRASE      Optional. Search phrase for enterprise audit log.
+            GH_TOKEN              Required. Token with access to the organization.
+            GH_ORG                Required. Organization login.
+            GH_API_URL            Optional. Defaults to https://api.github.com.
+            GH_API_VERSION        Optional. Defaults to 2022-11-28.
+            GH_OUTPUT_DIR         Optional. Defaults to ./evidence.
+            GH_INCLUDE_REPO_WEBHOOKS Optional. true/false, default false.
+            GH_INCLUDE_COLLABORATORS Optional. true/false, default false.
+            GH_ENTERPRISE         Optional. Enterprise slug for audit log export.
+            GH_AUDIT_LOG_INCLUDE  Optional. web/git/all, default web.
+            GH_AUDIT_LOG_PHRASE   Optional. Search phrase for enterprise audit log.
           """
           from __future__ import annotations
 
@@ -441,23 +441,23 @@ jobs:
 
           def main() -> int:
               parser = argparse.ArgumentParser(description="Collect GitHub CM-08 evidence package.")
-              parser.add_argument("--org", default=os.environ.get("GITHUB_ORG"), help="GitHub organization login")
-              parser.add_argument("--output-dir", default=os.environ.get("OUTPUT_DIR", "evidence"), help="Output directory")
-              parser.add_argument("--api-url", default=os.environ.get("GITHUB_API_URL", DEFAULT_API_URL), help="GitHub API base URL")
-              parser.add_argument("--api-version", default=os.environ.get("GITHUB_API_VERSION", DEFAULT_API_VERSION), help="GitHub API version header")
-              parser.add_argument("--enterprise", default=os.environ.get("GITHUB_ENTERPRISE"), help="Optional enterprise slug for audit log export")
-              parser.add_argument("--audit-log-include", default=os.environ.get("AUDIT_LOG_INCLUDE", "web"), choices=["web", "git", "all"], help="Enterprise audit log event scope")
-              parser.add_argument("--audit-log-phrase", default=os.environ.get("AUDIT_LOG_PHRASE"), help="Optional audit-log search phrase")
-              parser.add_argument("--include-repo-webhooks", action="store_true", default=os.environ.get("INCLUDE_REPO_WEBHOOKS", "false").lower() == "true", help="Collect repository webhook inventory")
-              parser.add_argument("--include-collaborators", action="store_true", default=os.environ.get("INCLUDE_COLLABORATORS", "false").lower() == "true", help="Collect repository collaborators (per repo)")
-              parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"), help="GitHub token")
+              parser.add_argument("--org", default=os.environ.get("GH_ORG"), help="GitHub organization login")
+              parser.add_argument("--output-dir", default=os.environ.get("GH_OUTPUT_DIR", "evidence"), help="Output directory")
+              parser.add_argument("--api-url", default=os.environ.get("GH_API_URL", DEFAULT_API_URL), help="GitHub API base URL")
+              parser.add_argument("--api-version", default=os.environ.get("GH_API_VERSION", DEFAULT_API_VERSION), help="GitHub API version header")
+              parser.add_argument("--enterprise", default=os.environ.get("GH_ENTERPRISE"), help="Optional enterprise slug for audit log export")
+              parser.add_argument("--audit-log-include", default=os.environ.get("GH_AUDIT_LOG_INCLUDE", "web"), choices=["web", "git", "all"], help="Enterprise audit log event scope")
+              parser.add_argument("--audit-log-phrase", default=os.environ.get("GH_AUDIT_LOG_PHRASE"), help="Optional audit-log search phrase")
+              parser.add_argument("--include-repo-webhooks", action="store_true", default=os.environ.get("GH_INCLUDE_REPO_WEBHOOKS", "false").lower() == "true", help="Collect repository webhook inventory")
+              parser.add_argument("--include-collaborators", action="store_true", default=os.environ.get("GH_INCLUDE_COLLABORATORS", "false").lower() == "true", help="Collect repository collaborators (per repo)")
+              parser.add_argument("--token", default=os.environ.get("GH_TOKEN"), help="GitHub token")
               args = parser.parse_args()
 
               if not args.token:
-                  print("ERROR: GITHUB_TOKEN is required", file=sys.stderr)
+                  print("ERROR: GH_TOKEN is required", file=sys.stderr)
                   return 2
               if not args.org:
-                  print("ERROR: GITHUB_ORG is required", file=sys.stderr)
+                  print("ERROR: GH_ORG is required", file=sys.stderr)
                   return 2
 
               outdir = Path(args.output_dir).resolve()
