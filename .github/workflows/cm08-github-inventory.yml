@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      GH_TOKEN: ${{ secrets.GH_ORG_READ_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_ORG_AUDIT_TOKEN }}
       GH_ORG: ${{ inputs.github_org || vars.GITHUB_ORG }}
       GH_API_URL: https://api.github.com
       GH_API_VERSION: 2022-11-28
@@ -73,7 +73,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "ERROR: GH_TOKEN is empty. Set repository secret GH_ORG_READ_TOKEN." >&2
+            echo "ERROR: GH_TOKEN is empty. Set repository secret GH_ORG_AUDIT_TOKEN." >&2
             exit 1
           fi
 
@@ -108,16 +108,16 @@ jobs:
           - summary.md
 
           Environment variables:
-            GH_TOKEN              Required. Token with access to the organization.
-            GH_ORG                Required. Organization login.
-            GH_API_URL            Optional. Defaults to https://api.github.com.
-            GH_API_VERSION        Optional. Defaults to 2022-11-28.
-            GH_OUTPUT_DIR         Optional. Defaults to ./evidence.
-            GH_INCLUDE_REPO_WEBHOOKS Optional. true/false, default false.
-            GH_INCLUDE_COLLABORATORS Optional. true/false, default false.
-            GH_ENTERPRISE         Optional. Enterprise slug for audit log export.
-            GH_AUDIT_LOG_INCLUDE  Optional. web/git/all, default web.
-            GH_AUDIT_LOG_PHRASE   Optional. Search phrase for enterprise audit log.
+            GH_TOKEN                    Required. Token with access to the organization.
+            GH_ORG                      Required. Organization login.
+            GH_API_URL                  Optional. Defaults to https://api.github.com.
+            GH_API_VERSION              Optional. Defaults to 2022-11-28.
+            GH_OUTPUT_DIR               Optional. Defaults to ./evidence.
+            GH_INCLUDE_REPO_WEBHOOKS    Optional. true/false, default false.
+            GH_INCLUDE_COLLABORATORS    Optional. true/false, default false.
+            GH_ENTERPRISE               Optional. Enterprise slug for audit log export.
+            GH_AUDIT_LOG_INCLUDE        Optional. web/git/all, default web.
+            GH_AUDIT_LOG_PHRASE         Optional. Search phrase for enterprise audit log.
           """
           from __future__ import annotations
 
