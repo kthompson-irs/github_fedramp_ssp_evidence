@@ -67,6 +67,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate required settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "ERROR: GITHUB_TOKEN is empty. Set repository secret GH_ORG_READ_TOKEN." >&2
+            exit 1
+          fi
+
+          if [ -z "${GITHUB_ORG:-}" ]; then
+            echo "ERROR: GITHUB_ORG is empty. Set vars.GITHUB_ORG or pass workflow_dispatch input github_org." >&2
+            exit 1
+          fi
+
+          mkdir -p evidence
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -102,7 +119,6 @@ jobs:
             AUDIT_LOG_INCLUDE     Optional. web/git/all, default web.
             AUDIT_LOG_PHRASE      Optional. Search phrase for enterprise audit log.
           """
-
           from __future__ import annotations
 
           import argparse
@@ -118,7 +134,6 @@ jobs:
           from urllib.parse import urljoin
 
           import requests
-
 
           DEFAULT_API_URL = "https://api.github.com"
           DEFAULT_API_VERSION = "2022-11-28"
@@ -150,7 +165,12 @@ jobs:
                       }
                   )
 
-              def request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+              def request(
+                  self,
+                  method: str,
+                  path: str,
+                  params: Optional[Dict[str, Any]] = None,
+              ) -> requests.Response:
                   url = urljoin(self.api_url, path.lstrip("/"))
                   resp = self.session.request(method, url, params=params, timeout=DEFAULT_TIMEOUT)
                   if resp.status_code >= 400:
@@ -161,10 +181,15 @@ jobs:
               def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
                   return self.request("GET", path, params=params).json()
 
-              def paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> Iterable[Any]:
+              def paginate(
+                  self,
+                  path: str,
+                  params: Optional[Dict[str, Any]] = None,
+              ) -> Iterable[Any]:
                   url = urljoin(self.api_url, path.lstrip("/"))
                   q = dict(params or {})
                   q.setdefault("per_page", 100)
+
                   while url:
                       resp = self.session.get(url, params=q, timeout=DEFAULT_TIMEOUT)
                       if resp.status_code >= 400:
@@ -202,7 +227,12 @@ jobs:
                   writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                   writer.writeheader()
                   for row in rows:
-                      writer.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v for k, v in row.items()})
+                      writer.writerow(
+                          {
+                              k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
+                              for k, v in row.items()
+                          }
+                      )
 
 
           def write_json(path: Path, data: Any) -> None:
@@ -326,7 +356,11 @@ jobs:
               return rows
 
 
-          def collect_repo_webhooks(client: GitHubCollector, org: str, repositories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+          def collect_repo_webhooks(
+              client: GitHubCollector,
+              org: str,
+              repositories: List[Dict[str, Any]],
+          ) -> List[Dict[str, Any]]:
               rows: List[Dict[str, Any]] = []
               for repo in repositories:
                   full_name = repo["full_name"]
@@ -352,10 +386,16 @@ jobs:
               return rows
 
 
-          def collect_enterprise_audit_log(client: GitHubCollector, enterprise: str, include: str, phrase: Optional[str]) -> List[Dict[str, Any]]:
+          def collect_enterprise_audit_log(
+              client: GitHubCollector,
+              enterprise: str,
+              include: str,
+              phrase: Optional[str],
+          ) -> List[Dict[str, Any]]:
               params: Dict[str, Any] = {"include": include, "per_page": 100}
               if phrase:
                   params["phrase"] = phrase
+
               rows: List[Dict[str, Any]] = []
               for event in client.paginate(f"/enterprises/{enterprise}/audit-log", params):
                   if isinstance(event, dict):
@@ -376,7 +416,15 @@ jobs:
                   lines.append(f"Enterprise: `{summary['enterprise']}`")
               lines.append("")
               lines.append("## Counts")
-              for key in ["repositories", "members", "outside_collaborators", "app_installations", "org_webhooks", "repo_webhooks", "audit_log_events"]:
+              for key in [
+                  "repositories",
+                  "members",
+                  "outside_collaborators",
+                  "app_installations",
+                  "org_webhooks",
+                  "repo_webhooks",
+                  "audit_log_events",
+              ]:
                   if key in summary["counts"]:
                       lines.append(f"- {key.replace('_', ' ').title()}: {summary['counts'][key]}")
               lines.append("")
@@ -423,6 +471,7 @@ jobs:
               outside_collaborators = collect_outside_collaborators(client, args.org)
               app_installations = collect_app_installations(client, args.org)
               org_webhooks = collect_org_webhooks(client, args.org)
+
               repo_webhooks: List[Dict[str, Any]] = []
               collaborators: List[Dict[str, Any]] = []
 
@@ -452,9 +501,13 @@ jobs:
 
               audit_log_events: List[Dict[str, Any]] = []
               if args.enterprise:
-                  audit_log_events = collect_enterprise_audit_log(client, args.enterprise, args.audit_log_include, args.audit_log_phrase)
+                  audit_log_events = collect_enterprise_audit_log(
+                      client,
+                      args.enterprise,
+                      args.audit_log_include,
+                      args.audit_log_phrase,
+                  )
 
-              # Write artifacts.
               inventory_summary = {
                   "generated_at": generated_at,
                   "org": args.org,
@@ -474,56 +527,155 @@ jobs:
               }
 
               write_json(outdir / "inventory_summary.json", inventory_summary)
-              write_csv(outdir / "repositories.csv", repositories, [
-                  "id", "name", "full_name", "private", "visibility", "archived", "disabled", "fork", "default_branch",
-                  "created_at", "updated_at", "pushed_at", "owner_login", "language", "open_issues_count", "topics",
-                  "has_issues", "has_projects", "has_wiki", "has_discussions", "allow_squash_merge", "allow_merge_commit",
-                  "allow_rebase_merge", "allow_auto_merge", "delete_branch_on_merge", "security_and_analysis",
-              ])
+              write_csv(
+                  outdir / "repositories.csv",
+                  repositories,
+                  [
+                      "id",
+                      "name",
+                      "full_name",
+                      "private",
+                      "visibility",
+                      "archived",
+                      "disabled",
+                      "fork",
+                      "default_branch",
+                      "created_at",
+                      "updated_at",
+                      "pushed_at",
+                      "owner_login",
+                      "language",
+                      "open_issues_count",
+                      "topics",
+                      "has_issues",
+                      "has_projects",
+                      "has_wiki",
+                      "has_discussions",
+                      "allow_squash_merge",
+                      "allow_merge_commit",
+                      "allow_rebase_merge",
+                      "allow_auto_merge",
+                      "delete_branch_on_merge",
+                      "security_and_analysis",
+                  ],
+              )
               write_csv(outdir / "members.csv", members, ["login", "id", "type", "site_admin"])
               write_csv(outdir / "outside_collaborators.csv", outside_collaborators, ["login", "id", "type", "site_admin"])
-              write_csv(outdir / "app_installations.csv", app_installations, [
-                  "installation_id", "app_id", "app_slug", "app_name", "app_owner", "account_login", "account_type",
-                  "target_type", "repository_selection", "created_at", "updated_at",
-              ])
-              write_csv(outdir / "org_webhooks.csv", org_webhooks, [
-                  "hook_id", "name", "active", "events", "created_at", "updated_at", "config_url", "config_content_type", "config_insecure_ssl",
-              ])
+              write_csv(
+                  outdir / "app_installations.csv",
+                  app_installations,
+                  [
+                      "installation_id",
+                      "app_id",
+                      "app_slug",
+                      "app_name",
+                      "app_owner",
+                      "account_login",
+                      "account_type",
+                      "target_type",
+                      "repository_selection",
+                      "created_at",
+                      "updated_at",
+                  ],
+              )
+              write_csv(
+                  outdir / "org_webhooks.csv",
+                  org_webhooks,
+                  [
+                      "hook_id",
+                      "name",
+                      "active",
+                      "events",
+                      "created_at",
+                      "updated_at",
+                      "config_url",
+                      "config_content_type",
+                      "config_insecure_ssl",
+                  ],
+              )
 
               if repo_webhooks:
-                  write_csv(outdir / "repo_webhooks.csv", repo_webhooks, [
-                      "repository", "hook_id", "name", "active", "events", "created_at", "updated_at", "config_url", "config_content_type", "config_insecure_ssl",
-                  ])
+                  write_csv(
+                      outdir / "repo_webhooks.csv",
+                      repo_webhooks,
+                      [
+                          "repository",
+                          "hook_id",
+                          "name",
+                          "active",
+                          "events",
+                          "created_at",
+                          "updated_at",
+                          "config_url",
+                          "config_content_type",
+                          "config_insecure_ssl",
+                      ],
+                  )
               else:
-                  # still create an empty file so auditors know the check ran
-                  write_csv(outdir / "repo_webhooks.csv", [], [
-                      "repository", "hook_id", "name", "active", "events", "created_at", "updated_at", "config_url", "config_content_type", "config_insecure_ssl",
-                  ])
+                  write_csv(
+                      outdir / "repo_webhooks.csv",
+                      [],
+                      [
+                          "repository",
+                          "hook_id",
+                          "name",
+                          "active",
+                          "events",
+                          "created_at",
+                          "updated_at",
+                          "config_url",
+                          "config_content_type",
+                          "config_insecure_ssl",
+                      ],
+                  )
 
               if args.include_collaborators:
-                  write_csv(outdir / "repository_collaborators.csv", collaborators, [
-                      "repository", "login", "id", "type", "site_admin", "permission_admin", "permission_push", "permission_pull",
-                  ])
+                  write_csv(
+                      outdir / "repository_collaborators.csv",
+                      collaborators,
+                      [
+                          "repository",
+                          "login",
+                          "id",
+                          "type",
+                          "site_admin",
+                          "permission_admin",
+                          "permission_push",
+                          "permission_pull",
+                      ],
+                  )
 
               if args.enterprise:
-                  write_csv(outdir / "audit_log.csv", audit_log_events, sorted({k for row in audit_log_events for k in row.keys()}))
+                  write_csv(
+                      outdir / "audit_log.csv",
+                      audit_log_events,
+                      sorted({k for row in audit_log_events for k in row.keys()}),
+                  )
               else:
                   write_csv(outdir / "audit_log.csv", [], ["note"])
 
-              summary_md = build_summary_md({
-                  "generated_at": generated_at,
-                  "org": args.org,
-                  "api_url": args.api_url,
-                  "enterprise": args.enterprise,
-                  "counts": inventory_summary["counts"],
-                  "evidence_files": [],
-              })
+              summary_md = build_summary_md(
+                  {
+                      "generated_at": generated_at,
+                      "org": args.org,
+                      "api_url": args.api_url,
+                      "enterprise": args.enterprise,
+                      "counts": inventory_summary["counts"],
+                      "evidence_files": [],
+                  }
+              )
               (outdir / "summary.md").write_text(summary_md, encoding="utf-8")
 
               evidence_files: List[EvidenceFile] = []
               for artifact in sorted(outdir.iterdir()):
                   if artifact.is_file() and artifact.name != "evidence_manifest.json":
-                      evidence_files.append(EvidenceFile(path=artifact.name, sha256=sha256_file(artifact), bytes=artifact.stat().st_size))
+                      evidence_files.append(
+                          EvidenceFile(
+                              path=artifact.name,
+                              sha256=sha256_file(artifact),
+                              bytes=artifact.stat().st_size,
+                          )
+                      )
 
               manifest = {
                   "generated_at": generated_at,
@@ -534,15 +686,16 @@ jobs:
               }
               write_json(outdir / "evidence_manifest.json", manifest)
 
-              # Refresh the summary now that the file list is complete.
-              summary_md = build_summary_md({
-                  "generated_at": generated_at,
-                  "org": args.org,
-                  "api_url": args.api_url,
-                  "enterprise": args.enterprise,
-                  "counts": inventory_summary["counts"],
-                  "evidence_files": [asdict(f) for f in evidence_files],
-              })
+              summary_md = build_summary_md(
+                  {
+                      "generated_at": generated_at,
+                      "org": args.org,
+                      "api_url": args.api_url,
+                      "enterprise": args.enterprise,
+                      "counts": inventory_summary["counts"],
+                      "evidence_files": [asdict(f) for f in evidence_files],
+                  }
+              )
               (outdir / "summary.md").write_text(summary_md, encoding="utf-8")
 
               print(summary_md)
@@ -566,10 +719,11 @@ jobs:
             cat evidence/summary.md >> "$GITHUB_STEP_SUMMARY"
           else
             echo "summary.md was not generated." >> "$GITHUB_STEP_SUMMARY"
+            ls -la evidence || true
           fi
 
       - name: Upload evidence package
-        if: always()
+        if: always() && hashFiles('evidence/**') != ''
         uses: actions/upload-artifact@v4
         with:
           name: cm08-github-inventory-evidence
