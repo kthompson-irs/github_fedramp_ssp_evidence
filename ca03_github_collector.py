@@ -673,6 +673,59 @@ def main() -> int:
     )
     safe_text_write(report, report_dir / "CA03_GitHub_Evidence_Report.md")
     collected_files.append(report_dir / "CA03_GitHub_Evidence_Report.md")
+
+    
+    controls = {
+        "CA-03": {
+            "status": "supported",
+            "artifacts": [
+                "csv/inventory.csv",
+                "report/CA03_GitHub_Evidence_Report.md",
+                "raw/org.json",
+                "raw/repos.json",
+                "raw/teams.json",
+                "raw/members.json",
+            ],
+        },
+        "AC-2": {
+            "status": "supported",
+            "artifacts": ["raw/members.json", "raw/teams.json", "csv/access.csv"],
+        },
+        "IA-2": {
+            "status": "partial",
+            "artifacts": ["raw/org.json"],
+            "note": "Organization MFA status may be visible in org metadata; retain manual screenshot evidence if the API does not expose the setting in your tenant.",
+        },
+        "SC-7": {
+            "status": "supported",
+            "artifacts": ["csv/inventory.csv", "csv/repos.csv", "csv/branch_protection.csv"],
+        },
+    }
+    safe_json_dump(controls, outdir / "controls.json")
+    collected_files.append(outdir / "controls.json")
+
+    manifest = build_manifest(collected_files, outdir)
+    safe_json_dump(manifest, outdir / "evidence_manifest.json")
+    collected_files.append(outdir / "evidence_manifest.json")
+
+    zip_path = outdir.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in collected_files:
+            if file_path.is_file():
+                zf.write(file_path, file_path.relative_to(outdir))
+
+    print(f"Evidence bundle created: {outdir}")
+    print(f"Zip archive: {zip_path}")
+    if errors:
+        print("\nWarnings:")
+        for err in errors:
+            print(f"- {err}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
     
                
   
