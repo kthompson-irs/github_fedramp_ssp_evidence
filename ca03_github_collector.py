@@ -475,7 +475,28 @@ def main() -> int:
 
         default_branch = repo.get("default_branch")
         if default_branch:
-            try:
+            try:                
+                bp = collector.get_branch_protection(repo_name, default_branch)
+                branch_rows.append(
+                    {
+                        "repo": repo.get("full_name"),
+                        "branch": default_branch,
+                        "status_code": bp.status_code,
+                        "required_status_checks": json.dumps((bp.data or {}).get("required_status_checks"), sort_keys=True),
+                        "enforce_admins": json.dumps((bp.data or {}).get("enforce_admins"), sort_keys=True),
+                        "required_pull_request_reviews": json.dumps(
+                            (bp.data or {}).get("required_pull_request_reviews"), sort_keys=True
+                        ),
+                        "restrictions": json.dumps((bp.data or {}).get("restrictions"), sort_keys=True),
+                    }
+                )
+                safe_json_dump(
+                    {"status_code": bp.status_code, "url": bp.url, "data": bp.data, "note": bp.note},
+                    raw_branch_dir / f"{repo_name}_{default_branch}.json",
+                )
+                collected_files.append(raw_branch_dir / f"{repo_name}_{default_branch}.json")
+            except requests.HTTPError as exc:
+                errors.append(f"Branch protection unavailable for {repo.get('full_name')}:{default_branch} ({exc})")      
         try:
             rulesets = collector.list_rulesets(repo_name)
             for rs in rulesets:
@@ -653,25 +674,5 @@ def main() -> int:
     safe_text_write(report, report_dir / "CA03_GitHub_Evidence_Report.md")
     collected_files.append(report_dir / "CA03_GitHub_Evidence_Report.md")
     
-                bp = collector.get_branch_protection(repo_name, default_branch)
-                branch_rows.append(
-                    {
-                        "repo": repo.get("full_name"),
-                        "branch": default_branch,
-                        "status_code": bp.status_code,
-                        "required_status_checks": json.dumps((bp.data or {}).get("required_status_checks"), sort_keys=True),
-                        "enforce_admins": json.dumps((bp.data or {}).get("enforce_admins"), sort_keys=True),
-                        "required_pull_request_reviews": json.dumps(
-                            (bp.data or {}).get("required_pull_request_reviews"), sort_keys=True
-                        ),
-                        "restrictions": json.dumps((bp.data or {}).get("restrictions"), sort_keys=True),
-                    }
-                )
-                safe_json_dump(
-                    {"status_code": bp.status_code, "url": bp.url, "data": bp.data, "note": bp.note},
-                    raw_branch_dir / f"{repo_name}_{default_branch}.json",
-                )
-                collected_files.append(raw_branch_dir / f"{repo_name}_{default_branch}.json")
-            except requests.HTTPError as exc:
-                errors.append(f"Branch protection unavailable for {repo.get('full_name')}:{default_branch} ({exc})")
+               
   
