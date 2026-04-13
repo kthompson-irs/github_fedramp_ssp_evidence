@@ -1,42 +1,59 @@
 name: AC-02 Evidence Collection
 
 on:
-workflow_dispatch:
-schedule:
-- cron: "0 2 * * 1"  # Weekly (Monday 2 AM UTC)
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 1"  # Weekly (Monday 2 AM UTC)
 
 jobs:
-collect-evidence:
-runs-on: ubuntu-latest
+  collect-evidence:
+    runs-on: ubuntu-latest
 
-```
-steps:
-  - name: Checkout repo
-    uses: actions/checkout@v4
+    permissions:
+      contents: read
 
-  - name: Install Ansible
-    run: |
-      sudo apt update
-      sudo apt install -y ansible
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-  - name: Set up Python deps
-    run: |
-      pip install requests
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
 
-  - name: Run AC-02 evidence playbook
-    env:
-      GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-    run: |
-      ansible-playbook github_ac02_evidence.yml
+      - name: Set up Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install requests
 
-  - name: Archive evidence
-    run: |
-      tar -czf ac02_evidence.tar.gz evidence_output/
+      - name: Validate GH_TOKEN is present
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "ERROR: GH_TOKEN is not set"
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
 
-  - name: Upload artifact
-    uses: actions/upload-artifact@v4
-    with:
-      name: ac02-evidence
-      path: ac02_evidence.tar.gz
-      retention-days: 30
-```
+      - name: Run AC-02 evidence playbook
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          ansible-playbook github_ac02_evidence.yml
+
+      - name: Archive evidence
+        run: |
+          tar -czf ac02_evidence.tar.gz evidence_output/
+
+      - name: Generate SHA256 hash (audit integrity)
+        run: |
+          sha256sum ac02_evidence.tar.gz > ac02_evidence.sha256
+
+      - name: Upload evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac02-evidence
+          path: |
+            ac02_evidence.tar.gz
+            ac02_evidence.sha256
+          retention-days: 30
