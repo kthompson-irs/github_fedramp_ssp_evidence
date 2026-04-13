@@ -24,11 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify workspace
+      - name: Debug workspace (IMPORTANT)
         run: |
+          echo "Current directory:"
           pwd
+          echo "Repo contents:"
           ls -la
-          find . -maxdepth 3 -name 'ca02_collect_github_evidence.py' -print
+          echo "Find script:"
+          find . -name "ca02_collect_github_evidence.py"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,18 +43,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Collect evidence
+      - name: Run CA-02 Evidence Collector
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_ORG: ${{ vars.GH_ORG }}
           GH_REPOS: ${{ vars.GH_REPOS }}
           GH_AUDIT_LOG_PHRASE: ${{ vars.GH_AUDIT_LOG_PHRASE }}
         run: |
-          python ./collect_github_evidence.py
+          python ./ca02_collect_github_evidence.py
 
       - name: Upload evidence bundle
         uses: actions/upload-artifact@v4
         with:
-          name: ca02_github-fedramp-evidence
+          name: github-fedramp-evidence
           path: evidence
           if-no-files-found: warn
