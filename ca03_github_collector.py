@@ -46,8 +46,6 @@ python ca03_github_collector.py --org my-org --repos repo-a,repo-b --outdir ./ev
 python ca03_github_collector.py --org my-org --include-audit-log --include-webhooks
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import json
