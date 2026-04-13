@@ -1,0 +1,47 @@
+name: Collect GitHub FedRAMP Evidence
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  collect-evidence:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      OUTPUT_DIR: evidence
+      GITHUB_BRANCH: main
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Collect evidence
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+          GITHUB_REPOS: ${{ vars.GITHUB_REPOS }}
+          AUDIT_LOG_PHRASE: ${{ vars.AUDIT_LOG_PHRASE }}
+        run: |
+          python collect_github_evidence.py
+
+      - name: Upload evidence bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-fedramp-evidence
+          path: evidence
+          if-no-files-found: warn
