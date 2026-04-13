@@ -31,7 +31,7 @@ jobs:
           echo "Repo contents:"
           ls -la
           echo "Find automation script:"
-          find . -maxdepth 3 -name 'ca02_audit_automation.py' -print
+          find . -maxdepth 4 -name 'ca02_audit_automation.py' -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,7 +50,15 @@ jobs:
           GH_REPOS: ${{ vars.GH_REPOS }}
           GH_AUDIT_LOG_PHRASE: ${{ vars.GH_AUDIT_LOG_PHRASE }}
         run: |
-          python ./ca02_audit_automation.py
+          SCRIPT="$(find . -maxdepth 4 -name 'ca02_audit_automation.py' | head -n 1)"
+          echo "Using script: $SCRIPT"
+
+          if [ -z "$SCRIPT" ]; then
+            echo "ERROR: ca02_audit_automation.py not found"
+            exit 1
+          fi
+
+          python "$SCRIPT"
 
       - name: Upload CA02 evidence archive
         uses: actions/upload-artifact@v4
