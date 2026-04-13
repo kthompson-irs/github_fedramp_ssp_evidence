@@ -1,4 +1,4 @@
-name: Collect GitHub FedRAMP Evidence
+name: CA02 Collect GitHub FedRAMP Evidence
 
 on:
   workflow_dispatch:
