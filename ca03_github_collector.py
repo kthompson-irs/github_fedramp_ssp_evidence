@@ -9,6 +9,7 @@ import os
 import sys
 import zipfile
 from collections import defaultdict
+"""
 CA-03 GitHub.com Evidence Collector
 
 Purpose
