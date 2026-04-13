@@ -14,11 +14,21 @@ jobs:
 
     env:
       OUTPUT_DIR: evidence
-      GITHUB_BRANCH: main
+      GH_BRANCH: main
+
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify workspace
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -name 'collect_github_evidence.py' -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,12 +42,12 @@ jobs:
 
       - name: Collect evidence
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
-          GITHUB_REPOS: ${{ vars.GITHUB_REPOS }}
-          AUDIT_LOG_PHRASE: ${{ vars.AUDIT_LOG_PHRASE }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPOS: ${{ vars.GH_REPOS }}
+          GH_AUDIT_LOG_PHRASE: ${{ vars.GH_AUDIT_LOG_PHRASE }}
         run: |
-          python collect_github_evidence.py
+          python ./collect_github_evidence.py
 
       - name: Upload evidence bundle
         uses: actions/upload-artifact@v4
