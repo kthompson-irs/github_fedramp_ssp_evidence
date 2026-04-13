@@ -32,7 +32,7 @@ class GitHubCollector:
     def _request(self, url: str, params: Optional[dict] = None):
         resp = self.session.get(url, params=params, timeout=self.timeout)
 
-        if resp.status_code in [403, 404]:
+        if resp.status_code in [403, 404, 400, 422]:
             return {"error": resp.text, "status": resp.status_code}
 
         resp.raise_for_status()
@@ -49,8 +49,8 @@ class GitHubCollector:
                 timeout=self.timeout
             )
 
-            if resp.status_code in [403, 404]:
-                break
+            if resp.status_code in [403, 404, 400, 422]:
+                return []
 
             resp.raise_for_status()
             data = resp.json()
@@ -96,10 +96,22 @@ class GitHubCollector:
         return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/hooks")
 
     def list_dependabot(self, repo):
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/dependabot/alerts")
+        try:
+            return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/dependabot/alerts")
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in (400, 403, 404, 422):
+                return []
+            raise
 
     def list_secret_scanning(self, repo):
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/secret-scanning/alerts")
+        try:
+            return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/secret-scanning/alerts")
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in (400, 403, 404, 422):
+                return []
+            raise
 
     def list_audit_log(self):
         return self._paginate(f"{BASE_URL}/orgs/{self.org}/audit-log")
