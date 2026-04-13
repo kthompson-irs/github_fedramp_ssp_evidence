@@ -28,7 +28,7 @@ jobs:
         run: |
           pwd
           ls -la
-          find . -maxdepth 3 -name 'ca02_collect_github_evidence.py' -print
+          find . -name "ca02_collect_github_evidence.py"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,9 +49,14 @@ jobs:
         run: |
           python ./ca02_collect_github_evidence.py
 
-      - name: Upload evidence bundle
+      # 🔥 NEW: ZIP WITH CA02 NAME
+      - name: Create CA02 Evidence Archive
+        run: |
+          zip -r ca02-github-fedramp-evidence.zip $OUTPUT_DIR
+
+      - name: Upload CA02 Evidence Bundle
         uses: actions/upload-artifact@v4
         with:
-          name: github-fedramp-evidence
-          path: evidence
-          if-no-files-found: warn
+          name: ca02-github-fedramp-evidence
+          path: ca02-github-fedramp-evidence.zip
+          if-no-files-found: error
