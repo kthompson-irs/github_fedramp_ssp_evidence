@@ -26,8 +26,11 @@ jobs:
 
       - name: Verify workspace
         run: |
+          echo "Current directory:"
           pwd
+          echo "Repo contents:"
           ls -la
+          echo "Find script:"
           find . -name "ca02_collect_github_evidence.py"
 
       - name: Set up Python
@@ -49,7 +52,6 @@ jobs:
         run: |
           python ./ca02_collect_github_evidence.py
 
-      # 🔥 NEW: ZIP WITH CA02 NAME
       - name: Create CA02 Evidence Archive
         run: |
           zip -r ca02-github-fedramp-evidence.zip $OUTPUT_DIR
