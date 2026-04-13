@@ -24,14 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug workspace (IMPORTANT)
+      - name: Verify workspace
         run: |
-          echo "Current directory:"
           pwd
-          echo "Repo contents:"
           ls -la
-          echo "Find script:"
-          find . -name "ca02_collect_github_evidence.py"
+          find . -maxdepth 3 -name 'ca02_collect_github_evidence.py' -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
