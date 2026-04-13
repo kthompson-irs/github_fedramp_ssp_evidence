@@ -20,13 +20,13 @@ Outputs a timestamped evidence package containing:
 Environment variables:
 
 - GH_TOKEN: required. GitHub token with access to the organization.
-- GITHUB_ORG: required. Organization login.
-- GITHUB_API_URL: optional. Defaults to https://api.github.com
-- GITHUB_API_VERSION: optional. Defaults to 2022-11-28
+- GH_ORG: required. Organization login.
+- GH_API_URL: optional. Defaults to https://api.github.com
+- GH_API_VERSION: optional. Defaults to 2022-11-28
 - OUTPUT_DIR: optional. Defaults to ./evidence_output
-- GITHUB_ENTERPRISE: optional. Enterprise slug for enterprise audit log export.
-- AUDIT_LOG_INCLUDE: optional. web/git/all for enterprise audit log, default web.
-- AUDIT_LOG_PHRASE: optional. Search phrase for audit log export.
+- GH_ENTERPRISE: optional. Enterprise slug for enterprise audit log export.
+- GH_AUDIT_LOG_INCLUDE: optional. web/git/all for enterprise audit log, default web.
+- GH_AUDIT_LOG_PHRASE: optional. Search phrase for audit log export.
 - INCLUDE_REPO_COLLABORATORS: optional. true/false, default true
 - INCLUDE_OUTSIDE_COLLABORATORS: optional. true/false, default true
 """
@@ -137,7 +137,7 @@ def build_summary_md(summary: Dict[str, Any]) -> str:
     lines.append("## Notes")
     lines.append("- This package is intended to support FedRAMP AC-02 evidence review.")
     lines.append("- Repository collaborator collection is optional and may be limited by token permissions.")
-    lines.append("- Audit-log export uses the enterprise audit-log endpoint when `GITHUB_ENTERPRISE` is set.")
+    lines.append("- Audit-log export uses the enterprise audit-log endpoint when `GH_ENTERPRISE` is set.")
     lines.append("")
     return "\n".join(lines)
 
@@ -377,12 +377,12 @@ def parse_bool(env_name: str, default: str = "true") -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect GitHub AC-02 evidence.")
-    parser.add_argument("--org", default=os.environ.get("GITHUB_ORG"), help="GitHub organization login")
+    parser.add_argument("--org", default=os.environ.get("GH_ORG"), help="GitHub organization login")
     parser.add_argument("--token", default=os.environ.get("GH_TOKEN"), help="GitHub token")
-    parser.add_argument("--api-url", default=os.environ.get("GITHUB_API_URL", DEFAULT_API_URL), help="GitHub API base URL")
+    parser.add_argument("--api-url", default=os.environ.get("GH_API_URL", DEFAULT_API_URL), help="GitHub API base URL")
     parser.add_argument(
         "--api-version",
-        default=os.environ.get("GITHUB_API_VERSION", DEFAULT_API_VERSION),
+        default=os.environ.get("GH_API_VERSION", DEFAULT_API_VERSION),
         help="GitHub API version header",
     )
     parser.add_argument(
@@ -392,18 +392,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--enterprise",
-        default=os.environ.get("GITHUB_ENTERPRISE"),
+        default=os.environ.get("GH_ENTERPRISE"),
         help="Optional enterprise slug for enterprise audit log export",
     )
     parser.add_argument(
         "--audit-log-include",
-        default=os.environ.get("AUDIT_LOG_INCLUDE", "web"),
+        default=os.environ.get("GH_AUDIT_LOG_INCLUDE", "web"),
         choices=["web", "git", "all"],
         help="Enterprise audit-log scope",
     )
     parser.add_argument(
         "--audit-log-phrase",
-        default=os.environ.get("AUDIT_LOG_PHRASE"),
+        default=os.environ.get("GH_AUDIT_LOG_PHRASE"),
         help="Optional audit-log search phrase",
     )
     parser.add_argument(
@@ -424,7 +424,7 @@ def main() -> int:
         print("ERROR: GH_TOKEN is required", file=sys.stderr)
         return 2
     if not args.org:
-        print("ERROR: GITHUB_ORG is required", file=sys.stderr)
+        print("ERROR: GH_ORG is required", file=sys.stderr)
         return 2
 
     output_root = Path(args.output_dir).resolve()
