@@ -28,7 +28,7 @@ jobs:
         run: |
           pwd
           ls -la
-          find . -maxdepth 3 -name 'collect_github_evidence.py' -print
+          find . -maxdepth 3 -name 'ca02_collect_github_evidence.py' -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,6 +52,6 @@ jobs:
       - name: Upload evidence bundle
         uses: actions/upload-artifact@v4
         with:
-          name: github-fedramp-evidence
+          name: ca02_github-fedramp-evidence
           path: evidence
           if-no-files-found: warn
