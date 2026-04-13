@@ -438,7 +438,7 @@ def main() -> int:
     def trap(label: str, fn):
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 - we want to capture evidence collection failures
+        except Exception as exc:  # noqa: BLE001
             errors.append({"section": label, "error": str(exc)})
             return []
 
@@ -460,7 +460,6 @@ def main() -> int:
         lambda: collect_audit_log(client, args.org, args.enterprise, args.audit_log_include, args.audit_log_phrase),
     )
 
-    # Write artifacts.
     write_csv(
         run_dir / "members.csv",
         members,
