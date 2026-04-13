@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 #!/usr/bin/env python3
+'''
 
 import argparse
 import csv
@@ -8,8 +7,7 @@ import json
 import os
 import sys
 import zipfile
-from collections import defaultdict#!/usr/bin/env python3
-"""
+from collections import defaultdict
 CA-03 GitHub.com Evidence Collector
 
 Purpose
