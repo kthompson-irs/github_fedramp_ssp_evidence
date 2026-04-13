@@ -11,17 +11,13 @@ Outputs:
 - secret_scanning/<repo>_alerts.json
 - manifest.json
 
-Requirements:
-- Python 3.10+
-- requests
-
 Environment variables:
-- GITHUB_TOKEN   Required. GitHub personal access token or app token with read access.
-- GITHUB_ORG     Required. GitHub organization name.
-- GITHUB_REPOS   Optional. Comma-separated list of repos. If omitted, all repos in org are scanned.
-- GITHUB_BRANCH  Optional. Branch name to inspect for protection settings. Default: main
-- OUTPUT_DIR     Optional. Output directory. Default: ./evidence
-- AUDIT_LOG_PHRASE Optional. Phrase filter for org audit log endpoint, if desired.
+- GH_TOKEN   Required. GitHub personal access token or app token with read access.
+- GH_ORG     Required. GitHub organization name.
+- GH_REPOS   Optional. Comma-separated list of repos. If omitted, all repos in org are scanned.
+- GH_BRANCH  Optional. Branch name to inspect for protection settings. Default: main
+- OUTPUT_DIR Optional. Output directory. Default: ./evidence
+- GH_AUDIT_LOG_PHRASE Optional. Phrase filter for org audit-log endpoint, if desired.
 
 Notes:
 - Some endpoints require GitHub Advanced Security or org-admin permissions.
@@ -60,15 +56,15 @@ def env(name: str, default: Optional[str] = None, required: bool = False) -> str
 
 
 def get_config() -> Config:
-    repos_raw = env("GITHUB_REPOS", "")
+    repos_raw = env("GH_REPOS", "")
     repos = [r.strip() for r in repos_raw.split(",") if r.strip()] if repos_raw else None
     return Config(
-        token=env("GITHUB_TOKEN", required=True),
-        org=env("GITHUB_ORG", required=True),
+        token=env("GH_TOKEN", required=True),
+        org=env("GH_ORG", required=True),
         repos=repos,
-        branch=env("GITHUB_BRANCH", "main"),
+        branch=env("GH_BRANCH", "main"),
         output_dir=Path(env("OUTPUT_DIR", "./evidence")).resolve(),
-        audit_log_phrase=env("AUDIT_LOG_PHRASE", "") or None,
+        audit_log_phrase=env("GH_AUDIT_LOG_PHRASE", "") or None,
     )
 
 
@@ -83,18 +79,27 @@ def request_json(session: requests.Session, method: str, url: str, *, params: Op
         payload = response.json()
     except Exception:
         payload = {"text": response.text}
+
     if response.ok:
         if isinstance(payload, dict):
             return payload
         return {"data": payload}
+
     result["error"] = payload
     return result
 
 
-def paged_get(session: requests.Session, url: str, *, params: Optional[dict] = None, max_pages: int = 20):
-    items = []
+def paged_get(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    max_pages: int = 20,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
     page_params = dict(params or {})
     page_params.setdefault("per_page", 100)
+
     for _ in range(max_pages):
         response = session.get(url, params=page_params, timeout=60)
         if not response.ok:
@@ -105,17 +110,21 @@ def paged_get(session: requests.Session, url: str, *, params: Optional[dict] = N
                 "error": response.text,
             })
             break
+
         payload = response.json()
         if isinstance(payload, list):
             items.extend(payload)
         else:
             items.append(payload)
             break
+
         next_link = response.links.get("next", {}).get("url")
         if not next_link:
             break
+
         url = next_link
         page_params = None
+
     return items
 
 
@@ -125,19 +134,19 @@ def safe_write_json(path: Path, data: Any) -> None:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
-def safe_write_jsonl(path: Path, rows):
+def safe_write_jsonl(path: Path, rows: List[Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, sort_keys=True))
-            f.write("\\n")
+            f.write("\n")
 
 
 def collect_org(session: requests.Session, org: str) -> Dict[str, Any]:
     return request_json(session, "GET", f"{API_BASE}/orgs/{org}")
 
 
-def collect_repos(session: requests.Session, org: str, repos_filter: Optional[List[str]]):
+def collect_repos(session: requests.Session, org: str, repos_filter: Optional[List[str]]) -> List[Dict[str, Any]]:
     if repos_filter:
         repos = []
         for repo in repos_filter:
@@ -146,7 +155,7 @@ def collect_repos(session: requests.Session, org: str, repos_filter: Optional[Li
     return paged_get(session, f"{API_BASE}/orgs/{org}/repos", params={"type": "all"})
 
 
-def collect_audit_log(session: requests.Session, org: str, phrase: Optional[str]):
+def collect_audit_log(session: requests.Session, org: str, phrase: Optional[str]) -> List[Dict[str, Any]]:
     params = {}
     if phrase:
         params["phrase"] = phrase
@@ -179,7 +188,7 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(headers)
 
-    manifest = {
+    manifest: Dict[str, Any] = {
         "org": cfg.org,
         "branch": cfg.branch,
         "repos_filter": cfg.repos,
@@ -206,20 +215,27 @@ def main() -> int:
     dependabot_dir.mkdir(exist_ok=True)
     secret_dir.mkdir(exist_ok=True)
 
-    repo_names = []
+    repo_names: List[str] = []
     for repo_entry in repos:
         if isinstance(repo_entry, dict) and repo_entry.get("name"):
             repo_names.append(repo_entry["name"])
 
-    repo_records = {}
+    repo_records: Dict[str, Any] = {}
     for repo in repo_names:
-        repo_record = {"repo": repo}
-        repo_record["branch_protection"] = collect_branch_protection(session, cfg.org, repo, cfg.branch)
-        safe_write_json(branch_dir / f"{repo}_{cfg.branch}_protection.json", repo_record["branch_protection"])
-        repo_record["dependabot_alerts"] = collect_dependabot(session, cfg.org, repo)
-        safe_write_json(dependabot_dir / f"{repo}_alerts.json", repo_record["dependabot_alerts"])
-        repo_record["secret_scanning_alerts"] = collect_secret_scanning(session, cfg.org, repo)
-        safe_write_json(secret_dir / f"{repo}_alerts.json", repo_record["secret_scanning_alerts"])
+        repo_record: Dict[str, Any] = {"repo": repo}
+
+        branch_protection = collect_branch_protection(session, cfg.org, repo, cfg.branch)
+        repo_record["branch_protection"] = branch_protection
+        safe_write_json(branch_dir / f"{repo}_{cfg.branch}_protection.json", branch_protection)
+
+        dependabot_alerts = collect_dependabot(session, cfg.org, repo)
+        repo_record["dependabot_alerts"] = dependabot_alerts
+        safe_write_json(dependabot_dir / f"{repo}_alerts.json", dependabot_alerts)
+
+        secret_scanning_alerts = collect_secret_scanning(session, cfg.org, repo)
+        repo_record["secret_scanning_alerts"] = secret_scanning_alerts
+        safe_write_json(secret_dir / f"{repo}_alerts.json", secret_scanning_alerts)
+
         repo_records[repo] = repo_record
 
     safe_write_json(cfg.output_dir / "repo_records.json", repo_records)
