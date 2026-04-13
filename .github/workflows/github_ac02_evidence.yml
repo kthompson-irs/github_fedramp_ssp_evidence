@@ -1,0 +1,71 @@
+name: AC-02 Evidence Collection
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 1"  # Weekly Monday 2 AM UTC
+
+jobs:
+  collect-evidence:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Validate required environment
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GH_TOKEN secret is not set"
+            exit 1
+          fi
+          if [ -z "$GITHUB_ORG" ]; then
+            echo "ERROR: GITHUB_ORG repository variable is not set"
+            exit 1
+          fi
+
+      - name: Run AC-02 evidence collector
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+          GITHUB_ENTERPRISE: ${{ vars.GITHUB_ENTERPRISE }}
+          AUDIT_LOG_INCLUDE: ${{ vars.AUDIT_LOG_INCLUDE }}
+          AUDIT_LOG_PHRASE: ${{ vars.AUDIT_LOG_PHRASE }}
+          INCLUDE_REPO_COLLABORATORS: "true"
+          INCLUDE_OUTSIDE_COLLABORATORS: "true"
+          OUTPUT_DIR: evidence_output
+        run: |
+          python3 github_ac02_evidence.py
+
+      - name: Archive evidence output
+        run: |
+          tar -czf ac02_evidence.tar.gz evidence_output/
+
+      - name: Generate SHA256
+        run: |
+          sha256sum ac02_evidence.tar.gz > ac02_evidence.tar.gz.sha256
+
+      - name: Upload evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac02-evidence
+          path: |
+            ac02_evidence.tar.gz
+            ac02_evidence.tar.gz.sha256
+          retention-days: 30
