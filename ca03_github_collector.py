@@ -441,3 +441,237 @@ def main() -> int:
                 "evidence_source": f"repo:{repo.get('full_name')}",
             }
         )
+
+        if args.include_webhooks:
+            hooks = collector.list_repo_hooks(repo_name)
+            webhook_rows.extend(
+                [
+                    {
+                        "repo": repo.get("full_name"),
+                        "hook_id": h.get("id"),
+                        "name": h.get("name"),
+                        "active": h.get("active"),
+                        "events": ",".join(h.get("events", [])) if isinstance(h.get("events"), list) else h.get("events"),
+                        "config_url": (h.get("config") or {}).get("url"),
+                    }
+                    for h in hooks
+                ]
+            )
+            safe_json_dump(hooks, raw_hooks_dir / f"{repo_name}.json")
+            collected_files.append(raw_hooks_dir / f"{repo_name}.json")
+
+        collaborators = collector.list_repo_collaborators(repo_name)
+        for c in collaborators:
+            access_rows.append(
+                {
+                    "repo": repo.get("full_name"),
+                    "principal": c.get("login") or (c.get("user") or {}).get("login"),
+                    "type": c.get("type"),
+                    "permissions": json.dumps(c.get("permissions"), sort_keys=True),
+                    "role_name": c.get("role_name"),
+                    "site_admin": c.get("site_admin"),
+                }
+            )
+
+        default_branch = repo.get("default_branch")
+        if default_branch:
+            try:
+        try:
+            rulesets = collector.list_rulesets(repo_name)
+            for rs in rulesets:
+                ruleset_rows.append(
+                    {
+                        "repo": repo.get("full_name"),
+                        "ruleset_id": rs.get("id"),
+                        "name": rs.get("name"),
+                        "target": rs.get("target"),
+                        "enforcement": rs.get("enforcement"),
+                        "conditions": json.dumps(rs.get("conditions"), sort_keys=True),
+                    }
+                )
+            safe_json_dump(rulesets, raw_ruleset_dir / f"{repo_name}.json")
+            collected_files.append(raw_ruleset_dir / f"{repo_name}.json")
+        except requests.HTTPError:
+            pass
+
+        if args.include_dependabot:
+            try:
+                alerts = collector.list_dependabot_alerts(repo_name)
+                for alert in alerts:
+                    dependabot_rows.append(
+                        {
+                            "repo": repo.get("full_name"),
+                            "number": alert.get("number"),
+                            "state": alert.get("state"),
+                            "severity": (alert.get("security_advisory") or {}).get("severity"),
+                            "package": ((alert.get("security_advisory") or {}).get("package") or {}).get("name"),
+                            "manifest_path": alert.get("manifest_path"),
+                        }
+                    )
+                safe_json_dump(alerts, raw_dep_dir / f"{repo_name}.json")
+                collected_files.append(raw_dep_dir / f"{repo_name}.json")
+            except requests.HTTPError:
+                pass
+
+        if args.include_secret_scanning:
+            try:
+                alerts = collector.list_secret_scanning_alerts(repo_name)
+                for alert in alerts:
+                    secret_rows.append(
+                        {
+                            "repo": repo.get("full_name"),
+                            "number": alert.get("number"),
+                            "state": alert.get("state"),
+                            "secret_type": alert.get("secret_type"),
+                            "resolution": alert.get("resolution"),
+                        }
+                    )
+                safe_json_dump(alerts, raw_secret_dir / f"{repo_name}.json")
+                collected_files.append(raw_secret_dir / f"{repo_name}.json")
+            except requests.HTTPError:
+                pass
+
+    audit_log_available = False
+    if args.include_audit_log:
+        try:
+            audit_log = collector.list_audit_log(limit_pages=args.max_audit_pages)
+            audit_log_available = bool(audit_log)
+            safe_json_dump(audit_log, raw_dir / "audit_log.json")
+            collected_files.append(raw_dir / "audit_log.json")
+            for event in audit_log:
+                audit_rows.append(
+                    {
+                        "action": event.get("action"),
+                        "actor": event.get("actor"),
+                        "repo": event.get("repo"),
+                        "created_at": event.get("@timestamp") or event.get("created_at"),
+                        "user": event.get("user"),
+                        "org": event.get("org"),
+                        "ip": event.get("ip"),
+                        "operation_type": event.get("operation_type"),
+                        "transport_protocol": event.get("transport_protocol"),
+                    }
+                )
+        except requests.HTTPError as exc:
+            errors.append(f"Audit log collection failed or unavailable: {exc}")
+        except Exception as exc:
+            errors.append(f"Audit log collection failed or unavailable: {exc}")
+
+    write_csv(
+        csv_dir / "inventory.csv",
+        inventory_rows,
+        [
+            "connection_name",
+            "external_system",
+            "connection_type",
+            "endpoint",
+            "protocol",
+            "data_type",
+            "direction",
+            "authorization",
+            "owner",
+            "evidence_source",
+        ],
+    )
+    write_csv(
+        csv_dir / "repos.csv",
+        repo_rows,
+        [
+            "full_name",
+            "private",
+            "visibility",
+            "default_branch",
+            "archived",
+            "disabled",
+            "allow_forking",
+            "has_issues",
+            "has_wiki",
+            "has_projects",
+            "has_discussions",
+        ],
+    )
+    write_csv(
+        csv_dir / "access.csv",
+        access_rows,
+        ["repo", "principal", "type", "permissions", "role_name", "site_admin"],
+    )
+        if webhook_rows:
+        write_csv(
+            csv_dir / "webhooks.csv",
+            webhook_rows,
+            ["repo", "hook_id", "name", "active", "events", "config_url"],
+        )
+    if branch_rows:
+        write_csv(
+            csv_dir / "branch_protection.csv",
+            branch_rows,
+            [
+                "repo",
+                "branch",
+                "status_code",
+                "required_status_checks",
+                "enforce_admins",
+                "required_pull_request_reviews",
+                "restrictions",
+            ],
+        )
+    if ruleset_rows:
+        write_csv(
+            csv_dir / "rulesets.csv",
+            ruleset_rows,
+            ["repo", "ruleset_id", "name", "target", "enforcement", "conditions"],
+        )
+    if dependabot_rows:
+        write_csv(
+            csv_dir / "dependabot.csv",
+            dependabot_rows,
+            ["repo", "number", "state", "severity", "package", "manifest_path"],
+        )
+    if secret_rows:
+        write_csv(
+            csv_dir / "secret_scanning.csv",
+            secret_rows,
+            ["repo", "number", "state", "secret_type", "resolution"],
+        )
+    if audit_rows:
+        write_csv(
+            csv_dir / "audit_log.csv",
+            audit_rows,
+            ["action", "actor", "repo", "created_at", "user", "org", "ip", "operation_type", "transport_protocol"],
+        )
+
+    report = make_report(
+        org_payload=org_payload,
+        repos=[r if isinstance(r, dict) else {} for r in repos],
+        members=members,
+        teams=teams,
+        team_repo_map=team_repo_map,
+        audit_log_available=audit_log_available,
+        errors=errors,
+        scope_repos=selected_repo_names,
+    )
+    safe_text_write(report, report_dir / "CA03_GitHub_Evidence_Report.md")
+    collected_files.append(report_dir / "CA03_GitHub_Evidence_Report.md")
+    
+                bp = collector.get_branch_protection(repo_name, default_branch)
+                branch_rows.append(
+                    {
+                        "repo": repo.get("full_name"),
+                        "branch": default_branch,
+                        "status_code": bp.status_code,
+                        "required_status_checks": json.dumps((bp.data or {}).get("required_status_checks"), sort_keys=True),
+                        "enforce_admins": json.dumps((bp.data or {}).get("enforce_admins"), sort_keys=True),
+                        "required_pull_request_reviews": json.dumps(
+                            (bp.data or {}).get("required_pull_request_reviews"), sort_keys=True
+                        ),
+                        "restrictions": json.dumps((bp.data or {}).get("restrictions"), sort_keys=True),
+                    }
+                )
+                safe_json_dump(
+                    {"status_code": bp.status_code, "url": bp.url, "data": bp.data, "note": bp.note},
+                    raw_branch_dir / f"{repo_name}_{default_branch}.json",
+                )
+                collected_files.append(raw_branch_dir / f"{repo_name}_{default_branch}.json")
+            except requests.HTTPError as exc:
+                errors.append(f"Branch protection unavailable for {repo.get('full_name')}:{default_branch} ({exc})")
+  
