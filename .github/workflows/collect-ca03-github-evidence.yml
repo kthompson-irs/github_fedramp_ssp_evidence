@@ -7,69 +7,39 @@ on:
         description: GitHub organization name
         required: true
         type: string
-      repos:
-        description: Optional comma-separated repository list
-        required: false
-        type: string
-      include_audit_log:
-        description: Collect audit log if permitted
-        required: false
-        type: boolean
-        default: true
-      include_webhooks:
-        description: Collect repository webhook data
-        required: false
-        type: boolean
-        default: true
-      include_secret_scanning:
-        description: Collect secret scanning alerts
-        required: false
-        type: boolean
-        default: false
-      include_dependabot:
-        description: Collect Dependabot alerts
-        required: false
-        type: boolean
-        default: false
-  schedule:
-    - cron: "0 8 1 * *"
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install requests
 
-      - name: Collect CA-03 evidence
+      - name: Run collector
         env:
-          CA03_GITHUB_TOKEN: ${{ secrets.CA03_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           python ca03_github_collector.py \
             --org "${{ inputs.org }}" \
-            ${{ inputs.repos && format('--repos "{0}"', inputs.repos) || '' }} \
-            ${{ inputs.include_audit_log && '--include-audit-log' || '' }} \
-            ${{ inputs.include_webhooks && '--include-webhooks' || '' }} \
-            ${{ inputs.include_secret_scanning && '--include-secret-scanning' || '' }} \
-            ${{ inputs.include_dependabot && '--include-dependabot' || '' }} \
+            --include-audit-log \
+            --include-webhooks \
+            --include-secret-scanning \
+            --include-dependabot \
             --outdir "ca03_github_evidence"
 
-      - name: Upload evidence bundle
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ca03-github-evidence
           path: |
-            ca03_github_evidence
-            ca03_github_evidence.zip
+            ca03_github_evidence*
