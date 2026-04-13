@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 #!/usr/bin/env python3
 """Generate SSP-ready Markdown and PDF summaries from a collector run directory."""
-from __future__ import annotations
 
 import argparse
 import csv
