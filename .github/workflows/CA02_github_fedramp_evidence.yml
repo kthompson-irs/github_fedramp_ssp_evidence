@@ -1,4 +1,4 @@
-name: CA02 Collect GitHub FedRAMP Evidence
+name: CA02 GitHub FedRAMP Audit Automation
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "0 8 * * 1"
 
 jobs:
-  collect-evidence:
+  build-evidence:
     runs-on: ubuntu-latest
 
     permissions:
@@ -30,8 +30,8 @@ jobs:
           pwd
           echo "Repo contents:"
           ls -la
-          echo "Find script:"
-          find . -name "ca02_collect_github_evidence.py"
+          echo "Find automation script:"
+          find . -maxdepth 3 -name 'ca02_audit_automation.py' -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,22 +41,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests openpyxl
 
-      - name: Run CA-02 Evidence Collector
+      - name: Run CA-02 audit automation
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_ORG: ${{ vars.GH_ORG }}
           GH_REPOS: ${{ vars.GH_REPOS }}
           GH_AUDIT_LOG_PHRASE: ${{ vars.GH_AUDIT_LOG_PHRASE }}
         run: |
-          python ./ca02_collect_github_evidence.py
+          python ./ca02_audit_automation.py
 
-      - name: Create CA02 Evidence Archive
-        run: |
-          zip -r ca02-github-fedramp-evidence.zip $OUTPUT_DIR
-
-      - name: Upload CA02 Evidence Bundle
+      - name: Upload CA02 evidence archive
         uses: actions/upload-artifact@v4
         with:
           name: ca02-github-fedramp-evidence
