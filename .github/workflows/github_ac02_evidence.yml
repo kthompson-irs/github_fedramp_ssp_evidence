@@ -29,24 +29,24 @@ jobs:
       - name: Validate required environment
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+          GH_ORG: ${{ vars.GH_ORG }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "ERROR: GH_TOKEN secret is not set"
             exit 1
           fi
-          if [ -z "$GITHUB_ORG" ]; then
-            echo "ERROR: GITHUB_ORG repository variable is not set"
+          if [ -z "$GH_ORG" ]; then
+            echo "ERROR: GH_ORG repository variable is not set"
             exit 1
           fi
 
       - name: Run AC-02 evidence collector
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
-          GITHUB_ENTERPRISE: ${{ vars.GITHUB_ENTERPRISE }}
-          AUDIT_LOG_INCLUDE: ${{ vars.AUDIT_LOG_INCLUDE }}
-          AUDIT_LOG_PHRASE: ${{ vars.AUDIT_LOG_PHRASE }}
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_ENTERPRISE: ${{ vars.GH_ENTERPRISE }}
+          GH_AUDIT_LOG_INCLUDE: ${{ vars.GH_AUDIT_LOG_INCLUDE }}
+          GH_AUDIT_LOG_PHRASE: ${{ vars.GH_AUDIT_LOG_PHRASE }}
           INCLUDE_REPO_COLLABORATORS: "true"
           INCLUDE_OUTSIDE_COLLABORATORS: "true"
           OUTPUT_DIR: evidence_output
