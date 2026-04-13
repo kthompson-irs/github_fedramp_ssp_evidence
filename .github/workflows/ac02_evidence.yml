@@ -1,0 +1,42 @@
+name: AC-02 Evidence Collection
+
+on:
+workflow_dispatch:
+schedule:
+- cron: "0 2 * * 1"  # Weekly (Monday 2 AM UTC)
+
+jobs:
+collect-evidence:
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
+
+  - name: Install Ansible
+    run: |
+      sudo apt update
+      sudo apt install -y ansible
+
+  - name: Set up Python deps
+    run: |
+      pip install requests
+
+  - name: Run AC-02 evidence playbook
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      ansible-playbook github_ac02_evidence.yml
+
+  - name: Archive evidence
+    run: |
+      tar -czf ac02_evidence.tar.gz evidence_output/
+
+  - name: Upload artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: ac02-evidence
+      path: ac02_evidence.tar.gz
+      retention-days: 30
+```
