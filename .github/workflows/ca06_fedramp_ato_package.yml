@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GH_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
       GH_ORG: ${{ github.event.inputs.org || vars.GH_ORG }}
       EVIDENCE_DIR: ca06_evidence
       PACKAGE_DIR: ca06_package
