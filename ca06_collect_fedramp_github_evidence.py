@@ -292,7 +292,7 @@ def main() -> int:
         print("ERROR: --org or GH_ORG is required", file=sys.stderr)
         return 2
     if not args.token:
-        print("ERROR: --token or GH_TOKEN/GITHUB_TOKEN is required", file=sys.stderr)
+        print("ERROR: --token or GH_TOKEN is required", file=sys.stderr)
         return 2
 
     out = Path(args.out).resolve()
