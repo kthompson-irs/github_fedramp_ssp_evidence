@@ -44,11 +44,11 @@ jobs:
       security-events: read
       pull-requests: read
       id-token: write
-      organization-administration: read
 
     env:
       # Use a dedicated read token for enterprise/org API visibility.
-      GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
+      # Fall back to the built-in token when the repo/org scope is sufficient.
+      GITHUB_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
@@ -71,7 +71,13 @@ jobs:
 
       - name: Run IA-5(6) enterprise compliance check
         run: |
-          python ia_5_6_compliance.py             --scope "$SCOPE"             --enterprise-slug "$ENTERPRISE_SLUG"             --orgs "$ORGS"             --repo "$REPO"             --branch "$BRANCH"             --output-dir compliance-output
+          python ia_5_6_compliance.py \
+            --scope "$SCOPE" \
+            --enterprise-slug "$ENTERPRISE_SLUG" \
+            --orgs "$ORGS" \
+            --repo "$REPO" \
+            --branch "$BRANCH" \
+            --output-dir compliance-output
 
       - name: Upload compliance artifacts
         uses: actions/upload-artifact@v4
