@@ -32,9 +32,7 @@ or a controlled code review evidence source approved by your organization.
 Authentication
 --------------
 Set one of the following environment variables:
-  - GITHUB_TOKEN
   - GH_TOKEN
-  - CA03_GITHUB_TOKEN
 
 The token should be a GitHub PAT or GitHub App installation token with the minimum permissions
 needed to read org metadata, repositories, teams, and audit logs (when available).
@@ -326,13 +324,11 @@ def main() -> int:
     args = parser.parse_args()
 
     token = (
-        os.environ.get("CA03_GITHUB_TOKEN")
-        or os.environ.get("GITHUB_TOKEN")
         or os.environ.get("GH_TOKEN")
     )
     if not token:
         print(
-            "Missing token. Set CA03_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN.",
+            "Missing token. Set GH_TOKEN.",
             file=sys.stderr,
         )
         return 2
