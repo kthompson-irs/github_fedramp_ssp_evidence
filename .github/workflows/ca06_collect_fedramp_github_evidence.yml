@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GH_TOKEN: ${{ secrets.GH__TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
       GH_ORG: ${{ inputs.org }}
       OUT_DIR: ${{ inputs.out_dir }}
 
@@ -43,7 +43,7 @@ jobs:
 
       - name: Collect GitHub evidence
         run: |
-          python scripts/collect_fedramp_github_evidence.py \
+          python ca06_collect_fedramp_github_evidence.py \
             --org "${GH_ORG}" \
             --out "${OUT_DIR}"
 
