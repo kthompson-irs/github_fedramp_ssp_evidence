@@ -55,7 +55,7 @@ jobs:
 
       - name: Collect CA-03 evidence
         env:
-          CA03_GITHUB_TOKEN: ${{ secrets.CA03_GITHUB_TOKEN }}
+          CA03_GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           python ca03_github_collector.py \
             --org "${{ inputs.org }}" \
