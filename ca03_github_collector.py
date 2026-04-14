@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""Generate SSP-ready Markdown and PDF summaries from a collector run directory."""
-
-import argparse
-import csv
-import json
-import os
-import sys
-import zipfile
-from collections import defaultdict
 """
 CA-03 GitHub.com Evidence Collector
 
 Purpose
 -------
 Collect auditable evidence for a GitHub.com interconnection used in a FedRAMP ATO package.
+
 The script gathers:
   - Organization metadata
   - Repository inventory and repo security posture
@@ -21,7 +13,9 @@ The script gathers:
   - Branch protection / rulesets
   - Webhooks
   - Audit log events (when permissions allow)
-  - A CA-03 evidence report and manifest
+  - CSV/JSON evidence artifacts
+  - An SSP-ready Markdown report
+  - Optional PDF report if reportlab is installed
 
 Important
 ---------
@@ -31,7 +25,7 @@ or a controlled code review evidence source approved by your organization.
 
 Authentication
 --------------
-Set one of the following environment variables:
+Set:
   - GH_TOKEN
 
 The token should be a GitHub PAT or GitHub App installation token with the minimum permissions
@@ -49,6 +43,7 @@ import csv
 import json
 import os
 import sys
+import time
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -57,10 +52,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 
-API_VERSION = "2022-11-28"
 BASE_URL = "https://api.github.com"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+SOFT_FAIL_STATUS_CODES = {400, 403, 404, 422}
 
 
 @dataclass
@@ -71,105 +77,18 @@ class ApiResult:
     note: str = ""
 
 
-class GitHubCollector:
-    def __init__(self, token: str, org: str, timeout: int = 30) -> None:
-        if not token:
-            raise ValueError("A GitHub token is required.")
-        self.org = org
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": API_VERSION,
-                "User-Agent": "ca03-github-evidence-collector",
-            }
-        )
-
-    def _request(self, method: str, url: str, params: Optional[dict] = None) -> ApiResult:
-        resp = self.session.request(method, url, params=params, timeout=self.timeout)
-        note = ""
-        if resp.status_code == 204:
-            return ApiResult(resp.status_code, None, resp.url)
-        if resp.headers.get("Content-Type", "").startswith("application/json"):
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"raw_text": resp.text}
-        else:
-            data = resp.text
-
-        if resp.status_code in (403, 404):
-            note = f"{resp.status_code} returned; may indicate missing permissions or unavailable endpoint."
-        if resp.status_code >= 400 and resp.status_code not in (403, 404):
-            resp.raise_for_status()
-        return ApiResult(resp.status_code, data, resp.url, note=note)
-
-    def _paginate(self, url: str, params: Optional[dict] = None, max_pages: int = 20) -> List[Any]:
-        items: List[Any] = []
-        page = 1
-        params = dict(params or {})
-        while True:
-            params.update({"per_page": 100, "page": page})
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            if resp.status_code in (403, 404):
-                break
-            resp.raise_for_status()
-            payload = resp.json()
-            if isinstance(payload, list):
-                items.extend(payload)
-            else:
-                items.append(payload)
-                break
-            link = resp.headers.get("Link", "")
-            if 'rel="next"' not in link or page >= max_pages:
-                break
-            page += 1
-        return items
-
-    def get_org(self) -> ApiResult:
-        return self._request("GET", f"{BASE_URL}/orgs/{self.org}")
-
-    def list_org_repos(self) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/repos", params={"type": "all", "sort": "full_name"})
-
-    def list_org_members(self) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/members")
-
-    def list_org_teams(self) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/teams")
-
-    def get_team_repos(self, team_slug: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/teams/{team_slug}/repos")
-
-    def get_repo(self, repo_name: str) -> ApiResult:
-        return self._request("GET", f"{BASE_URL}/repos/{self.org}/{repo_name}")
-
-    def list_repo_collaborators(self, repo_name: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo_name}/collaborators")
-
-    def list_repo_hooks(self, repo_name: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo_name}/hooks")
-
-    def get_branch_protection(self, repo_name: str, branch: str) -> ApiResult:
-        return self._request("GET", f"{BASE_URL}/repos/{self.org}/{repo_name}/branches/{branch}/protection")
-
-    def list_rulesets(self, repo_name: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo_name}/rulesets")
-
-    def list_dependabot_alerts(self, repo_name: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo_name}/dependabot/alerts")
-
-    def list_secret_scanning_alerts(self, repo_name: str) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo_name}/secret-scanning/alerts")
-
-    def list_audit_log(self, limit_pages: int = 5) -> List[Dict[str, Any]]:
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/audit-log", max_pages=limit_pages)
-
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def safe_slug(value: str) -> str:
+    allowed = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            allowed.append(ch)
+        else:
+            allowed.append("_")
+    return "".join(allowed).strip("._") or "item"
 
 
 def safe_json_dump(obj: Any, path: Path) -> None:
@@ -205,6 +124,301 @@ def build_manifest(files: List[Path], outdir: Path) -> List[Dict[str, Any]]:
     return manifest
 
 
+def make_pdf_from_markdown(markdown_text: str, output_path: Path) -> None:
+    if not REPORTLAB_AVAILABLE:
+        return
+
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(str(output_path), pagesize=letter)
+    story = []
+
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            story.append(Spacer(1, 8))
+            continue
+
+        if line.startswith("# "):
+            story.append(Paragraph(line[2:].strip(), styles["Title"]))
+        elif line.startswith("## "):
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(line[3:].strip(), styles["Heading2"]))
+        elif line.startswith("### "):
+            story.append(Spacer(1, 4))
+            story.append(Paragraph(line[4:].strip(), styles["Heading3"]))
+        elif line.startswith("- "):
+            story.append(Paragraph("• " + line[2:].strip(), styles["BodyText"]))
+        else:
+            story.append(Paragraph(line, styles["BodyText"]))
+
+    doc.build(story)
+
+
+class GitHubCollector:
+    def __init__(
+        self,
+        token: str,
+        org: str,
+        timeout: int = 30,
+        max_attempts: int = 5,
+        backoff_factor: float = 1.5,
+        max_rate_limit_sleep: int = 900,
+    ) -> None:
+        if not token:
+            raise ValueError("GH_TOKEN is required")
+
+        self.org = org
+        self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.backoff_factor = backoff_factor
+        self.max_rate_limit_sleep = max_rate_limit_sleep
+
+        self.session = requests.Session()
+
+        retry = Retry(
+            total=0,
+            connect=0,
+            read=0,
+            redirect=0,
+            status=0,
+            allowed_methods=frozenset(["GET"]),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "ca03-github-evidence-collector",
+            }
+        )
+
+    def _decode_response(self, resp: requests.Response) -> Any:
+        if resp.status_code == 204:
+            return None
+        content_type = resp.headers.get("Content-Type", "")
+        if content_type.startswith("application/json"):
+            try:
+                return resp.json()
+            except Exception:
+                return {"raw_text": resp.text}
+        return resp.text
+
+    def _sleep_for_rate_limit(self, resp: requests.Response) -> bool:
+        if resp.status_code != 403:
+            return False
+
+        remaining = resp.headers.get("X-RateLimit-Remaining")
+        reset = resp.headers.get("X-RateLimit-Reset")
+        if remaining != "0" or not reset:
+            return False
+
+        try:
+            reset_epoch = int(reset)
+        except ValueError:
+            return False
+
+        now_epoch = int(time.time())
+        wait_seconds = max(reset_epoch - now_epoch + 5, 5)
+        wait_seconds = min(wait_seconds, self.max_rate_limit_sleep)
+
+        print(f"[!] GitHub rate limit reached; sleeping {wait_seconds}s", file=sys.stderr)
+        time.sleep(wait_seconds)
+        return True
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        params: Optional[dict] = None,
+        soft_fail: bool = False,
+        soft_fail_statuses: Optional[set[int]] = None,
+    ) -> ApiResult:
+        soft_fail_statuses = soft_fail_statuses or SOFT_FAIL_STATUS_CODES
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                resp = self.session.request(method, url, params=params, timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < self.max_attempts:
+                    time.sleep(min(self.backoff_factor ** attempt, 30))
+                    continue
+                raise
+
+            if self._sleep_for_rate_limit(resp):
+                continue
+
+            data = self._decode_response(resp)
+            note = ""
+
+            if resp.status_code in soft_fail_statuses and soft_fail:
+                note = f"soft-failed with status {resp.status_code}"
+                return ApiResult(resp.status_code, data, resp.url, note=note)
+
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                if attempt < self.max_attempts:
+                    time.sleep(min(self.backoff_factor ** attempt, 30))
+                    continue
+
+            if resp.status_code >= 400:
+                if resp.status_code in soft_fail_statuses and soft_fail:
+                    note = f"soft-failed with status {resp.status_code}"
+                    return ApiResult(resp.status_code, data, resp.url, note=note)
+                resp.raise_for_status()
+
+            return ApiResult(resp.status_code, data, resp.url, note=note)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Request failed for {url}")
+
+    def _paginate(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        max_pages: int = 20,
+        soft_fail: bool = False,
+        soft_fail_statuses: Optional[set[int]] = None,
+    ) -> List[Any]:
+        soft_fail_statuses = soft_fail_statuses or SOFT_FAIL_STATUS_CODES
+        items: List[Any] = []
+        page = 1
+        params = dict(params or {})
+
+        while True:
+            params.update({"per_page": 100, "page": page})
+
+            last_error: Optional[Exception] = None
+            resp: Optional[requests.Response] = None
+
+            for attempt in range(1, self.max_attempts + 1):
+                try:
+                    resp = self.session.get(url, params=params, timeout=self.timeout)
+                except requests.RequestException as exc:
+                    last_error = exc
+                    if attempt < self.max_attempts:
+                        time.sleep(min(self.backoff_factor ** attempt, 30))
+                        continue
+                    raise
+
+                if self._sleep_for_rate_limit(resp):
+                    continue
+
+                if resp.status_code in soft_fail_statuses and soft_fail:
+                    return []
+
+                if resp.status_code in RETRYABLE_STATUS_CODES:
+                    if attempt < self.max_attempts:
+                        time.sleep(min(self.backoff_factor ** attempt, 30))
+                        continue
+
+                if resp.status_code >= 400:
+                    if resp.status_code in soft_fail_statuses and soft_fail:
+                        return []
+                    resp.raise_for_status()
+
+                break
+
+            if resp is None:
+                if last_error:
+                    raise last_error
+                raise RuntimeError(f"Pagination failed for {url}")
+
+            payload = self._decode_response(resp)
+            if isinstance(payload, list):
+                items.extend(payload)
+            else:
+                items.append(payload)
+                break
+
+            link = resp.headers.get("Link", "")
+            if 'rel="next"' not in link or page >= max_pages:
+                break
+
+            page += 1
+
+        return items
+
+    def get_org(self) -> ApiResult:
+        return self._request("GET", f"{BASE_URL}/orgs/{self.org}")
+
+    def list_org_repos(self) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/orgs/{self.org}/repos",
+            params={"type": "all", "sort": "full_name"},
+        )
+
+    def list_org_members(self) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/orgs/{self.org}/members",
+            soft_fail=True,
+        )
+
+    def list_org_teams(self) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/orgs/{self.org}/teams",
+            soft_fail=True,
+        )
+
+    def get_team_repos(self, team_slug: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/orgs/{self.org}/teams/{team_slug}/repos",
+            soft_fail=True,
+        )
+
+    def get_repo(self, repo_name: str) -> ApiResult:
+        return self._request("GET", f"{BASE_URL}/repos/{self.org}/{repo_name}")
+
+    def list_repo_collaborators(self, repo_name: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/collaborators",
+            soft_fail=True,
+        )
+
+    def list_repo_hooks(self, repo_name: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/hooks",
+            soft_fail=True,
+        )
+
+    def get_branch_protection(self, repo_name: str, branch: str) -> ApiResult:
+        return self._request(
+            "GET",
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/branches/{branch}/protection",
+            soft_fail=True,
+        )
+
+    def list_rulesets(self, repo_name: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/rulesets",
+            soft_fail=True,
+        )
+
+    def list_dependabot_alerts(self, repo_name: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/dependabot/alerts",
+            soft_fail=True,
+        )
+
+    def list_secret_scanning_alerts(self, repo_name: str) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/repos/{self.org}/{repo_name}/secret-scanning/alerts",
+            soft_fail=True,
+        )
+
+    def list_audit_log(self, limit_pages: int = 5) -> List[Dict[str, Any]]:
+        return self._paginate(
+            f"{BASE_URL}/orgs/{self.org}/audit-log",
+            max_pages=limit_pages,
+            soft_fail=True,
+        )
+
+
 def make_report(
     org_payload: Dict[str, Any],
     repos: List[Dict[str, Any]],
@@ -221,9 +435,18 @@ def make_report(
     lines.append(f"- Collected: {utc_now_iso()}")
     lines.append(f"- Organization: `{org_payload.get('login', '')}`")
     lines.append(f"- Org name: {org_payload.get('name') or ''}")
-    lines.append(f"- Visibility: {org_payload.get('public_repos', 0)} public repos, {org_payload.get('total_private_repos', 0)} private repos (if visible)")
-    lines.append(f"- Two-factor requirement enabled: {org_payload.get('two_factor_requirement_enabled', 'unavailable')}")
-    lines.append(f"- Audit log collection: {'enabled' if audit_log_available else 'unavailable or permission denied'}")
+    lines.append(
+        f"- Visibility: {org_payload.get('public_repos', 0)} public repos, "
+        f"{org_payload.get('total_private_repos', 0)} private repos (if visible)"
+    )
+    lines.append(
+        f"- Two-factor requirement enabled: "
+        f"{org_payload.get('two_factor_requirement_enabled', 'unavailable')}"
+    )
+    lines.append(
+        f"- Audit log collection: "
+        f"{'enabled' if audit_log_available else 'unavailable or permission denied'}"
+    )
     if scope_repos:
         lines.append(f"- Scoped repositories: {', '.join(scope_repos)}")
     lines.append("")
@@ -237,7 +460,12 @@ def make_report(
     lines.append("## Repository Inventory")
     lines.append("")
     for repo in repos:
-        lines.append(f"- `{repo.get('full_name')}` | private={repo.get('private')} | default branch={repo.get('default_branch')} | archived={repo.get('archived')}")
+        lines.append(
+            f"- `{repo.get('full_name')}` | "
+            f"private={repo.get('private')} | "
+            f"default branch={repo.get('default_branch')} | "
+            f"archived={repo.get('archived')}"
+        )
     if not repos:
         lines.append("- No repositories collected.")
     lines.append("")
@@ -245,7 +473,6 @@ def make_report(
     lines.append("")
     lines.append(f"- Members collected: {len(members)}")
     lines.append(f"- Teams collected: {len(teams)}")
-    lines.append("")
     for team in teams:
         slug = team.get("slug")
         repos_for_team = team_repo_map.get(slug, [])
@@ -287,6 +514,12 @@ def make_report(
     return "\n".join(lines)
 
 
+def collect_and_write_pdf(report_md: str, pdf_path: Path) -> None:
+    if not REPORTLAB_AVAILABLE:
+        return
+    make_pdf_from_markdown(report_md, pdf_path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect CA-03 evidence for GitHub.com.")
     parser.add_argument("--org", required=True, help="GitHub organization name")
@@ -295,44 +528,20 @@ def main() -> int:
         help="Optional comma-separated repository list. If omitted, all org repos are collected.",
     )
     parser.add_argument("--outdir", default=None, help="Output directory for evidence")
-    parser.add_argument(
-        "--include-audit-log",
-        action="store_true",
-        help="Attempt to collect org audit log events",
-    )
-    parser.add_argument(
-        "--include-webhooks",
-        action="store_true",
-        help="Collect repository webhook settings",
-    )
-    parser.add_argument(
-        "--include-secret-scanning",
-        action="store_true",
-        help="Collect secret scanning alerts when available",
-    )
-    parser.add_argument(
-        "--include-dependabot",
-        action="store_true",
-        help="Collect Dependabot alerts when available",
-    )
-    parser.add_argument(
-        "--max-audit-pages",
-        type=int,
-        default=5,
-        help="Maximum audit log pages to collect",
-    )
+    parser.add_argument("--include-audit-log", action="store_true", help="Attempt to collect org audit log events")
+    parser.add_argument("--include-webhooks", action="store_true", help="Collect repository webhook settings")
+    parser.add_argument("--include-secret-scanning", action="store_true", help="Collect secret scanning alerts when available")
+    parser.add_argument("--include-dependabot", action="store_true", help="Collect Dependabot alerts when available")
+    parser.add_argument("--max-audit-pages", type=int, default=5, help="Maximum audit log pages to collect")
     args = parser.parse_args()
 
     token = os.getenv("GH_TOKEN")
     if not token:
-        print(
-            "Missing token. Set GH_TOKEN.",
-            file=sys.stderr,
-        )
+        print("Missing token. Set GH_TOKEN.", file=sys.stderr)
         return 2
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    outdir = Path(args.outdir or f"ca03_github_evidence_{args.org}_{ts}").resolve()
+    outdir = Path(args.outdir or f"ca03_github_evidence_{safe_slug(args.org)}_{ts}").resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
     raw_dir = outdir / "raw"
@@ -347,6 +556,7 @@ def main() -> int:
     errors: List[str] = []
     collected_files: List[Path] = []
 
+    # Org metadata
     org_res = collector.get_org()
     org_payload = org_res.data if isinstance(org_res.data, dict) else {}
     safe_json_dump(
@@ -360,6 +570,7 @@ def main() -> int:
     )
     collected_files.append(raw_dir / "org.json")
 
+    # Repos
     all_repos = collector.list_org_repos()
     selected_repo_names = None
     if args.repos:
@@ -367,20 +578,20 @@ def main() -> int:
         repo_map = {repo.get("name"): repo for repo in all_repos}
         repos = [repo_map[name] for name in selected_repo_names if name in repo_map]
         missing = [name for name in selected_repo_names if name not in repo_map]
-        for m in missing:
-            errors.append(f"Repository not found in org listing: {m}")
+        for name in missing:
+            errors.append(f"Repository not found in org listing: {name}")
     else:
         repos = all_repos
 
     safe_json_dump(repos, raw_dir / "repos.json")
     collected_files.append(raw_dir / "repos.json")
 
+    # Members / teams
     members = collector.list_org_members()
-    safe_json_dump(members, raw_dir / "members.json")
-    collected_files.append(raw_dir / "members.json")
-
     teams = collector.list_org_teams()
+    safe_json_dump(members, raw_dir / "members.json")
     safe_json_dump(teams, raw_dir / "teams.json")
+    collected_files.append(raw_dir / "members.json")
     collected_files.append(raw_dir / "teams.json")
 
     team_repo_map: Dict[str, List[str]] = defaultdict(list)
@@ -391,9 +602,10 @@ def main() -> int:
             continue
         team_repos = collector.get_team_repos(slug)
         team_repo_map[slug] = [r.get("full_name", "") for r in team_repos]
-        safe_json_dump(team_repos, raw_team_repos_dir / f"{slug}.json")
-        collected_files.append(raw_team_repos_dir / f"{slug}.json")
+        safe_json_dump(team_repos, raw_team_repos_dir / f"{safe_slug(slug)}.json")
+        collected_files.append(raw_team_repos_dir / f"{safe_slug(slug)}.json")
 
+    # Output rows
     repo_rows: List[Dict[str, Any]] = []
     access_rows: List[Dict[str, Any]] = []
     inventory_rows: List[Dict[str, Any]] = []
@@ -404,7 +616,7 @@ def main() -> int:
     secret_rows: List[Dict[str, Any]] = []
     audit_rows: List[Dict[str, Any]] = []
 
-    raw_repos_dir = raw_dir / "repos"
+    raw_repos_dir = raw_dir / "repo_detail"
     raw_hooks_dir = raw_dir / "hooks"
     raw_branch_dir = raw_dir / "branch_protection"
     raw_ruleset_dir = raw_dir / "rulesets"
@@ -415,6 +627,7 @@ def main() -> int:
         repo_name = repo_stub.get("name")
         if not repo_name:
             continue
+
         try:
             repo_res = collector.get_repo(repo_name)
             repo = repo_res.data if isinstance(repo_res.data, dict) else {}
@@ -423,10 +636,15 @@ def main() -> int:
             continue
 
         safe_json_dump(
-            {"status_code": repo_res.status_code, "url": repo_res.url, "data": repo, "note": repo_res.note},
-            raw_repos_dir / f"{repo_name}.json",
+            {
+                "status_code": repo_res.status_code,
+                "url": repo_res.url,
+                "data": repo,
+                "note": repo_res.note,
+            },
+            raw_repos_dir / f"{safe_slug(repo_name)}.json",
         )
-        collected_files.append(raw_repos_dir / f"{repo_name}.json")
+        collected_files.append(raw_repos_dir / f"{safe_slug(repo_name)}.json")
 
         repo_rows.append(
             {
@@ -460,35 +678,39 @@ def main() -> int:
         )
 
         if args.include_webhooks:
-            hooks = collector.list_repo_hooks(repo_name)
-            webhook_rows.extend(
-                [
+            try:
+                hooks = collector.list_repo_hooks(repo_name)
+                for h in hooks:
+                    webhook_rows.append(
+                        {
+                            "repo": repo.get("full_name"),
+                            "hook_id": h.get("id"),
+                            "name": h.get("name"),
+                            "active": h.get("active"),
+                            "events": ",".join(h.get("events", [])) if isinstance(h.get("events"), list) else h.get("events"),
+                            "config_url": (h.get("config") or {}).get("url"),
+                        }
+                    )
+                safe_json_dump(hooks, raw_hooks_dir / f"{safe_slug(repo_name)}.json")
+                collected_files.append(raw_hooks_dir / f"{safe_slug(repo_name)}.json")
+            except Exception as exc:
+                errors.append(f"Webhook collection failed for {repo_name}: {exc}")
+
+        try:
+            collaborators = collector.list_repo_collaborators(repo_name)
+            for c in collaborators:
+                access_rows.append(
                     {
                         "repo": repo.get("full_name"),
-                        "hook_id": h.get("id"),
-                        "name": h.get("name"),
-                        "active": h.get("active"),
-                        "events": ",".join(h.get("events", [])) if isinstance(h.get("events"), list) else h.get("events"),
-                        "config_url": (h.get("config") or {}).get("url"),
+                        "principal": c.get("login") or (c.get("user") or {}).get("login"),
+                        "type": c.get("type"),
+                        "permissions": json.dumps(c.get("permissions"), sort_keys=True),
+                        "role_name": c.get("role_name"),
+                        "site_admin": c.get("site_admin"),
                     }
-                    for h in hooks
-                ]
-            )
-            safe_json_dump(hooks, raw_hooks_dir / f"{repo_name}.json")
-            collected_files.append(raw_hooks_dir / f"{repo_name}.json")
-
-        collaborators = collector.list_repo_collaborators(repo_name)
-        for c in collaborators:
-            access_rows.append(
-                {
-                    "repo": repo.get("full_name"),
-                    "principal": c.get("login") or (c.get("user") or {}).get("login"),
-                    "type": c.get("type"),
-                    "permissions": json.dumps(c.get("permissions"), sort_keys=True),
-                    "role_name": c.get("role_name"),
-                    "site_admin": c.get("site_admin"),
-                }
-            )
+                )
+        except Exception as exc:
+            errors.append(f"Collaborator collection failed for {repo_name}: {exc}")
 
         default_branch = repo.get("default_branch")
         if default_branch:
@@ -501,18 +723,21 @@ def main() -> int:
                         "status_code": bp.status_code,
                         "required_status_checks": json.dumps((bp.data or {}).get("required_status_checks"), sort_keys=True),
                         "enforce_admins": json.dumps((bp.data or {}).get("enforce_admins"), sort_keys=True),
-                        "required_pull_request_reviews": json.dumps(
-                            (bp.data or {}).get("required_pull_request_reviews"), sort_keys=True
-                        ),
+                        "required_pull_request_reviews": json.dumps((bp.data or {}).get("required_pull_request_reviews"), sort_keys=True),
                         "restrictions": json.dumps((bp.data or {}).get("restrictions"), sort_keys=True),
                     }
                 )
                 safe_json_dump(
-                    {"status_code": bp.status_code, "url": bp.url, "data": bp.data, "note": bp.note},
-                    raw_branch_dir / f"{repo_name}_{default_branch}.json",
+                    {
+                        "status_code": bp.status_code,
+                        "url": bp.url,
+                        "data": bp.data,
+                        "note": bp.note,
+                    },
+                    raw_branch_dir / f"{safe_slug(repo_name)}_{safe_slug(default_branch)}.json",
                 )
-                collected_files.append(raw_branch_dir / f"{repo_name}_{default_branch}.json")
-            except requests.HTTPError as exc:
+                collected_files.append(raw_branch_dir / f"{safe_slug(repo_name)}_{safe_slug(default_branch)}.json")
+            except Exception as exc:
                 errors.append(f"Branch protection unavailable for {repo.get('full_name')}:{default_branch} ({exc})")
 
         try:
@@ -528,10 +753,10 @@ def main() -> int:
                         "conditions": json.dumps(rs.get("conditions"), sort_keys=True),
                     }
                 )
-            safe_json_dump(rulesets, raw_ruleset_dir / f"{repo_name}.json")
-            collected_files.append(raw_ruleset_dir / f"{repo_name}.json")
-        except requests.HTTPError:
-            pass
+            safe_json_dump(rulesets, raw_ruleset_dir / f"{safe_slug(repo_name)}.json")
+            collected_files.append(raw_ruleset_dir / f"{safe_slug(repo_name)}.json")
+        except Exception as exc:
+            errors.append(f"Ruleset collection unavailable for {repo_name}: {exc}")
 
         if args.include_dependabot:
             try:
@@ -547,10 +772,10 @@ def main() -> int:
                             "manifest_path": alert.get("manifest_path"),
                         }
                     )
-                safe_json_dump(alerts, raw_dep_dir / f"{repo_name}.json")
-                collected_files.append(raw_dep_dir / f"{repo_name}.json")
-            except requests.HTTPError:
-                pass
+                safe_json_dump(alerts, raw_dep_dir / f"{safe_slug(repo_name)}.json")
+                collected_files.append(raw_dep_dir / f"{safe_slug(repo_name)}.json")
+            except Exception as exc:
+                errors.append(f"Dependabot collection unavailable for {repo_name}: {exc}")
 
         if args.include_secret_scanning:
             try:
@@ -565,10 +790,10 @@ def main() -> int:
                             "resolution": alert.get("resolution"),
                         }
                     )
-                safe_json_dump(alerts, raw_secret_dir / f"{repo_name}.json")
-                collected_files.append(raw_secret_dir / f"{repo_name}.json")
-            except requests.HTTPError:
-                pass
+                safe_json_dump(alerts, raw_secret_dir / f"{safe_slug(repo_name)}.json")
+                collected_files.append(raw_secret_dir / f"{safe_slug(repo_name)}.json")
+            except Exception as exc:
+                errors.append(f"Secret scanning collection unavailable for {repo_name}: {exc}")
 
     audit_log_available = False
     if args.include_audit_log:
@@ -591,11 +816,10 @@ def main() -> int:
                         "transport_protocol": event.get("transport_protocol"),
                     }
                 )
-        except requests.HTTPError as exc:
-            errors.append(f"Audit log collection failed or unavailable: {exc}")
         except Exception as exc:
             errors.append(f"Audit log collection failed or unavailable: {exc}")
 
+    # CSV outputs
     write_csv(
         csv_dir / "inventory.csv",
         inventory_rows,
@@ -679,7 +903,8 @@ def main() -> int:
             ["action", "actor", "repo", "created_at", "user", "org", "ip", "operation_type", "transport_protocol"],
         )
 
-    report = make_report(
+    # Reports
+    report_md = make_report(
         org_payload=org_payload,
         repos=[r if isinstance(r, dict) else {} for r in repos],
         members=members,
@@ -689,8 +914,13 @@ def main() -> int:
         errors=errors,
         scope_repos=selected_repo_names,
     )
-    safe_text_write(report, report_dir / "CA03_GitHub_Evidence_Report.md")
+    safe_text_write(report_md, report_dir / "CA03_GitHub_Evidence_Report.md")
     collected_files.append(report_dir / "CA03_GitHub_Evidence_Report.md")
+
+    pdf_path = report_dir / "CA03_GitHub_Evidence_Report.pdf"
+    collect_and_write_pdf(report_md, pdf_path)
+    if pdf_path.exists():
+        collected_files.append(pdf_path)
 
     controls = {
         "CA-03": {
@@ -711,7 +941,7 @@ def main() -> int:
         "IA-2": {
             "status": "partial",
             "artifacts": ["raw/org.json"],
-            "note": "Organization MFA status may be visible in org metadata; retain manual screenshot evidence if the API does not expose the setting in your tenant.",
+            "note": "Retain manual screenshot evidence for org MFA enforcement and any IdP/SSO settings not exposed through API.",
         },
         "SC-7": {
             "status": "supported",
@@ -743,246 +973,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-import requests
-
-BASE_URL = "https://api.github.com"
-
-
-class GitHubCollector:
-    def __init__(self, token: str, org: str, timeout: int = 30):
-        if not token:
-            raise ValueError("GH_TOKEN is required")
-
-        self.org = org
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json"
-        })
-
-    def _request(self, url: str, params: Optional[dict] = None):
-        resp = self.session.get(url, params=params, timeout=self.timeout)
-
-        if resp.status_code in [403, 404, 400, 422]:
-            return {"error": resp.text, "status": resp.status_code}
-
-        resp.raise_for_status()
-        return resp.json()
-
-    def _paginate(self, url: str):
-        results = []
-        page = 1
-
-        while True:
-            resp = self.session.get(
-                url,
-                params={"per_page": 100, "page": page},
-                timeout=self.timeout
-            )
-
-            if resp.status_code in [403, 404, 400, 422]:
-                return []
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            if not data:
-                break
-
-            results.extend(data)
-
-            if "next" not in resp.links:
-                break
-
-            page += 1
-
-        return results
-
-    def get_org(self):
-        return self._request(f"{BASE_URL}/orgs/{self.org}")
-
-    def list_repos(self):
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/repos")
-
-    def list_members(self):
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/members")
-
-    def list_teams(self):
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/teams")
-
-    def get_team_repos(self, team_slug: str) -> List[Dict[str, Any]]:
-        return self._paginate(
-            f"{BASE_URL}/orgs/{self.org}/teams/{team_slug}/repos"
-        )
-
-    def list_collaborators(self, repo):
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/collaborators")
-
-    def get_branch_protection(self, repo, branch):
-        return self._request(
-            f"{BASE_URL}/repos/{self.org}/{repo}/branches/{branch}/protection"
-        )
-
-    def list_hooks(self, repo):
-        return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/hooks")
-
-    def list_dependabot(self, repo):
-        try:
-            return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/dependabot/alerts")
-        except requests.HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status in (400, 403, 404, 422):
-                return []
-            raise
-
-    def list_secret_scanning(self, repo):
-        try:
-            return self._paginate(f"{BASE_URL}/repos/{self.org}/{repo}/secret-scanning/alerts")
-        except requests.HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status in (400, 403, 404, 422):
-                return []
-            raise
-
-    def list_audit_log(self):
-        return self._paginate(f"{BASE_URL}/orgs/{self.org}/audit-log")
-
-
-def write_json(data, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def write_csv(rows, path):
-    if not rows:
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--org", required=True)
-    parser.add_argument("--outdir", default="evidence")
-    parser.add_argument("--include-audit-log", action="store_true")
-    parser.add_argument("--include-webhooks", action="store_true")
-    parser.add_argument("--include-secret-scanning", action="store_true")
-    parser.add_argument("--include-dependabot", action="store_true")
-
-    args = parser.parse_args()
-
-    token = os.getenv("GH_TOKEN")
-
-    if not token:
-        print("ERROR: GH_TOKEN not set")
-        sys.exit(1)
-
-    collector = GitHubCollector(token, args.org)
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    outdir = Path(f"{args.outdir}_{ts}")
-
-    raw_dir = outdir / "raw"
-    csv_dir = outdir / "csv"
-
-    print("[+] Collecting org data...")
-    org = collector.get_org()
-    write_json(org, raw_dir / "org.json")
-
-    print("[+] Collecting repos...")
-    repos = collector.list_repos()
-    write_json(repos, raw_dir / "repos.json")
-
-    print("[+] Collecting members...")
-    members = collector.list_members()
-    write_json(members, raw_dir / "members.json")
-
-    print("[+] Collecting teams...")
-    teams = collector.list_teams()
-    write_json(teams, raw_dir / "teams.json")
-
-    team_repo_map = defaultdict(list)
-
-    for team in teams:
-        slug = team.get("slug")
-        if not slug:
-            continue
-
-        repos_for_team = collector.get_team_repos(slug)
-        team_repo_map[slug] = repos_for_team
-
-        write_json(repos_for_team, raw_dir / f"team_{slug}_repos.json")
-
-    repo_rows = []
-    access_rows = []
-
-    for repo in repos:
-        name = repo["name"]
-
-        repo_rows.append({
-            "name": name,
-            "private": repo.get("private"),
-            "default_branch": repo.get("default_branch")
-        })
-
-        print(f"[+] Processing repo: {name}")
-
-        collaborators = collector.list_collaborators(name)
-        for c in collaborators:
-            access_rows.append({
-                "repo": name,
-                "user": c.get("login"),
-                "permissions": json.dumps(c.get("permissions"))
-            })
-
-        if args.include_webhooks:
-            hooks = collector.list_hooks(name)
-            write_json(hooks, raw_dir / f"{name}_hooks.json")
-
-        if args.include_dependabot:
-            dep = collector.list_dependabot(name)
-            write_json(dep, raw_dir / f"{name}_dependabot.json")
-
-        if args.include_secret_scanning:
-            sec = collector.list_secret_scanning(name)
-            write_json(sec, raw_dir / f"{name}_secret_scanning.json")
-
-        try:
-            bp = collector.get_branch_protection(name, repo.get("default_branch"))
-            write_json(bp, raw_dir / f"{name}_branch_protection.json")
-        except Exception:
-            pass
-
-    if args.include_audit_log:
-        print("[+] Collecting audit log...")
-        audit = collector.list_audit_log()
-        write_json(audit, raw_dir / "audit_log.json")
-
-    write_csv(repo_rows, csv_dir / "repos.csv")
-    write_csv(access_rows, csv_dir / "access.csv")
-
-    zip_path = outdir.with_suffix(".zip")
-
-    print("[+] Creating zip bundle...")
-
-    with zipfile.ZipFile(zip_path, "w") as z:
-        for file in outdir.rglob("*"):
-            z.write(file, file.relative_to(outdir))
-
-    print(f"[+] DONE: {zip_path}")
-
-
-if __name__ == "__main__":
-    main()
