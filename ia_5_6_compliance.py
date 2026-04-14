@@ -541,7 +541,7 @@ def main() -> int:
     parser.add_argument("--repo", default=os.getenv("REPO", ""))
     parser.add_argument("--branch", default=os.getenv("BRANCH", "main"))
     parser.add_argument("--output-dir", default="compliance-output")
-    parser.add_argument("--token", default=os.getenv("GITHUB_TOKEN", ""))
+    parser.add_argument("--token", default=os.getenv("GH_TOKEN", ""))
     args = parser.parse_args()
 
     token = args.token
