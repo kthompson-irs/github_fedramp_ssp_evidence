@@ -2,8 +2,16 @@
 """IA-5(6) GitHub compliance evidence collector.
 
 This script is designed to support FedRAMP IA-5(6) evidence collection for a
-GitHub.com-based workflow. It does not "certify" compliance; it gathers
-evidence, flags gaps, and produces artifacts for assessor review.
+GitHub.com-based workflow. It does not certify compliance; it gathers evidence,
+flags gaps, and produces artifacts for assessor review.
+
+Checks performed:
+- repository secret-scanning status
+- repository push-protection status
+- branch protection on the target branch
+- workflow OIDC usage
+- obvious plaintext secret patterns in tracked files
+- best-effort org-level 2FA requirement
 """
 
 from __future__ import annotations
@@ -25,7 +33,10 @@ API_BASE = "https://api.github.com"
 SUSPICIOUS_PATTERNS = [
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key ID pattern"),
     (re.compile(r"ASIA[0-9A-Z]{16}"), "AWS temporary access key ID pattern"),
-    (re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{20,}"), "AWS secret access key assignment"),
+    (
+        re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{20,}"),
+        "AWS secret access key assignment",
+    ),
     (re.compile(r"(?i)password\s*[:=]\s*['\"].+['\"]"), "Password assignment"),
     (re.compile(r"(?i)client_secret\s*[:=]\s*['\"].+['\"]"), "Client secret assignment"),
     (re.compile(r"(?i)private_key\s*[:=]\s*['\"].+['\"]"), "Private key assignment"),
@@ -69,7 +80,17 @@ def api_get(path: str, token: str, params: Optional[Dict[str, Any]] = None) -> T
 
 def scan_repository_files(root: Path, limit: int = 50) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
-    patterns = ["**/*.yml", "**/*.yaml", "**/*.py", "**/*.sh", "**/*.json", "**/*.toml", "**/*.ini", "**/*.env", "**/*.txt"]
+    patterns = [
+        "**/*.yml",
+        "**/*.yaml",
+        "**/*.py",
+        "**/*.sh",
+        "**/*.json",
+        "**/*.toml",
+        "**/*.ini",
+        "**/*.env",
+        "**/*.txt",
+    ]
     seen = set()
 
     for glob_pattern in patterns:
@@ -105,8 +126,7 @@ def scan_repository_files(root: Path, limit: int = 50) -> List[Dict[str, Any]]:
 
 def scan_oidc_usage(root: Path) -> List[Dict[str, Any]]:
     hits: List[Dict[str, Any]] = []
-    workflows = root.glob(".github/workflows/**/*.yml")
-    workflows = list(workflows) + list(root.glob(".github/workflows/**/*.yaml"))
+    workflows = list(root.glob(".github/workflows/**/*.yml")) + list(root.glob(".github/workflows/**/*.yaml"))
 
     for path in workflows:
         if not path.is_file():
@@ -116,14 +136,18 @@ def scan_oidc_usage(root: Path) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-        if "token.actions.githubusercontent.com" in text or ("id-token: write" in text):
+        if "token.actions.githubusercontent.com" in text or "id-token: write" in text:
             hits.append({"file": str(path), "oidc": "present"})
     return hits
 
 
 def write_outputs(output_dir: Path, evidence: Dict[str, Any], results: List[CheckResult]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "ia_5_6_evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+    (output_dir / "ia_5_6_evidence.json").write_text(
+        json.dumps(evidence, indent=2),
+        encoding="utf-8",
+    )
 
     md_lines = [
         "# IA-5(6) GitHub Compliance Evidence Report",
@@ -135,6 +159,7 @@ def write_outputs(output_dir: Path, evidence: Dict[str, Any], results: List[Chec
         "| Control | Item | Status | Evidence |",
         "|---|---|---:|---|",
     ]
+
     for r in results:
         md_lines.append(f"| {r.control} | {r.item} | {r.status} | {r.evidence} |")
 
@@ -147,6 +172,7 @@ def write_outputs(output_dir: Path, evidence: Dict[str, Any], results: List[Chec
             "- For FedRAMP evidence, attach screenshots or exports that corroborate the API outputs captured here.",
         ]
     )
+
     (output_dir / "ia_5_6_evidence_report.md").write_text("\n".join(md_lines), encoding="utf-8")
 
 
@@ -155,13 +181,27 @@ def main() -> int:
     parser.add_argument("--owner", required=True, help="GitHub organization or owner")
     parser.add_argument("--repo", required=True, help="Repository name")
     parser.add_argument("--branch", default="main", help="Branch to evaluate")
-    parser.add_argument("--output-dir", default="compliance-output", help="Output directory for evidence artifacts")
-    parser.add_argument("--token", default=os.getenv("GH_TOKEN", ""), help="GitHub token")
+    parser.add_argument(
+        "--output-dir",
+        default="compliance-output",
+        help="Output directory for evidence artifacts",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.getenv("GITHUB_TOKEN", ""),
+        help="GitHub token (or GITHUB_TOKEN env var)",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
 
+    # Repository metadata is required for the rest of the evidence collection.
     status, repo = api_get(f"/repos/{args.owner}/{args.repo}", args.token)
+    if status == 404:
+        raise SystemExit(
+            f"Repository not found or inaccessible: {args.owner}/{args.repo}. "
+            "Check the owner/repo name and token permissions."
+        )
     if status != 200:
         raise SystemExit(f"Failed to load repository metadata: HTTP {status} {repo}")
 
@@ -171,6 +211,7 @@ def main() -> int:
     push_protection = security.get("secret_scanning_push_protection") or {}
 
     results: List[CheckResult] = []
+
     results.append(
         CheckResult(
             control="IA-5(6)",
@@ -180,6 +221,7 @@ def main() -> int:
             details={"status": secret_scanning.get("status"), "raw": secret_scanning},
         )
     )
+
     results.append(
         CheckResult(
             control="IA-5(6)",
@@ -190,12 +232,23 @@ def main() -> int:
         )
     )
 
-    bp_status, bp = api_get(f"/repos/{args.owner}/{args.repo}/branches/{default_branch}/protection", args.token)
+    bp_status, bp = api_get(
+        f"/repos/{args.owner}/{args.repo}/branches/{default_branch}/protection",
+        args.token,
+    )
+
+    if bp_status == 200:
+        bp_status_text = "PASS"
+    elif bp_status == 404:
+        bp_status_text = "WARN"
+    else:
+        bp_status_text = "WARN"
+
     results.append(
         CheckResult(
             control="AC/CM",
             item=f"Branch protection on {default_branch}",
-            status="PASS" if bp_status == 200 else "WARN",
+            status=bp_status_text,
             evidence=f"/repos/{args.owner}/{args.repo}/branches/{default_branch}/protection",
             details={"http_status": bp_status, "raw": bp if bp_status == 200 else None},
         )
@@ -235,6 +288,16 @@ def main() -> int:
                 status=status_text,
                 evidence=f"/orgs/{args.owner}",
                 details={"two_factor_requirement_enabled": two_factor},
+            )
+        )
+    elif org_status == 404:
+        results.append(
+            CheckResult(
+                control="IA-2",
+                item="Org two-factor requirement (best-effort)",
+                status="NA",
+                evidence=f"/orgs/{args.owner}",
+                details={"note": "Organization metadata not accessible or not found.", "http_status": org_status},
             )
         )
     else:
