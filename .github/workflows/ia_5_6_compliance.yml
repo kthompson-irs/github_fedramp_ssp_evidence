@@ -1,18 +1,31 @@
-name: IA-5(6) GitHub Compliance Check
+name: IA-5(6) Enterprise Compliance Check
 
 on:
   workflow_dispatch:
     inputs:
-      owner:
-        description: "GitHub organization/owner"
+      scope:
+        description: "Scan scope"
+        required: true
+        default: "enterprise"
+        type: choice
+        options:
+          - repo
+          - org
+          - enterprise
+      enterprise_slug:
+        description: "Enterprise slug (required for enterprise scope)"
+        required: false
+        type: string
+      orgs:
+        description: "Comma-separated org list (optional for org scope)"
         required: false
         type: string
       repo:
-        description: "Repository name"
+        description: "Single repo name (optional for repo scope)"
         required: false
         type: string
       branch:
-        description: "Branch to evaluate"
+        description: "Branch to evaluate for repo scope"
         required: false
         default: "main"
         type: string
@@ -31,12 +44,14 @@ jobs:
       security-events: read
       pull-requests: read
       id-token: write
+      organization-administration: read
 
     env:
-      # Prefer a dedicated read token for cross-repository or org-level inspection.
-      # If GH_READ_TOKEN is not configured, github.token is used as a fallback.
-      GITHUB_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
-      OWNER: ${{ inputs.owner || github.repository_owner }}
+      # Use a dedicated read token for enterprise/org API visibility.
+      GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
+      SCOPE: ${{ inputs.scope || 'enterprise' }}
+      ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
+      ORGS: ${{ inputs.orgs || '' }}
       REPO: ${{ inputs.repo || github.event.repository.name }}
       BRANCH: ${{ inputs.branch || github.event.repository.default_branch || 'main' }}
 
@@ -52,19 +67,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip requests
+        run: python -m pip install --upgrade pip requests reportlab
 
-      - name: Run IA-5(6) compliance check
+      - name: Run IA-5(6) enterprise compliance check
         run: |
-          python ia_5_6_compliance.py \
-            --owner "$OWNER" \
-            --repo "$REPO" \
-            --branch "$BRANCH" \
-            --output-dir compliance-output
+          python ia_5_6_compliance.py             --scope "$SCOPE"             --enterprise-slug "$ENTERPRISE_SLUG"             --orgs "$ORGS"             --repo "$REPO"             --branch "$BRANCH"             --output-dir compliance-output
 
       - name: Upload compliance artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ia-5-6-compliance-artifacts
+          name: ia-5-6-enterprise-compliance-artifacts
           path: compliance-output/
           if-no-files-found: error
