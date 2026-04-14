@@ -323,7 +323,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    token = os.environ.get("GH_TOKEN")
+    token = os.getenv("GH_TOKEN")
     if not token:
         print(
             "Missing token. Set GH_TOKEN.",
