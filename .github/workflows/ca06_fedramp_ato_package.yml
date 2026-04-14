@@ -1,0 +1,66 @@
+name: CA06 Build FedRAMP ATO Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      org:
+        description: GitHub organization login
+        required: true
+        type: string
+  schedule:
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
+      GH_ORG: ${{ github.event.inputs.org || vars.GH_ORG }}
+      EVIDENCE_DIR: ca06_evidence
+      PACKAGE_DIR: ca06_package
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Collect GitHub evidence
+        run: |
+          python ca06_collect_fedramp_github_evidence.py \
+            --org "${GH_ORG}" \
+            --out "${EVIDENCE_DIR}"
+
+      - name: Build FedRAMP ATO package
+        run: |
+          python ca06_build_fedramp_ato_package.py \
+            --evidence_dir "${EVIDENCE_DIR}" \
+            --out_dir "${PACKAGE_DIR}"
+
+      - name: Upload evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ca06-evidence
+          path: ca06_evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ca06-package
+          path: ca06_package
+          if-no-files-found: error
+          retention-days: 90
