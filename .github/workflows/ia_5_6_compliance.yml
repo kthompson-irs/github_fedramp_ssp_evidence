@@ -48,7 +48,7 @@ jobs:
     env:
       # Use a dedicated read token for enterprise/org API visibility.
       # Fall back to the built-in token when the repo/org scope is sufficient.
-      GITHUB_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
+      GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
