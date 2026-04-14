@@ -2,12 +2,17 @@
 """
 Collect GitHub evidence for FedRAMP CA-6 / SA-9 support.
 
-Requirements:
-  pip install requests
+Expected location:
+  Repository root:
+    ca06_collect_fedramp_github_evidence.py
 
-Required environment or argument:
-  GH_TOKEN / --token   PAT, GitHub App token, or equivalent
-  GH_ORG / --org       Organization name
+Usage:
+  python ca06_collect_fedramp_github_evidence.py --org <ORG> --out <OUT_DIR>
+
+Environment:
+  GH_TOKEN   GitHub token with permission to read org/repo/audit data
+  GH_ORG     Optional default org name
+  OUT_DIR    Optional default output dir
 
 Outputs:
   <out>/
@@ -18,7 +23,9 @@ Outputs:
     audit_log.json
     members.json
     outside_collaborators.json
+    security_managers.json
     rulesets/
+      org_rulesets.json
     repos/<repo>/
       repo.json
       rulesets.json
@@ -26,6 +33,7 @@ Outputs:
       code_scanning_alerts.json
       dependabot_alerts.json
       branch_protection.json
+      error.txt   (only if a repo endpoint fails)
 """
 
 from __future__ import annotations
@@ -35,9 +43,8 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -46,23 +53,14 @@ API_BASE = "https://api.github.com/"
 API_VERSION = "2022-11-28"
 
 
-@dataclass
-class Artifact:
-    file: str
-    source: str
-    endpoint: str
-    note: str = ""
-    poam_id: str = ""
-
-
 class GitHubAPIError(RuntimeError):
     pass
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CA06 Collect GitHub FedRAMP evidence.")
-    parser.add_argument("--org", default=os.getenv("GH_ORG"), help="GitHub organization")
-    parser.add_argument("--token", default=os.getenv("GH_TOKEN"), help="GitHub token")
+    parser = argparse.ArgumentParser(description="Collect GitHub FedRAMP evidence.")
+    parser.add_argument("--org", default=os.getenv("GH_ORG"), help="GitHub organization name")
+    parser.add_argument("--token", default=os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN"), help="GitHub token")
     parser.add_argument("--out", default=os.getenv("OUT_DIR", "ca06_evidence"), help="Output directory")
     parser.add_argument(
         "--include-code-scanning",
@@ -149,6 +147,7 @@ def write_text(path: Path, data: str) -> None:
 
 def collect_org(session: requests.Session, org: str, out: Path) -> List[str]:
     manifest: List[str] = []
+
     org_obj = api_get(session, f"/orgs/{org}").json()
     write_json(out / "org.json", org_obj)
     manifest.append("org.json")
@@ -162,7 +161,10 @@ def collect_org(session: requests.Session, org: str, out: Path) -> List[str]:
     manifest.append("members.json")
 
     outside = paginate_json(
-        session, f"/orgs/{org}/outside_collaborators", params={"per_page": 100}, optional=True
+        session,
+        f"/orgs/{org}/outside_collaborators",
+        params={"per_page": 100},
+        optional=True,
     )
     write_json(out / "outside_collaborators.json", outside)
     manifest.append("outside_collaborators.json")
@@ -175,7 +177,6 @@ def collect_org(session: requests.Session, org: str, out: Path) -> List[str]:
     write_json(out / "rulesets" / "org_rulesets.json", rulesets)
     manifest.append("rulesets/org_rulesets.json")
 
-    # Security managers may not be available for all orgs/tokens.
     sec_managers = api_get(session, f"/orgs/{org}/security-managers", optional=True)
     if sec_managers is not None:
         write_json(out / "security_managers.json", sec_managers.json())
@@ -184,7 +185,14 @@ def collect_org(session: requests.Session, org: str, out: Path) -> List[str]:
     return manifest
 
 
-def collect_repo(session: requests.Session, org: str, repo_name: str, out: Path, include_code: bool, include_dep: bool) -> List[str]:
+def collect_repo(
+    session: requests.Session,
+    org: str,
+    repo_name: str,
+    out: Path,
+    include_code: bool,
+    include_dep: bool,
+) -> List[str]:
     repo_dir = out / "repos" / repo_name
     manifest: List[str] = []
 
@@ -197,21 +205,30 @@ def collect_repo(session: requests.Session, org: str, repo_name: str, out: Path,
     manifest.append(f"repos/{repo_name}/rulesets.json")
 
     secret_alerts = paginate_json(
-        session, f"/repos/{org}/{repo_name}/secret-scanning/alerts", params={"per_page": 100}, optional=True
+        session,
+        f"/repos/{org}/{repo_name}/secret-scanning/alerts",
+        params={"per_page": 100},
+        optional=True,
     )
     write_json(repo_dir / "secret_scanning_alerts.json", secret_alerts)
     manifest.append(f"repos/{repo_name}/secret_scanning_alerts.json")
 
     if include_code:
         code_alerts = paginate_json(
-            session, f"/repos/{org}/{repo_name}/code-scanning/alerts", params={"per_page": 100}, optional=True
+            session,
+            f"/repos/{org}/{repo_name}/code-scanning/alerts",
+            params={"per_page": 100},
+            optional=True,
         )
         write_json(repo_dir / "code_scanning_alerts.json", code_alerts)
         manifest.append(f"repos/{repo_name}/code_scanning_alerts.json")
 
     if include_dep:
         dep_alerts = paginate_json(
-            session, f"/repos/{org}/{repo_name}/dependabot/alerts", params={"per_page": 100}, optional=True
+            session,
+            f"/repos/{org}/{repo_name}/dependabot/alerts",
+            params={"per_page": 100},
+            optional=True,
         )
         write_json(repo_dir / "dependabot_alerts.json", dep_alerts)
         manifest.append(f"repos/{repo_name}/dependabot_alerts.json")
@@ -243,6 +260,7 @@ Contents:
 - audit_log.json
 - members.json
 - outside_collaborators.json
+- security_managers.json
 - rulesets/org_rulesets.json
 - repos/<repo>/repo.json
 - repos/<repo>/rulesets.json
@@ -274,7 +292,7 @@ def main() -> int:
         print("ERROR: --org or GH_ORG is required", file=sys.stderr)
         return 2
     if not args.token:
-        print("ERROR: --token or GH_TOKEN is required", file=sys.stderr)
+        print("ERROR: --token or GH_TOKEN/GITHUB_TOKEN is required", file=sys.stderr)
         return 2
 
     out = Path(args.out).resolve()
@@ -286,6 +304,7 @@ def main() -> int:
 
     repos = json.loads((out / "repos.json").read_text(encoding="utf-8"))
     repo_artifacts: List[str] = []
+
     for repo in repos:
         name = repo["name"]
         try:
@@ -300,8 +319,9 @@ def main() -> int:
                 )
             )
         except GitHubAPIError as exc:
-            # Do not stop the entire evidence package if a repo endpoint is unavailable.
-            write_text(out / "repos" / name / "error.txt", str(exc) + "\n")
+            err_dir = out / "repos" / name
+            err_dir.mkdir(parents=True, exist_ok=True)
+            write_text(err_dir / "error.txt", str(exc) + "\n")
             repo_artifacts.append(f"repos/{name}/error.txt")
 
     build_readme(args.org, out, len(repos))
