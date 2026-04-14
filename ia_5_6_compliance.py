@@ -156,7 +156,7 @@ def main() -> int:
     parser.add_argument("--repo", required=True, help="Repository name")
     parser.add_argument("--branch", default="main", help="Branch to evaluate")
     parser.add_argument("--output-dir", default="compliance-output", help="Output directory for evidence artifacts")
-    parser.add_argument("--token", default=os.getenv("GITHUB_TOKEN", ""), help="GitHub token (or GITHUB_TOKEN env var)")
+    parser.add_argument("--token", default=os.getenv("GH_TOKEN", ""), help="GitHub token")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
