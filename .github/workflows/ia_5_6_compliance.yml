@@ -20,6 +20,11 @@ on:
         description: "Comma-separated org list (used only for org or repo scope)"
         required: false
         type: string
+      org_inventory:
+        description: "CSV file path for org inventory fallback"
+        required: false
+        default: "org_inventory.csv"
+        type: string
       repo:
         description: "Single repo name (used only for repo scope)"
         required: false
@@ -54,7 +59,7 @@ jobs:
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
-      ORG_INVENTORY: ${{ inputs.org_inventory || '' }}
+      ORG_INVENTORY: ${{ inputs.org_inventory || 'org_inventory.csv' }}
       REPO: ${{ inputs.repo || github.event.repository.name }}
       BRANCH: ${{ inputs.branch || github.event.repository.default_branch || 'main' }}
 
