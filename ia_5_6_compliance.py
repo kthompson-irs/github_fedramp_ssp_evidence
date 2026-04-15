@@ -815,9 +815,10 @@ def main() -> int:
     if args.repo:
         print(f"Repo filter: {args.repo}")
     print()
+    summary = evidence["summary"]
     for status in ["PASS", "WARN", "FAIL", "NA", "ERROR"]:
-        if evidence["summary"].get(status):
-            print(f"{status}: {evidence["summary"][status]}")
+        if summary.get(status):
+            print(f"{status}: {summary[status]}")
     print()
     print(f"Wrote: {json_path}")
     print(f"Wrote: {csv_path}")
