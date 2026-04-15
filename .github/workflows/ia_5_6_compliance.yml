@@ -47,10 +47,14 @@ jobs:
       id-token: write
 
     env:
-      GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+      GH_APP_INSTALLATION_ID: ${{ secrets.GH_APP_INSTALLATION_ID }}
+
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
+      ORG_INVENTORY: ${{ inputs.org_inventory || '' }}
       REPO: ${{ inputs.repo || github.event.repository.name }}
       BRANCH: ${{ inputs.branch || github.event.repository.default_branch || 'main' }}
 
@@ -66,7 +70,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip requests reportlab
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests reportlab cryptography pyjwt
 
       - name: Run IA-5(6) enterprise compliance check
         run: |
@@ -74,6 +80,7 @@ jobs:
             --scope "$SCOPE" \
             --enterprise-slug "$ENTERPRISE_SLUG" \
             --orgs "$ORGS" \
+            --org-inventory "$ORG_INVENTORY" \
             --repo "$REPO" \
             --branch "$BRANCH" \
             --output-dir compliance-output
