@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""
-Helper script to retrieve the GitHub App installation ID.
+"""Helper script to print the GitHub App installation ID for a target account.
 
 Usage:
-  python get_installation_id.py --target internal-revenue-service
+  python helpers/get_installation_id.py --target internal-revenue-service
 
-Requires:
+Required environment variables:
   GH_APP_ID
-  GH_APP_PRIVATE_KEY (or GH_APP_PRIVATE_KEY_FILE)
+  GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE
+
+Optional:
+  GH_APP_INSTALLATION_ID   # if already known, verifies it
 """
 
 from __future__ import annotations
@@ -17,47 +19,60 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import requests
-
-try:
-    import jwt
-except Exception:
-    jwt = None
-
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+try:
+    import jwt  # PyJWT
+except Exception:
+    jwt = None
 
 
 API_BASE = "https://api.github.com"
 
 
-def read_private_key() -> bytes:
+def read_private_key_pem() -> bytes:
+    key_file = os.getenv("GH_APP_PRIVATE_KEY_FILE", "").strip()
+    if key_file:
+        path = Path(key_file)
+        if not path.exists():
+            raise SystemExit(f"GitHub App private key file not found: {path}")
+        return path.read_text(encoding="utf-8").strip().encode("utf-8")
+
     raw = os.getenv("GH_APP_PRIVATE_KEY", "").strip()
     if not raw:
-        raise SystemExit("❌ GH_APP_PRIVATE_KEY not set")
+        raise SystemExit("GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE is required.")
     return raw.replace("\r", "").encode("utf-8")
 
 
 def get_app_id() -> int:
     raw = os.getenv("GH_APP_ID", "").strip()
     if not raw:
-        raise SystemExit("❌ GH_APP_ID not set")
-    return int(raw)
+        raise SystemExit("GH_APP_ID is required.")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid GH_APP_ID: {raw}") from exc
 
 
 def github_headers(token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token.strip()}",
+    clean = (token or "").strip().replace("\r", "").replace("\n", "")
+    headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "github-app-installation-id-helper/1.0",
     }
+    if clean:
+        headers["Authorization"] = f"Bearer {clean}"
+    return headers
 
 
 def api_get(path: str, token: str) -> Tuple[int, Any]:
-    url = f"{API_BASE}{path}"
-    resp = requests.get(url, headers=github_headers(token), timeout=30)
+    resp = requests.get(f"{API_BASE}{path}", headers=github_headers(token), timeout=30)
     try:
         return resp.status_code, resp.json()
     except Exception:
@@ -66,77 +81,86 @@ def api_get(path: str, token: str) -> Tuple[int, Any]:
 
 def build_jwt(app_id: int, private_key: bytes) -> str:
     now = datetime.now(timezone.utc)
-
     payload = {
         "iat": int((now - timedelta(seconds=60)).timestamp()),
         "exp": int((now + timedelta(minutes=9)).timestamp()),
         "iss": str(app_id),
     }
 
-    if jwt:
+    if jwt is not None:
         return jwt.encode(payload, private_key, algorithm="RS256")
 
     key = serialization.load_pem_private_key(private_key, password=None)
-
     header = {"alg": "RS256", "typ": "JWT"}
 
-    def b64(data: bytes):
+    def b64(data: bytes) -> bytes:
         return base64.urlsafe_b64encode(data).rstrip(b"=")
 
-    header_b64 = b64(json.dumps(header).encode())
-    payload_b64 = b64(json.dumps(payload).encode())
-    message = header_b64 + b"." + payload_b64
-
-    signature = key.sign(message, padding.PKCS1v15(), hashes.SHA256())
-
-    return (message + b"." + b64(signature)).decode()
+    header_b64 = b64(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = b64(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = header_b64 + b"." + payload_b64
+    signature = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    return (signing_input + b"." + b64(signature)).decode("utf-8")
 
 
-def main():
+def list_installations(app_jwt: str) -> list[dict[str, Any]]:
+    status, payload = api_get("/app/installations", app_jwt)
+    if status != 200 or not isinstance(payload, list):
+        raise SystemExit(f"Failed to list app installations: HTTP {status} {payload}")
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def verify_installation_id(app_jwt: str, installation_id: int) -> bool:
+    status, _ = api_get(f"/app/installations/{installation_id}", app_jwt)
+    return status == 200
+
+
+def find_installation_id(app_jwt: str, target: str) -> Optional[int]:
+    for inst in list_installations(app_jwt):
+        inst_id = inst.get("id")
+        account = inst.get("account") or {}
+        login = account.get("login") if isinstance(account, dict) else None
+
+        if isinstance(inst_id, int) and (
+            login == target or str(login or "").lower() == target.lower()
+        ):
+            return inst_id
+
+    return None
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, help="Enterprise or org name")
+    parser.add_argument("--target", required=True, help="Enterprise or org login to match")
     args = parser.parse_args()
 
     app_id = get_app_id()
-    private_key = read_private_key()
+    private_key = read_private_key_pem()
+    app_jwt = build_jwt(app_id, private_key)
 
-    print("🔐 Generating GitHub App JWT...")
-    jwt_token = build_jwt(app_id, private_key)
+    env_installation = os.getenv("GH_APP_INSTALLATION_ID", "").strip()
+    if env_installation:
+        try:
+            installation_id = int(env_installation)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid GH_APP_INSTALLATION_ID: {env_installation}") from exc
 
-    print("📡 Fetching installations...")
-    status, data = api_get("/app/installations", jwt_token)
+        if verify_installation_id(app_jwt, installation_id):
+            print(installation_id)
+            return 0
 
-    if status != 200:
-        raise SystemExit(f"❌ Failed to list installations: {status} {data}")
+        print(
+            f"Installation ID {installation_id} is not valid for this GitHub App. "
+            "Searching for the correct installation..."
+        )
 
-    print("\n🔍 Searching for installation:\n")
+    installation_id = find_installation_id(app_jwt, args.target)
+    if installation_id is None:
+        raise SystemExit(f"No installation found for target '{args.target}'.")
 
-    found = False
-
-    for inst in data:
-        inst_id = inst.get("id")
-        account = inst.get("account", {})
-        login = account.get("login")
-        account_type = account.get("type")
-
-        print(f"➡️  Found installation:")
-        print(f"   ID: {inst_id}")
-        print(f"   Account: {login}")
-        print(f"   Type: {account_type}")
-        print()
-
-        if login == args.target:
-            found = True
-            print("✅ MATCH FOUND")
-            print(f"👉 Installation ID for '{args.target}': {inst_id}\n")
-
-    if not found:
-        print("❌ No matching installation found.")
-        print("👉 This means one of the following:")
-        print("   - App is NOT installed on the enterprise")
-        print("   - App is installed only on orgs/repos")
-        print("   - Wrong enterprise slug")
+    print(installation_id)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
