@@ -7,9 +7,9 @@ Scopes supported:
 - enterprise: survey ALL orgs in the enterprise by default
 
 Enterprise behavior:
-- The script always attempts to enumerate all orgs from the enterprise slug.
-- ORGS is ignored in enterprise mode unless you later choose to extend this.
-- If the enterprise endpoint is inaccessible, the script exits with a clear error.
+- The script first attempts to enumerate all orgs from the enterprise slug.
+- If the enterprise endpoint is inaccessible, it can fall back to an org inventory CSV.
+- If neither is available, it exits with a clear error.
 
 Outputs:
 - JSON evidence
@@ -131,6 +131,27 @@ def parse_csv_list(value: str) -> List[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def load_org_inventory(path_value: str) -> List[str]:
+    if not path_value:
+        return []
+    inventory_path = Path(path_value)
+    if not inventory_path.exists():
+        raise SystemExit(f"Org inventory file not found: {inventory_path}")
+
+    orgs: List[str] = []
+    with inventory_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if "org" not in reader.fieldnames and "login" not in reader.fieldnames:
+            raise SystemExit(
+                "Org inventory CSV must contain an 'org' or 'login' column."
+            )
+        for row in reader:
+            org_name = (row.get("org") or row.get("login") or "").strip()
+            if org_name:
+                orgs.append(org_name)
+    return orgs
 
 
 def repo_default_branch(repo: Dict[str, Any], fallback: str) -> str:
@@ -317,7 +338,7 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
     return results
 
 
-def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, branch: str, token: str) -> List[CheckResult]:
+def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], org_inventory: List[str], repo: str, branch: str, token: str) -> List[CheckResult]:
     results: List[CheckResult] = []
 
     if scope == "repo":
@@ -373,10 +394,31 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, 
 
         enterprise_orgs = fetch_enterprise_orgs(enterprise_slug, token)
         if not enterprise_orgs:
-            raise SystemExit(
-                f"Enterprise org listing unavailable for '{enterprise_slug}'. "
-                "The token must be able to read the enterprise org listing endpoint."
-            )
+            if not org_inventory:
+                raise SystemExit(
+                    f"Enterprise org listing unavailable for '{enterprise_slug}'. "
+                    "Provide --org-inventory CSV or fix the enterprise token permissions."
+                )
+            # Fallback to explicitly supplied org inventory.
+            for org_name in org_inventory:
+                results.append(
+                    CheckResult(
+                        scope="enterprise",
+                        owner=org_name,
+                        repo="*",
+                        control="IA-2",
+                        item="Org discovered via org inventory fallback",
+                        status="WARN",
+                        evidence="org inventory CSV",
+                        details={"note": "Enterprise org listing was unavailable; using supplied org inventory."},
+                    )
+                )
+                repos = fetch_org_repos(org_name, token)
+                for r in repos:
+                    if not isinstance(r, dict) or not r.get("name"):
+                        continue
+                    results.extend(collect_repo_evidence(org_name, r["name"], token, scope_label="enterprise", branch_override=branch))
+            return results
 
         for org in enterprise_orgs:
             org_login = org.get("login") if isinstance(org, dict) else None
@@ -477,6 +519,8 @@ def make_pdf_report(output_dir: Path, meta: Dict[str, Any], results: List[CheckR
     story.append(Paragraph(f"Scope: {meta['scope']}", normal))
     if meta.get("enterprise_slug"):
         story.append(Paragraph(f"Enterprise: {meta['enterprise_slug']}", normal))
+    if meta.get("org_inventory"):
+        story.append(Paragraph(f"Org inventory fallback: {meta['org_inventory']}", normal))
     if meta.get("orgs"):
         story.append(Paragraph(f"Target orgs: {', '.join(meta['orgs'])}", normal))
     story.append(Paragraph(f"Repository filter: {meta.get('repo') or 'N/A'}", normal))
@@ -558,6 +602,7 @@ def main() -> int:
     parser.add_argument("--scope", choices=["repo", "org", "enterprise"], required=True)
     parser.add_argument("--enterprise-slug", default=os.getenv("ENTERPRISE_SLUG", ""))
     parser.add_argument("--orgs", default=os.getenv("ORGS", ""))
+    parser.add_argument("--org-inventory", default=os.getenv("ORG_INVENTORY", ""))
     parser.add_argument("--repo", default=os.getenv("REPO", ""))
     parser.add_argument("--branch", default=os.getenv("BRANCH", "main"))
     parser.add_argument("--output-dir", default="compliance-output")
@@ -569,13 +614,16 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     orgs = parse_csv_list(args.orgs)
-    results = collect_scope(args.scope, args.enterprise_slug, orgs, args.repo, args.branch, token)
+    org_inventory = load_org_inventory(args.org_inventory) if args.org_inventory else []
+
+    results = collect_scope(args.scope, args.enterprise_slug, orgs, org_inventory, args.repo, args.branch, token)
 
     meta = {
         "generated_at": utc_now(),
         "scope": args.scope,
         "enterprise_slug": args.enterprise_slug,
         "orgs": orgs,
+        "org_inventory": args.org_inventory,
         "repo": args.repo,
         "branch": args.branch,
     }
@@ -595,6 +643,8 @@ def main() -> int:
     print(f"Scope: {args.scope}")
     if args.enterprise_slug:
         print(f"Enterprise: {args.enterprise_slug}")
+    if args.org_inventory:
+        print(f"Org inventory: {args.org_inventory}")
     if orgs:
         print(f"Orgs: {', '.join(orgs)}")
     if args.repo:
