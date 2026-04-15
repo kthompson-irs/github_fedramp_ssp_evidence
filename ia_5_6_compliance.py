@@ -9,7 +9,7 @@ Auth flow:
    - GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE
    - GH_APP_INSTALLATION_ID (optional)
 2. Generate a short-lived JWT for the GitHub App.
-3. Resolve the app installation ID (verify hint, then discover if needed).
+3. Resolve and validate the app installation ID.
 4. Exchange the JWT for an installation access token.
 5. Use the installation token for all API calls.
 
@@ -50,14 +50,7 @@ import requests
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.platypus import (
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 try:
     import jwt  # PyJWT
@@ -240,14 +233,18 @@ def build_app_jwt(app_id: int, private_key_pem: bytes) -> str:
     return (signing_input + b"." + b64url(signature)).decode("utf-8")
 
 
+def verify_installation_id(app_jwt: str, installation_id: int) -> bool:
+    status, _ = api_get(f"/app/installations/{installation_id}", app_jwt)
+    return status == 200
+
+
 def discover_installation_id(app_jwt: str, args: argparse.Namespace, target_account: Optional[str] = None) -> int:
     hint = get_installation_id_hint(args)
     if hint is not None:
-        status, payload = api_get(f"/app/installations/{hint}", app_jwt)
-        if status == 200 and isinstance(payload, dict):
+        if verify_installation_id(app_jwt, hint):
             return hint
         raise SystemExit(
-            f"Installation ID {hint} could not be verified for this GitHub App (HTTP {status}). "
+            f"Installation ID {hint} could not be verified for this GitHub App. "
             "The app may not be installed at that location, or the ID may be wrong."
         )
 
