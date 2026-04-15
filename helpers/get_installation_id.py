@@ -2,14 +2,11 @@
 """Helper script to print the GitHub App installation ID for a target account.
 
 Usage:
-  python helpers/get_installation_id.py --target internal-revenue-service
+  python helpers/get_installation_id.py --target sds-sbx
 
 Required environment variables:
   GH_APP_ID
   GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE
-
-Optional:
-  GH_APP_INSTALLATION_ID   # if already known, verifies it first
 """
 
 from __future__ import annotations
@@ -117,11 +114,6 @@ def list_installations(app_jwt: str) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
-def verify_installation_id(app_jwt: str, installation_id: int) -> bool:
-    status, _ = api_get(f"/app/installations/{installation_id}", app_jwt)
-    return status == 200
-
-
 def find_installation_id(app_jwt: str, target: str) -> Optional[int]:
     target_norm = target.strip().lower()
 
@@ -147,22 +139,6 @@ def main() -> int:
     app_id = get_app_id()
     private_key = read_private_key_pem()
     app_jwt = build_jwt(app_id, private_key)
-
-    env_installation = os.getenv("GH_APP_INSTALLATION_ID", "").strip()
-    if env_installation:
-        try:
-            installation_id = int(env_installation)
-        except ValueError as exc:
-            raise SystemExit(f"Invalid GH_APP_INSTALLATION_ID: {env_installation}") from exc
-
-        if verify_installation_id(app_jwt, installation_id):
-            print(installation_id)
-            return 0
-
-        print(
-            f"Installation ID {installation_id} is not valid for this GitHub App. "
-            "Searching for the correct installation..."
-        )
 
     installation_id = find_installation_id(app_jwt, args.target)
     if installation_id is None:
