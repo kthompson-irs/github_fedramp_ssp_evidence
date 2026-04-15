@@ -287,21 +287,79 @@ class GitHubAppAuthenticator:
             timeout=self.cfg.timeout,
         )
 
-    def get_installation_id(self) -> int:
-        resp = self.request("GET", f"/orgs/{self.cfg.org}/installation")
-        if resp.status_code == 404:
-            raise RuntimeError(
-                f"Could not find a GitHub App installation for organization '{self.cfg.org}'. "
-                f"Make sure the app is installed on that org. Response: {resp.text[:400]}"
-            )
+    def get_json(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
+        resp = self.request("GET", path_or_url, params=params)
         if resp.status_code >= 400:
+            raise RuntimeError(f"GET {path_or_url} failed: {resp.status_code} {resp.text[:400]}")
+        return resp.json()
+
+    def paginate(self, path_or_url: str, *, params: Optional[Dict[str, Any]] = None) -> Iterable[Any]:
+        params = dict(params or {})
+        params.setdefault("per_page", 100)
+        page = 1
+
+        while True:
+            page_params = dict(params)
+            page_params["page"] = page
+            resp = self.request("GET", path_or_url, params=page_params)
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"GET {path_or_url} page {page} failed: {resp.status_code} {resp.text[:400]}")
+
+            data = resp.json()
+            if isinstance(data, list):
+                for item in data:
+                    yield item
+            else:
+                yield data
+
+            link = resp.headers.get("Link", "")
+            if 'rel="next"' not in link:
+                break
+            page += 1
+
+    def get_installation_id(self) -> int:
+        # Confirm which app identity is being used.
+        app = self.get_json("/app")
+
+        # List every installation visible to this app, then match the org login.
+        installations = list(self.paginate("/app/installations"))
+        target = self.cfg.org.strip().lower()
+        matches = []
+
+        for inst in installations:
+            account = inst.get("account") or {}
+            login = str(account.get("login", "")).strip().lower()
+            if login == target:
+                matches.append(inst)
+
+        if not matches:
+            visible = [
+                {
+                    "installation_id": inst.get("id"),
+                    "account_login": (inst.get("account") or {}).get("login"),
+                    "target_type": inst.get("target_type"),
+                }
+                for inst in installations
+            ]
             raise RuntimeError(
-                f"GET /orgs/{self.cfg.org}/installation failed: {resp.status_code} {resp.text[:400]}"
+                f"GitHub App '{app.get('slug', '<unknown>')}' (id={app.get('id', '<unknown>')}) "
+                f"has no visible installation for org '{self.cfg.org}'. "
+                f"Visible installations: {visible}. "
+                f"Check that the app is actually approved for the org, not only pending, "
+                f"and that GH_ORG is the organization login."
             )
-        data = resp.json()
-        installation_id = data.get("id")
+
+        if len(matches) > 1:
+            ids = [m.get("id") for m in matches]
+            raise RuntimeError(
+                f"Multiple matching installations found for org '{self.cfg.org}': {ids}. "
+                f"Select one explicitly or tighten the lookup."
+            )
+
+        installation_id = matches[0].get("id")
         if not installation_id:
-            raise RuntimeError(f"Installation lookup returned no id: {data}")
+            raise RuntimeError(f"Matched installation record had no id: {matches[0]}")
         return int(installation_id)
 
     def get_installation_token(self, installation_id: int) -> str:
@@ -844,11 +902,11 @@ def collect(cfg: GitHubConfig) -> Path:
     summary["persistent_archive_slice_dir"] = str(persistent_slice_dir)
     write_json(summary_path, summary)
 
-    # Update only the archived copy; do not copy onto the same run-dir file.
+    # Keep the archived copy in sync with the finalized summary/control map.
     shutil.copy2(summary_path, persistent_slice_dir / "summary.json")
     shutil.copy2(control_map_path, persistent_slice_dir / "control_map.json")
 
-    # Keep the run directory copies current after the final summary fields were added.
+    # Keep run directory copies current after final fields were added.
     write_json(summary_path, summary)
     write_json(control_map_path, control_map)
 
