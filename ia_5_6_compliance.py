@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """IA-5(6) enterprise compliance evidence collector for GitHub.com.
 
+This script now authenticates with a GitHub App at runtime.
+
+Auth flow:
+1. Read GitHub App credentials from environment or CLI:
+   - GH_APP_ID
+   - GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE
+   - GH_APP_INSTALLATION_ID (optional)
+2. Generate a short-lived JWT for the GitHub App.
+3. Exchange the JWT for an installation access token.
+4. Use the installation token for all API calls.
+
 Scopes supported:
 - repo: one repository
 - org: one or more organizations
@@ -23,18 +34,18 @@ It does not certify compliance.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import dataclasses
 import json
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -47,6 +58,20 @@ from reportlab.platypus import (
     TableStyle,
     PageBreak,
 )
+
+try:
+    import jwt  # PyJWT
+except Exception:
+    jwt = None
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+except Exception as exc:  # pragma: no cover
+    raise SystemExit(
+        "cryptography is required to sign the GitHub App JWT. "
+        "Install it with: python -m pip install cryptography pyjwt"
+    ) from exc
 
 
 API_BASE = "https://api.github.com"
@@ -78,14 +103,66 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def get_token() -> str:
-    raw = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_TOKEN") or ""
-    token = raw.strip().replace("\r", "").replace("\n", "")
-    if not token:
+def parse_csv_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def load_org_inventory(path_value: str) -> List[str]:
+    if not path_value:
+        return []
+    inventory_path = Path(path_value)
+    if not inventory_path.exists():
+        raise SystemExit(f"Org inventory file not found: {inventory_path}")
+
+    orgs: List[str] = []
+    with inventory_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if "org" not in reader.fieldnames and "login" not in reader.fieldnames:
+            raise SystemExit("Org inventory CSV must contain an 'org' or 'login' column.")
+        for row in reader:
+            org_name = (row.get("org") or row.get("login") or "").strip()
+            if org_name:
+                orgs.append(org_name)
+    return orgs
+
+
+def read_private_key_pem(args: argparse.Namespace) -> bytes:
+    if args.private_key_file:
+        key_path = Path(args.private_key_file)
+        if not key_path.exists():
+            raise SystemExit(f"GitHub App private key file not found: {key_path}")
+        pem_text = key_path.read_text(encoding="utf-8")
+        return pem_text.strip().encode("utf-8")
+
+    raw = args.private_key or os.getenv("GH_APP_PRIVATE_KEY") or ""
+    pem_text = raw.strip().replace("\r", "")
+    if not pem_text:
         raise SystemExit(
-            "No token found. Set GH_ENTERPRISE_TOKEN, or GH_TOKEN as fallback, or pass --token."
+            "No GitHub App private key found. Set GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE."
         )
-    return token
+    return pem_text.encode("utf-8")
+
+
+def get_app_id(args: argparse.Namespace) -> int:
+    raw = str(args.app_id or os.getenv("GH_APP_ID") or "").strip()
+    if not raw:
+        raise SystemExit("No GitHub App ID found. Set GH_APP_ID or pass --app-id.")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid GitHub App ID: {raw}") from exc
+
+
+def get_installation_id_hint(args: argparse.Namespace) -> Optional[int]:
+    raw = str(args.installation_id or os.getenv("GH_APP_INSTALLATION_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid GitHub App installation ID: {raw}") from exc
 
 
 def github_headers(token: str) -> Dict[str, str]:
@@ -110,6 +187,16 @@ def api_get(path: str, token: str, params: Optional[Dict[str, Any]] = None) -> T
     return resp.status_code, payload
 
 
+def api_post(path: str, token: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+    url = f"{API_BASE}{path}"
+    resp = requests.post(url, headers=github_headers(token), json=payload, timeout=45)
+    try:
+        data = resp.json()
+    except Exception:
+        data = resp.text
+    return resp.status_code, data
+
+
 def paginated_get(path: str, token: str, params: Optional[Dict[str, Any]] = None) -> List[Any]:
     params = dict(params or {})
     params.setdefault("per_page", 100)
@@ -129,29 +216,94 @@ def paginated_get(path: str, token: str, params: Optional[Dict[str, Any]] = None
     return out
 
 
-def parse_csv_list(value: str) -> List[str]:
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
+def build_app_jwt(app_id: int, private_key_pem: bytes) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iat": int((now - timedelta(seconds=60)).timestamp()),
+        "exp": int((now + timedelta(minutes=9)).timestamp()),
+        "iss": str(app_id),
+    }
+
+    if jwt is not None:
+        return jwt.encode(payload, private_key_pem, algorithm="RS256")
+
+    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+    header = {"alg": "RS256", "typ": "JWT"}
+
+    def b64url(data: bytes) -> bytes:
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = header_b64 + b"." + payload_b64
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    return (signing_input + b"." + b64url(signature)).decode("utf-8")
 
 
-def load_org_inventory(path_value: str) -> List[str]:
-    if not path_value:
-        return []
-    inventory_path = Path(path_value)
-    if not inventory_path.exists():
-        raise SystemExit(f"Org inventory file not found: {inventory_path}")
+def discover_installation_id(app_jwt: str, args: argparse.Namespace, target_account: Optional[str] = None) -> int:
+    hint = get_installation_id_hint(args)
+    if hint:
+        return hint
 
-    orgs: List[str] = []
-    with inventory_path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        if "org" not in reader.fieldnames and "login" not in reader.fieldnames:
-            raise SystemExit("Org inventory CSV must contain an 'org' or 'login' column.")
-        for row in reader:
-            org_name = (row.get("org") or row.get("login") or "").strip()
-            if org_name:
-                orgs.append(org_name)
-    return orgs
+    status, payload = api_get("/app/installations", app_jwt)
+    if status != 200 or not isinstance(payload, list):
+        raise SystemExit(f"Failed to list app installations: HTTP {status} {payload}")
+
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    for inst in payload:
+        if not isinstance(inst, dict):
+            continue
+        inst_id = inst.get("id")
+        account = inst.get("account") or {}
+        account_login = None
+        account_id = None
+        if isinstance(account, dict):
+            account_login = account.get("login")
+            account_id = account.get("id")
+        if isinstance(inst_id, int):
+            candidates.append((inst_id, inst))
+        if target_account:
+            if account_login == target_account:
+                return inst_id
+            if str(account_login or "").lower() == str(target_account).lower():
+                return inst_id
+            if str(inst.get("app_slug") or "").lower() == str(target_account).lower():
+                return inst_id
+            if str(account_id or "") == str(target_account):
+                return inst_id
+
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    raise SystemExit(
+        "Unable to determine GitHub App installation ID automatically. "
+        "Set GH_APP_INSTALLATION_ID or ensure the app is installed on the target enterprise/org."
+    )
+
+
+def get_installation_access_token(app_jwt: str, installation_id: int, repo: Optional[str] = None, owner: Optional[str] = None) -> str:
+    body: Dict[str, Any] = {}
+    if repo and owner:
+        body["repositories"] = [repo]
+
+    status, payload = api_post(f"/app/installations/{installation_id}/access_tokens", app_jwt, body)
+    if status not in (200, 201) or not isinstance(payload, dict):
+        raise SystemExit(f"Failed to create installation token: HTTP {status} {payload}")
+
+    token = str(payload.get("token") or "").strip()
+    if not token:
+        raise SystemExit("Installation token response did not include a token.")
+    return token
+
+
+def resolve_api_token(args: argparse.Namespace) -> str:
+    app_id = get_app_id(args)
+    private_key_pem = read_private_key_pem(args)
+    app_jwt = build_app_jwt(app_id, private_key_pem)
+    target_account = args.enterprise_slug or (parse_csv_list(args.orgs)[0] if args.orgs else None)
+    installation_id = discover_installation_id(app_jwt, args, target_account=target_account)
+    owner = parse_csv_list(args.orgs)[0] if args.orgs else None
+    return get_installation_access_token(app_jwt, installation_id, repo=args.repo or None, owner=owner)
 
 
 def repo_default_branch(repo: Dict[str, Any], fallback: str) -> str:
@@ -405,7 +557,7 @@ def collect_scope(
             if not org_inventory:
                 raise SystemExit(
                     f"Enterprise org listing unavailable for '{enterprise_slug}'. "
-                    "Provide --org-inventory CSV or fix the enterprise token permissions."
+                    "Provide --org-inventory CSV or verify that the GitHub App is installed on the enterprise and has permission to read the enterprise org listing endpoint."
                 )
             for org_name in org_inventory:
                 results.append(
@@ -613,17 +765,21 @@ def main() -> int:
     parser.add_argument("--repo", default=os.getenv("REPO", ""))
     parser.add_argument("--branch", default=os.getenv("BRANCH", "main"))
     parser.add_argument("--output-dir", default="compliance-output")
-    parser.add_argument("--token", default=get_token())
+    parser.add_argument("--app-id", default=os.getenv("GH_APP_ID", ""))
+    parser.add_argument("--private-key", default=os.getenv("GH_APP_PRIVATE_KEY", ""))
+    parser.add_argument("--private-key-file", default=os.getenv("GH_APP_PRIVATE_KEY_FILE", ""))
+    parser.add_argument("--installation-id", default=os.getenv("GH_APP_INSTALLATION_ID", ""))
     args = parser.parse_args()
 
-    token = (args.token or "").strip().replace("\r", "").replace("\n", "")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     orgs = parse_csv_list(args.orgs)
     org_inventory = load_org_inventory(args.org_inventory) if args.org_inventory else []
 
-    results = collect_scope(args.scope, args.enterprise_slug, orgs, org_inventory, args.repo, args.branch, token)
+    api_token = resolve_api_token(args)
+
+    results = collect_scope(args.scope, args.enterprise_slug, orgs, org_inventory, args.repo, args.branch, api_token)
 
     meta = {
         "generated_at": utc_now(),
@@ -633,6 +789,8 @@ def main() -> int:
         "org_inventory": args.org_inventory,
         "repo": args.repo,
         "branch": args.branch,
+        "app_id": args.app_id,
+        "installation_id": args.installation_id,
     }
 
     evidence = {
