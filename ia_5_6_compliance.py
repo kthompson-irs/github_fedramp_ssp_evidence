@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """IA-5(6) enterprise compliance evidence collector for GitHub.com.
 
-This script now authenticates with a GitHub App at runtime.
+This script authenticates with a GitHub App at runtime.
 
 Auth flow:
 1. Read GitHub App credentials from environment or CLI:
@@ -817,7 +817,7 @@ def main() -> int:
     print()
     for status in ["PASS", "WARN", "FAIL", "NA", "ERROR"]:
         if evidence["summary"].get(status):
-            print(f"{status}: {evidence['summary'][status]}")
+            print(f"{status}: {evidence["summary"][status]}")
     print()
     print(f"Wrote: {json_path}")
     print(f"Wrote: {csv_path}")
