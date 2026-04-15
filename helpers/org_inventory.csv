@@ -1,8 +1,8 @@
-org	display_name	two_factor_authentication	members	repositories	deploy_keys
-IRS-Codespaces-testing	IRS-Codespaces-Testing	Enforced	5	1	
-IRS-CoPilot-Testing	IRS-CoPilot-Testing	Enforced	2	1	
-IRS-Public	Internal Revenue Service	Enforced	10	3	
-IRS-ShareIT	IRS-ShareIT	Enforced	2	1	
-IRSDigitalService	IRSDigitalService	Enforced	48	17	
-sds-sbx	sds-sbx	Enforced	6	1	
-Taxpayer-Services-and-Online-Accounts	Taxpayer Services and Online Accounts	Enforced	16	4	
+org,	display_name,	two_factor_authentication,	members,	repositories,	deploy_keys
+IRS-Codespaces-testing,	IRS-Codespaces-Testing,	Enforced,	5,	1	
+IRS-CoPilot-Testing,	IRS-CoPilot-Testing,	Enforced,	2,	1	
+IRS-Public,	Internal Revenue Service,	Enforced,	10,	3	
+IRS-ShareIT,	IRS-ShareIT,	Enforced,	2,	1	
+IRSDigitalService,	IRSDigitalService,	Enforced,	48,	17	
+sds-sbx,	sds-sbx,	Enforced,	6,	1	
+Taxpayer-Services-and-Online-Accounts,	Taxpayer Services and Online Accounts,	Enforced,	16,	4	
