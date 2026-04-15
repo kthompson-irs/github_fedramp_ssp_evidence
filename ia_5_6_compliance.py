@@ -79,7 +79,8 @@ def utc_now() -> str:
 
 
 def get_token() -> str:
-    token = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_TOKEN")
+    raw = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_TOKEN") or ""
+    token = raw.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise SystemExit(
             "No token found. Set GH_ENTERPRISE_TOKEN, or GH_TOKEN as fallback, or pass --token."
@@ -88,13 +89,14 @@ def get_token() -> str:
 
 
 def github_headers(token: str) -> Dict[str, str]:
+    clean_token = (token or "").strip().replace("\r", "").replace("\n", "")
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ia-5-6-enterprise-compliance/1.0",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if clean_token:
+        headers["Authorization"] = f"Bearer {clean_token}"
     return headers
 
 
@@ -144,9 +146,7 @@ def load_org_inventory(path_value: str) -> List[str]:
     with inventory_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if "org" not in reader.fieldnames and "login" not in reader.fieldnames:
-            raise SystemExit(
-                "Org inventory CSV must contain an 'org' or 'login' column."
-            )
+            raise SystemExit("Org inventory CSV must contain an 'org' or 'login' column.")
         for row in reader:
             org_name = (row.get("org") or row.get("login") or "").strip()
             if org_name:
@@ -338,7 +338,15 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
     return results
 
 
-def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], org_inventory: List[str], repo: str, branch: str, token: str) -> List[CheckResult]:
+def collect_scope(
+    scope: str,
+    enterprise_slug: str,
+    orgs: List[str],
+    org_inventory: List[str],
+    repo: str,
+    branch: str,
+    token: str,
+) -> List[CheckResult]:
     results: List[CheckResult] = []
 
     if scope == "repo":
@@ -399,7 +407,6 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], org_invento
                     f"Enterprise org listing unavailable for '{enterprise_slug}'. "
                     "Provide --org-inventory CSV or fix the enterprise token permissions."
                 )
-            # Fallback to explicitly supplied org inventory.
             for org_name in org_inventory:
                 results.append(
                     CheckResult(
@@ -609,7 +616,7 @@ def main() -> int:
     parser.add_argument("--token", default=get_token())
     args = parser.parse_args()
 
-    token = args.token
+    token = (args.token or "").strip().replace("\r", "").replace("\n", "")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
