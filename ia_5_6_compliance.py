@@ -9,8 +9,9 @@ Auth flow:
    - GH_APP_PRIVATE_KEY or GH_APP_PRIVATE_KEY_FILE
    - GH_APP_INSTALLATION_ID (optional)
 2. Generate a short-lived JWT for the GitHub App.
-3. Exchange the JWT for an installation access token.
-4. Use the installation token for all API calls.
+3. Resolve the app installation ID (verify hint, then discover if needed).
+4. Exchange the JWT for an installation access token.
+5. Use the installation token for all API calls.
 
 Scopes supported:
 - repo: one repository
@@ -49,14 +50,13 @@ import requests
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate,
+    PageBreak,
     Paragraph,
+    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
-    PageBreak,
 )
 
 try:
@@ -119,7 +119,7 @@ def load_org_inventory(path_value: str) -> List[str]:
     orgs: List[str] = []
     with inventory_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        if "org" not in reader.fieldnames and "login" not in reader.fieldnames:
+        if not reader.fieldnames or ("org" not in reader.fieldnames and "login" not in reader.fieldnames):
             raise SystemExit("Org inventory CSV must contain an 'org' or 'login' column.")
         for row in reader:
             org_name = (row.get("org") or row.get("login") or "").strip()
@@ -242,14 +242,20 @@ def build_app_jwt(app_id: int, private_key_pem: bytes) -> str:
 
 def discover_installation_id(app_jwt: str, args: argparse.Namespace, target_account: Optional[str] = None) -> int:
     hint = get_installation_id_hint(args)
-    if hint:
-        return hint
+    if hint is not None:
+        status, payload = api_get(f"/app/installations/{hint}", app_jwt)
+        if status == 200 and isinstance(payload, dict):
+            return hint
+        raise SystemExit(
+            f"Installation ID {hint} could not be verified for this GitHub App (HTTP {status}). "
+            "The app may not be installed at that location, or the ID may be wrong."
+        )
 
     status, payload = api_get("/app/installations", app_jwt)
     if status != 200 or not isinstance(payload, list):
         raise SystemExit(f"Failed to list app installations: HTTP {status} {payload}")
 
-    candidates: List[Tuple[int, Dict[str, Any]]] = []
+    candidates: List[int] = []
     for inst in payload:
         if not isinstance(inst, dict):
             continue
@@ -261,19 +267,19 @@ def discover_installation_id(app_jwt: str, args: argparse.Namespace, target_acco
             account_login = account.get("login")
             account_id = account.get("id")
         if isinstance(inst_id, int):
-            candidates.append((inst_id, inst))
-        if target_account:
-            if account_login == target_account:
-                return inst_id
-            if str(account_login or "").lower() == str(target_account).lower():
-                return inst_id
-            if str(inst.get("app_slug") or "").lower() == str(target_account).lower():
-                return inst_id
-            if str(account_id or "") == str(target_account):
-                return inst_id
+            candidates.append(inst_id)
+            if target_account:
+                if account_login == target_account:
+                    return inst_id
+                if str(account_login or "").lower() == str(target_account).lower():
+                    return inst_id
+                if str(inst.get("app_slug") or "").lower() == str(target_account).lower():
+                    return inst_id
+                if str(account_id or "") == str(target_account):
+                    return inst_id
 
     if len(candidates) == 1:
-        return candidates[0][0]
+        return candidates[0]
 
     raise SystemExit(
         "Unable to determine GitHub App installation ID automatically. "
@@ -300,9 +306,14 @@ def resolve_api_token(args: argparse.Namespace) -> str:
     app_id = get_app_id(args)
     private_key_pem = read_private_key_pem(args)
     app_jwt = build_app_jwt(app_id, private_key_pem)
-    target_account = args.enterprise_slug or (parse_csv_list(args.orgs)[0] if args.orgs else None)
+
+    orgs = parse_csv_list(args.orgs)
+    org_inventory = load_org_inventory(args.org_inventory) if args.org_inventory else []
+    target_account = args.enterprise_slug or (orgs[0] if orgs else (org_inventory[0] if org_inventory else None))
+
     installation_id = discover_installation_id(app_jwt, args, target_account=target_account)
-    owner = parse_csv_list(args.orgs)[0] if args.orgs else None
+    owner = orgs[0] if orgs else None
+
     return get_installation_access_token(app_jwt, installation_id, repo=args.repo or None, owner=owner)
 
 
