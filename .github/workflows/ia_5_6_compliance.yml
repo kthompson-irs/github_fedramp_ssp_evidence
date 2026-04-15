@@ -23,7 +23,7 @@ on:
       org_inventory:
         description: "CSV file path for org inventory fallback"
         required: false
-        default: "org_inventory.csv"
+        default: ""
         type: string
       repo:
         description: "Single repo name (used only for repo scope)"
@@ -59,7 +59,7 @@ jobs:
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
-      ORG_INVENTORY: ${{ inputs.org_inventory || 'org_inventory.csv' }}
+      ORG_INVENTORY: ${{ inputs.org_inventory || '' }}
       REPO: ${{ inputs.repo || github.event.repository.name }}
       BRANCH: ${{ inputs.branch || github.event.repository.default_branch || 'main' }}
 
@@ -80,7 +80,15 @@ jobs:
           pip install requests reportlab cryptography pyjwt
 
       - name: Print installation ID
-        run: python helpers/get_installation_id.py --target internal-revenue-service
+        run: python helpers/get_installation_id.py --target sds-sbx
+
+      - name: Check org inventory file
+        run: |
+          if [ -n "$ORG_INVENTORY" ] && [ ! -f "$ORG_INVENTORY" ]; then
+            echo "Org inventory file not found: $ORG_INVENTORY"
+            echo "Continuing without org inventory fallback."
+            exit 0
+          fi
 
       - name: Run IA-5(6) enterprise compliance check
         run: |
