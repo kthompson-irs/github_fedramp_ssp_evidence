@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """IA-5(6) enterprise compliance evidence collector for GitHub.com.
 
-This script can operate in three scopes:
+Scopes supported:
 - repo: one repository
-- org: all repositories in one or more organizations
-- enterprise: all repositories in all organizations under a GitHub Enterprise slug
+- org: one or more organizations
+- enterprise: enterprise discovery, with fallback to supplied org list if needed
 
-It gathers evidence for FedRAMP IA-5(6) and related supporting controls:
-- secret scanning
-- push protection
-- branch protection
-- workflow OIDC usage
-- best-effort org MFA requirement
-- workflow-file inspection for obvious secret patterns
-
-It also generates:
+Outputs:
 - JSON evidence
 - CSV manifest
-- PDF report for assessor review
+- PDF report
 
-This script does not certify compliance. It collects evidence and highlights gaps.
+This script collects evidence for FedRAMP IA-5(6) and related supporting controls.
+It does not certify compliance.
 """
 
 from __future__ import annotations
@@ -33,28 +26,22 @@ import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-try:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import letter, landscape
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import inch
-    from reportlab.platypus import (
-        SimpleDocTemplate,
-        Paragraph,
-        Spacer,
-        Table,
-        TableStyle,
-        PageBreak,
-    )
-except Exception as exc:  # pragma: no cover
-    raise SystemExit(
-        "reportlab is required to generate the PDF report. "
-        "Install it with: python -m pip install reportlab"
-    ) from exc
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
 
 
 API_BASE = "https://api.github.com"
@@ -84,6 +71,15 @@ class CheckResult:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_token() -> str:
+    token = os.getenv("GH_TOKEN") or os.getenv("GH_ENTERPRISE_TOKEN")
+    if not token:
+        raise SystemExit(
+            "No token found. Set GH_TOKEN or GH_ENTERPRISE_TOKEN, or pass --token."
+        )
+    return token
 
 
 def github_headers(token: str) -> Dict[str, str]:
@@ -139,25 +135,31 @@ def repo_default_branch(repo: Dict[str, Any], fallback: str) -> str:
 def fetch_repository(owner: str, repo: str, token: str) -> Dict[str, Any]:
     status, payload = api_get(f"/repos/{owner}/{repo}", token)
     if status == 404:
-        raise SystemExit(f"Repository not found or inaccessible: {owner}/{repo}. Check name and token permissions.")
+        raise SystemExit(
+            f"Repository not found or inaccessible: {owner}/{repo}. "
+            "Check the owner, repo name, and token permissions."
+        )
     if status != 200 or not isinstance(payload, dict):
         raise SystemExit(f"Failed to load repository metadata for {owner}/{repo}: HTTP {status} {payload}")
     return payload
 
 
 def fetch_org_repos(org: str, token: str) -> List[Dict[str, Any]]:
-    return paginated_get(f"/orgs/{org}/repos", token, params={"type": "all", "sort": "full_name", "direction": "asc"})
+    return paginated_get(
+        f"/orgs/{org}/repos",
+        token,
+        params={"type": "all", "sort": "full_name", "direction": "asc"},
+    )
+
+
+def fetch_org_metadata(org: str, token: str) -> Tuple[int, Any]:
+    return api_get(f"/orgs/{org}", token)
 
 
 def fetch_enterprise_orgs(slug: str, token: str) -> List[Dict[str, Any]]:
     status, payload = api_get(f"/enterprises/{slug}/orgs", token)
-    if status == 404:
-        raise SystemExit(
-            f"Enterprise not found or inaccessible: {slug}. "
-            "Check the enterprise slug and token permissions."
-        )
     if status != 200 or not isinstance(payload, list):
-        raise SystemExit(f"Failed to load enterprise org list for {slug}: HTTP {status} {payload}")
+        return []
     return payload
 
 
@@ -165,14 +167,12 @@ def fetch_branch_protection(owner: str, repo: str, branch: str, token: str) -> T
     return api_get(f"/repos/{owner}/{repo}/branches/{branch}/protection", token)
 
 
-def fetch_org_metadata(org: str, token: str) -> Tuple[int, Any]:
-    return api_get(f"/orgs/{org}", token)
-
-
 def fetch_workflow_files(owner: str, repo: str, default_branch: str, token: str) -> List[Dict[str, Any]]:
-    status, payload = api_get(f"/repos/{owner}/{repo}/contents/.github/workflows", token, params={"ref": default_branch})
-    if status == 404:
-        return []
+    status, payload = api_get(
+        f"/repos/{owner}/{repo}/contents/.github/workflows",
+        token,
+        params={"ref": default_branch},
+    )
     if status != 200:
         return []
 
@@ -193,15 +193,21 @@ def fetch_raw_file(url: str, token: str) -> str:
 
 
 def scan_workflow_text_for_oidc(text: str) -> bool:
-    return ("token.actions.githubusercontent.com" in text) or ("id-token: write" in text)
+    return "token.actions.githubusercontent.com" in text or "id-token: write" in text
 
 
 def scan_workflow_text_for_secrets(text: str) -> List[Dict[str, str]]:
     findings: List[Dict[str, str]] = []
     for rx, label in SUSPICIOUS_PATTERNS:
         for m in rx.finditer(text):
-            snippet = text[max(0, m.start() - 60): min(len(text), m.end() + 60)].replace("\n", " ")
-            findings.append({"pattern": label, "match": m.group(0)[:120], "snippet": snippet[:240]})
+            snippet = text[max(0, m.start() - 60) : min(len(text), m.end() + 60)].replace("\n", " ")
+            findings.append(
+                {
+                    "pattern": label,
+                    "match": m.group(0)[:120],
+                    "snippet": snippet[:240],
+                }
+            )
     return findings
 
 
@@ -242,7 +248,6 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
     )
 
     bp_status, bp = fetch_branch_protection(owner, repo_name, default_branch, token)
-    bp_state = "PASS" if bp_status == 200 else "WARN"
     results.append(
         CheckResult(
             scope=scope_label,
@@ -250,7 +255,7 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
             repo=repo_name,
             control="AC/CM",
             item=f"Branch protection on {default_branch}",
-            status=bp_state,
+            status="PASS" if bp_status == 200 else "WARN",
             evidence=f"/repos/{owner}/{repo_name}/branches/{default_branch}/protection",
             details={"http_status": bp_status, "raw": bp if bp_status == 200 else None},
         )
@@ -258,6 +263,7 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
 
     workflow_findings: List[Dict[str, Any]] = []
     oidc_hits: List[Dict[str, Any]] = []
+
     workflow_files = fetch_workflow_files(owner, repo_name, default_branch, token)
     for wf in workflow_files:
         download_url = wf.get("download_url")
@@ -272,6 +278,7 @@ def collect_repo_evidence(owner: str, repo_name: str, token: str, scope_label: s
 
         if scan_workflow_text_for_oidc(text):
             oidc_hits.append({"file": wf_name, "oidc": "present"})
+
         workflow_findings.extend(
             [{"file": wf_name, **finding} for finding in scan_workflow_text_for_secrets(text)]
         )
@@ -309,9 +316,9 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, 
     results: List[CheckResult] = []
 
     if scope == "repo":
-        owner = orgs[0] if orgs else None
-        if not owner:
-            raise SystemExit("For repo scope, pass --orgs with one owner/org value or set ORGS in the workflow.")
+        if not orgs:
+            raise SystemExit("For repo scope, pass --orgs with one owner/org value.")
+        owner = orgs[0]
         results.extend(collect_repo_evidence(owner, repo, token, scope_label="repo", branch_override=branch))
         return results
 
@@ -357,10 +364,39 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, 
 
     if scope == "enterprise":
         if not enterprise_slug:
-            raise SystemExit("For enterprise scope, pass --enterprise-slug or set ENTERPRISE_SLUG in the workflow.")
+            raise SystemExit("For enterprise scope, pass --enterprise-slug.")
+
         enterprise_orgs = fetch_enterprise_orgs(enterprise_slug, token)
-        for org_item in enterprise_orgs:
-            org_login = org_item.get("login") if isinstance(org_item, dict) else None
+
+        if not enterprise_orgs:
+            if not orgs:
+                raise SystemExit(
+                    "Enterprise org listing was inaccessible, and no ORGS fallback was supplied. "
+                    "Provide --orgs or fix the enterprise token permissions/slug."
+                )
+
+            for org_name in orgs:
+                results.append(
+                    CheckResult(
+                        scope="enterprise",
+                        owner=org_name,
+                        repo="*",
+                        control="IA-2",
+                        item="Org discovered via fallback org list",
+                        status="WARN",
+                        evidence="fallback org list",
+                        details={"note": "Enterprise org listing was unavailable; using supplied ORGS list."},
+                    )
+                )
+                repos = fetch_org_repos(org_name, token)
+                for r in repos:
+                    if not isinstance(r, dict) or not r.get("name"):
+                        continue
+                    results.extend(collect_repo_evidence(org_name, r["name"], token, scope_label="enterprise", branch_override=branch))
+            return results
+
+        for org in enterprise_orgs:
+            org_login = org.get("login") if isinstance(org, dict) else None
             if not org_login:
                 continue
 
@@ -398,6 +434,7 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, 
                 if not isinstance(r, dict) or not r.get("name"):
                     continue
                 results.extend(collect_repo_evidence(org_login, r["name"], token, scope_label="enterprise", branch_override=branch))
+
         return results
 
     raise SystemExit(f"Unsupported scope: {scope}")
@@ -541,7 +578,7 @@ def main() -> int:
     parser.add_argument("--repo", default=os.getenv("REPO", ""))
     parser.add_argument("--branch", default=os.getenv("BRANCH", "main"))
     parser.add_argument("--output-dir", default="compliance-output")
-    parser.add_argument("--token", default=os.getenv("GH_TOKEN", ""))
+    parser.add_argument("--token", default=get_token())
     args = parser.parse_args()
 
     token = args.token
