@@ -17,11 +17,11 @@ on:
         required: false
         type: string
       orgs:
-        description: "Comma-separated org list (optional for org scope)"
+        description: "Comma-separated org list (used only for org or repo scope)"
         required: false
         type: string
       repo:
-        description: "Single repo name (optional for repo scope)"
+        description: "Single repo name (used only for repo scope)"
         required: false
         type: string
       branch:
@@ -38,6 +38,7 @@ on:
 jobs:
   compliance:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       actions: read
@@ -46,9 +47,7 @@ jobs:
       id-token: write
 
     env:
-      # Use a dedicated read token for enterprise/org API visibility.
-      # Fall back to the built-in token when the repo/org scope is sufficient.
-      GH_TOKEN: ${{ secrets.GH_READ_TOKEN || github.token }}
+      GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
       SCOPE: ${{ inputs.scope || 'enterprise' }}
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || '' }}
       ORGS: ${{ inputs.orgs || '' }}
