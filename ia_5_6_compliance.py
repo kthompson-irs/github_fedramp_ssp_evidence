@@ -4,7 +4,12 @@
 Scopes supported:
 - repo: one repository
 - org: one or more organizations
-- enterprise: enterprise discovery, with fallback to supplied org list if needed
+- enterprise: survey ALL orgs in the enterprise by default
+
+Enterprise behavior:
+- The script always attempts to enumerate all orgs from the enterprise slug.
+- ORGS is ignored in enterprise mode unless you later choose to extend this.
+- If the enterprise endpoint is inaccessible, the script exits with a clear error.
 
 Outputs:
 - JSON evidence
@@ -64,7 +69,7 @@ class CheckResult:
     repo: str
     control: str
     item: str
-    status: str  # PASS / WARN / FAIL / NA / ERROR
+    status: str
     evidence: str
     details: Dict[str, Any]
 
@@ -74,10 +79,10 @@ def utc_now() -> str:
 
 
 def get_token() -> str:
-    token = os.getenv("GH_TOKEN") or os.getenv("GH_ENTERPRISE_TOKEN")
+    token = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_TOKEN")
     if not token:
         raise SystemExit(
-            "No token found. Set GH_TOKEN or GH_ENTERPRISE_TOKEN, or pass --token."
+            "No token found. Set GH_ENTERPRISE_TOKEN, or GH_TOKEN as fallback, or pass --token."
         )
     return token
 
@@ -367,33 +372,11 @@ def collect_scope(scope: str, enterprise_slug: str, orgs: List[str], repo: str, 
             raise SystemExit("For enterprise scope, pass --enterprise-slug.")
 
         enterprise_orgs = fetch_enterprise_orgs(enterprise_slug, token)
-
         if not enterprise_orgs:
-            if not orgs:
-                raise SystemExit(
-                    "Enterprise org listing was inaccessible, and no ORGS fallback was supplied. "
-                    "Provide --orgs or fix the enterprise token permissions/slug."
-                )
-
-            for org_name in orgs:
-                results.append(
-                    CheckResult(
-                        scope="enterprise",
-                        owner=org_name,
-                        repo="*",
-                        control="IA-2",
-                        item="Org discovered via fallback org list",
-                        status="WARN",
-                        evidence="fallback org list",
-                        details={"note": "Enterprise org listing was unavailable; using supplied ORGS list."},
-                    )
-                )
-                repos = fetch_org_repos(org_name, token)
-                for r in repos:
-                    if not isinstance(r, dict) or not r.get("name"):
-                        continue
-                    results.extend(collect_repo_evidence(org_name, r["name"], token, scope_label="enterprise", branch_override=branch))
-            return results
+            raise SystemExit(
+                f"Enterprise org listing unavailable for '{enterprise_slug}'. "
+                "The token must be able to read the enterprise org listing endpoint."
+            )
 
         for org in enterprise_orgs:
             org_login = org.get("login") if isinstance(org, dict) else None
