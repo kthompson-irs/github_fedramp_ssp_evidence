@@ -1,0 +1,53 @@
+name: IA-11 FedRAMP Evidence Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/ia11_compliance.py"
+      - ".github/workflows/ia11_compliance.yml"
+      - "evidence/**"
+
+jobs:
+  ia11-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      GITHUB_ORG: ${{ secrets.GITHUB_ORG }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_API_URL: https://api.github.com
+      OUTPUT_DIR: artifacts
+      SINCE_DAYS: "30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run IA-11 evidence collector
+        run: python scripts/ia11_compliance.py
+
+      - name: Upload evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia11-evidence
+          path: |
+            artifacts/**
+          if-no-files-found: error
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f artifacts/ia11_report.md ]; then
+            cat artifacts/ia11_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "IA-11 report not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
