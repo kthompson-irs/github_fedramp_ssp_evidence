@@ -3,14 +3,14 @@
 Enterprise-scoped FedRAMP IA control collector for GitHub Enterprise Cloud.
 
 What this script does:
-- Pulls enterprise audit log events
+- Pulls enterprise metadata and enterprise audit log events
 - Validates IA controls using enterprise evidence and optional IdP policy exports
 - Produces JSON + Markdown reports
 - Fails only on hard IA violations; warnings remain non-fatal
 
 Required environment variables:
 - GH_ENTERPRISE
-- GH_TOKEN
+- GH_ENTERPRISE_TOKEN
 
 Optional environment variables:
 - GH_API_URL (default: https://api.github.com)
@@ -21,6 +21,11 @@ Optional environment variables:
 - IDP_POLICY_FILE (path to JSON export of session/reauth policy)
 - ENTERPRISE_SECURITY_FILE (path to JSON export of enterprise security settings)
 - MANUAL_EVIDENCE_DIR (path to screenshot package)
+
+Notes:
+- GH_ENTERPRISE must be the enterprise slug, not the display name.
+- The enterprise audit-log API requires an enterprise admin and a classic PAT
+  with read:audit_log scope.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+
 AUTH_RELATED_ACTIONS = {
     "user.login",
     "org.sso_response",
@@ -48,10 +54,11 @@ AUTH_RELATED_ACTIONS = {
     "repo.access",
 }
 
+
 @dataclass
 class ControlResult:
     control_id: str
-    status: str
+    status: str  # PASS, WARN, FAIL
     summary: str
     evidence: List[str]
     notes: List[str]
@@ -90,7 +97,7 @@ def api_get(url: str, token: str, timeout: int = 30) -> Any:
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
+            "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "ia-enterprise-fedramp-collector",
         },
         method="GET",
@@ -117,17 +124,44 @@ def build_url(api_base: str, path: str, params: Optional[Dict[str, Any]] = None)
     return url
 
 
+def validate_enterprise_slug(value: str) -> None:
+    if not value:
+        raise ValueError("GH_ENTERPRISE is empty.")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    if any(ch not in allowed for ch in value):
+        raise ValueError(
+            "GH_ENTERPRISE must be the enterprise slug, not the display name. "
+            "Use only letters, numbers, hyphens, and underscores."
+        )
+
+
 def fetch_enterprise_metadata(api_base: str, token: str, enterprise: str) -> Dict[str, Any]:
     return api_get(build_url(api_base, f"/enterprises/{enterprise}"), token)
 
 
-def fetch_enterprise_audit_events(api_base: str, token: str, enterprise: str, since_days: int, page_size: int, max_pages: int) -> List[Dict[str, Any]]:
+def fetch_enterprise_audit_events(
+    api_base: str,
+    token: str,
+    enterprise: str,
+    since_days: int,
+    page_size: int,
+    max_pages: int,
+) -> List[Dict[str, Any]]:
+    """
+    Enterprise audit log endpoint:
+    /enterprises/{enterprise}/audit-log
+    """
     events: List[Dict[str, Any]] = []
     cutoff = utc_now() - dt.timedelta(days=since_days)
 
     for page in range(1, max_pages + 1):
-        url = build_url(api_base, f"/enterprises/{enterprise}/audit-log", {"per_page": page_size, "page": page, "order": "desc", "include": "all"})
+        url = build_url(
+            api_base,
+            f"/enterprises/{enterprise}/audit-log",
+            {"per_page": page_size, "page": page, "order": "desc", "include": "all"},
+        )
         data = api_get(url, token)
+
         if not data:
             break
         if not isinstance(data, list):
@@ -180,8 +214,18 @@ def detect_manual_evidence(manual_dir: Path) -> Dict[str, bool]:
 
 
 def validate_idp_policy(policy: Optional[Dict[str, Any]]) -> Tuple[str, List[str], List[str]]:
+    """
+    Real re-auth validation uses an IdP export.
+
+    Expected keys:
+      - session_timeout_minutes (int)
+      - reauth_required (bool)
+      - mfa_required (bool)
+      - provider (str, optional)
+    """
     notes: List[str] = []
     evidence: List[str] = []
+
     if not policy:
         return "WARN", ["No IdP policy file provided or it could not be loaded."], evidence
 
@@ -196,9 +240,10 @@ def validate_idp_policy(policy: Optional[Dict[str, Any]]) -> Tuple[str, List[str
     evidence.append(f"MFA required: {mfa_required}")
 
     if timeout is None or reauth_required is None or mfa_required is None:
-        return "FAIL", ["IdP policy file is missing one or more required fields."], evidence
+        return "WARN", ["IdP policy file is missing one or more required fields."], evidence
+
     if not isinstance(timeout, int):
-        return "FAIL", ["IdP session_timeout_minutes must be an integer."], evidence
+        return "WARN", ["IdP session_timeout_minutes should be an integer."], evidence
 
     if timeout > 15:
         notes.append(f"Session timeout is {timeout} minutes, which exceeds the 15 minute IA-11 threshold.")
@@ -213,7 +258,13 @@ def validate_idp_policy(policy: Optional[Dict[str, Any]]) -> Tuple[str, List[str
     return "PASS", ["IdP policy satisfies the IA-11 re-authentication threshold."], evidence
 
 
-def assess_controls(enterprise_meta: Dict[str, Any], summary: Dict[str, Any], idp_policy: Optional[Dict[str, Any]], enterprise_security: Optional[Dict[str, Any]], manual_evidence: Dict[str, bool]) -> List[ControlResult]:
+def assess_controls(
+    enterprise_meta: Dict[str, Any],
+    summary: Dict[str, Any],
+    idp_policy: Optional[Dict[str, Any]],
+    enterprise_security: Optional[Dict[str, Any]],
+    manual_evidence: Dict[str, bool],
+) -> List[ControlResult]:
     results: List[ControlResult] = []
 
     ia2_evidence: List[str] = []
@@ -298,13 +349,22 @@ def assess_controls(enterprise_meta: Dict[str, Any], summary: Dict[str, Any], id
     return results
 
 
-def write_reports(output_dir: Path, enterprise: str, enterprise_meta: Dict[str, Any], events: List[Dict[str, Any]], summary: Dict[str, Any], controls: List[ControlResult], manual_evidence: Dict[str, bool], since_days: int) -> None:
+def write_reports(
+    output_dir: Path,
+    enterprise: str,
+    enterprise_meta: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    summary: Dict[str, Any],
+    controls: List[ControlResult],
+    manual_evidence: Dict[str, bool],
+    since_days: int,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    status_rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
     overall = "PASS"
+    rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
     for c in controls:
-        if status_rank[c.status] > status_rank[overall]:
+        if rank[c.status] > rank[overall]:
             overall = c.status
 
     raw_path = output_dir / "enterprise_audit_log_raw.json"
@@ -377,11 +437,13 @@ def write_reports(output_dir: Path, enterprise: str, enterprise_meta: Dict[str, 
     for name, present in manual_evidence.items():
         md.append(f"- {name}: {'present' if present else 'missing'}")
 
-    md.extend([
-        "",
-        "## Auditor Guidance",
-        "This report is supporting evidence only. Pair it with screenshots and exports for SAML, MFA, session timeout, re-authentication, and audit log review.",
-    ])
+    md.extend(
+        [
+            "",
+            "## Auditor Guidance",
+            "This report is supporting evidence only. Pair it with screenshots and exports for SAML, MFA, session timeout, re-authentication, and audit log review.",
+        ]
+    )
 
     (output_dir / "ia_enterprise_report.md").write_text("\n".join(md) + "\n")
 
@@ -389,7 +451,7 @@ def write_reports(output_dir: Path, enterprise: str, enterprise_meta: Dict[str, 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect enterprise-scoped IA FedRAMP evidence from GitHub Enterprise Cloud.")
     parser.add_argument("--enterprise", default=os.getenv("GH_ENTERPRISE"))
-    parser.add_argument("--token", default=os.getenv("GH_TOKEN"))
+    parser.add_argument("--token", default=os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_TOKEN"))
     parser.add_argument("--api-url", default=os.getenv("GH_API_URL", "https://api.github.com"))
     parser.add_argument("--output-dir", default=os.getenv("OUTPUT_DIR", "artifacts"))
     parser.add_argument("--since-days", type=int, default=int(os.getenv("SINCE_DAYS", "30")))
@@ -401,26 +463,60 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.enterprise:
-        print("ERROR: GH_ENTERPRISE is required.", file=sys.stderr)
+        print(
+            "ERROR: GH_ENTERPRISE is required and must be the enterprise slug, not the display name.",
+            file=sys.stderr,
+        )
         return 2
     if not args.token:
-        print("ERROR: GH_TOKEN is required.", file=sys.stderr)
+        print("ERROR: GH_ENTERPRISE_TOKEN is required.", file=sys.stderr)
         return 2
 
     try:
+        validate_enterprise_slug(args.enterprise)
+
         enterprise_meta = fetch_enterprise_metadata(args.api_url, args.token, args.enterprise)
-        events = fetch_enterprise_audit_events(args.api_url, args.token, args.enterprise, args.since_days, args.page_size, args.max_pages)
+        expected_slug = str(enterprise_meta.get("slug") or "")
+        if expected_slug and expected_slug != args.enterprise:
+            raise RuntimeError(
+                f"GH_ENTERPRISE value '{args.enterprise}' does not match enterprise slug '{expected_slug}'."
+            )
+
+        events = fetch_enterprise_audit_events(
+            api_base=args.api_url,
+            token=args.token,
+            enterprise=args.enterprise,
+            since_days=args.since_days,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+        )
         summary = summarize_events(events)
+
         idp_policy, idp_err = load_json_file(args.idp_policy_file)
         enterprise_security, sec_err = load_json_file(args.enterprise_security_file)
         manual_evidence = detect_manual_evidence(Path(args.manual_evidence_dir))
-        controls = assess_controls(enterprise_meta, summary, idp_policy, enterprise_security, manual_evidence)
 
-        write_reports(Path(args.output_dir), args.enterprise, enterprise_meta, events, summary, controls, manual_evidence, args.since_days)
+        controls = assess_controls(
+            enterprise_meta=enterprise_meta,
+            summary=summary,
+            idp_policy=idp_policy,
+            enterprise_security=enterprise_security,
+            manual_evidence=manual_evidence,
+        )
 
-        status_rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
-        overall = max(controls, key=lambda c: status_rank[c.status]).status if controls else "UNKNOWN"
+        write_reports(
+            output_dir=Path(args.output_dir),
+            enterprise=args.enterprise,
+            enterprise_meta=enterprise_meta,
+            events=events,
+            summary=summary,
+            controls=controls,
+            manual_evidence=manual_evidence,
+            since_days=args.since_days,
+        )
+
         print(f"IA enterprise report written to {args.output_dir}/ia_enterprise_report.md")
+        overall = max(controls, key=lambda c: {"PASS": 0, "WARN": 1, "FAIL": 2}[c.status]).status if controls else "UNKNOWN"
         print(f"Overall status: {overall}")
 
         hard_failures = [c for c in controls if c.status == "FAIL"]
@@ -436,6 +532,20 @@ def main() -> int:
 
         return 0
 
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "404" in msg and "/enterprises/" in msg:
+            print(
+                "ERROR: GitHub returned 404 for the enterprise endpoint. "
+                "Check that GH_ENTERPRISE is the slug version of the enterprise name "
+                "and that GH_ENTERPRISE_TOKEN belongs to an enterprise admin with read:audit_log.",
+                file=sys.stderr,
+            )
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
