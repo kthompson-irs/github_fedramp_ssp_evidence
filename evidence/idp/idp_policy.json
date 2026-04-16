@@ -1,0 +1,23 @@
+{
+  "provider": "entra",
+  "tenant": "irs.gov",
+  "policy_name": "FedRAMP-IA11-Session-Control",
+  "session_timeout_minutes": 15,
+  "reauth_required": true,
+  "mfa_required": true,
+  "applies_to": [
+    "All Users",
+    "Privileged Roles"
+  ],
+  "conditions": {
+    "sign_in_frequency_hours": 12,
+    "persistent_browser_session": "never",
+    "require_compliant_device": true
+  },
+  "last_reviewed": "2026-04-01T00:00:00Z",
+  "evidence": {
+    "source": "Azure Conditional Access Export",
+    "export_method": "Microsoft Graph API",
+    "validated_by": "IAM Team"
+  }
+}
