@@ -1,0 +1,18 @@
+{
+  "enterprise_slug": "internal-revenue-service",
+  "two_factor_requirement_enabled": true,
+  "scim_enabled": true,
+  "saml_sso_enforced": true,
+  "pat_expiration_required": true,
+  "pat_max_lifetime_days": 90,
+  "ssh_key_restrictions_enabled": true,
+  "fips_endpoints_required": true,
+  "outside_collaborators_count": 0,
+  "allowed_ip_ranges_enabled": true,
+  "audit_log_retention_days": 180,
+  "last_reviewed": "2026-04-01T00:00:00Z",
+  "evidence": {
+    "source": "GitHub Enterprise Settings Export",
+    "validated_by": "Cloud Security Team"
+  }
+}
