@@ -1,0 +1,55 @@
+name: IA FedRAMP Enterprise Evidence Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/ia_compliance_enterprise.py"
+      - ".github/workflows/ia_compliance_enterprise.yml"
+      - "evidence/**"
+
+jobs:
+  ia-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      GH_ENTERPRISE: ${{ secrets.GH_ENTERPRISE }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GH_API_URL: https://api.github.com
+      OUTPUT_DIR: artifacts
+      SINCE_DAYS: "30"
+      IDP_POLICY_FILE: evidence/idp/idp_policy.json
+      ENTERPRISE_SECURITY_FILE: evidence/github/enterprise_security.json
+      MANUAL_EVIDENCE_DIR: evidence/manual
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run IA enterprise evidence collector
+        run: python scripts/ia_compliance_enterprise.py
+
+      - name: Upload evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-enterprise-evidence
+          path: |
+            artifacts/**
+          if-no-files-found: error
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f artifacts/ia_enterprise_report.md ]; then
+            cat artifacts/ia_enterprise_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "IA enterprise report not generated." >> "$GITHUB_STEP_SUMMARY"
