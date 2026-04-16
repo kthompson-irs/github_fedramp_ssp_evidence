@@ -1,261 +1,371 @@
 #!/usr/bin/env python3
-"""Generate SSP-ready Markdown and PDF summaries from a collector run directory."""
+"""
+Generate an SSP-style evidence summary for GitHub Enterprise Cloud enterprise audit-log collection.
+
+This report is intentionally enterprise-focused:
+- uses "enterprise audit log" terminology throughout
+- avoids org-scoped language unless explicitly referring to supporting artifacts
+- reads the output of github_enterprise_ia208_collector.py
+
+Expected input directory contents:
+- enterprise_installation.json
+- enterprise_audit_log.jsonl
+- enterprise_audit_log.csv
+- summary.json
+- control_map.json
+- manifest.md
+
+Outputs:
+- reports/ssp_evidence_summary.md
+- reports/ssp_evidence_summary.txt
+- reports/report_metadata.json
+"""
+
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import csv
 import json
-import os
-import shutil
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from reportlab.lib.enums import TA_LEFT
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
-from xml.sax.saxutils import escape
+
+@dataclass
+class RunArtifacts:
+    run_dir: Path
+    reports_dir: Path
+    summary: Dict[str, Any]
+    control_map: Dict[str, List[str]]
+    enterprise_installation: Dict[str, Any]
+    manifest_text: str
+    audit_rows: List[Dict[str, Any]]
 
 
 def load_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def read_manifest_entries(path: Path) -> List[str]:
-    entries: List[str] = []
     if not path.exists():
-        return entries
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line.startswith("- "):
-            entries.append(line[2:].strip())
-    return entries
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        return data
+    raise ValueError(f"Expected JSON object in {path}, got {type(data).__name__}")
 
 
-def build_markdown(summary: Dict[str, Any], manifest_entries: List[str]) -> str:
-    controls = summary.get("controls_covered", [])
-    control_map = summary.get("control_map", {})
-    potential_gaps = summary.get("potential_gaps", [])
+def load_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict):
+                rows.append(item)
+    return rows
+
+
+def load_manifest(path: Path) -> str:
+    if not path.exists():
+        return "# Manifest not found\n"
+    return path.read_text(encoding="utf-8")
+
+
+def load_artifacts(run_dir: Path) -> RunArtifacts:
+    summary = load_json(run_dir / "summary.json")
+    control_map = load_json(run_dir / "control_map.json")
+    enterprise_installation = load_json(run_dir / "enterprise_installation.json")
+    manifest_text = load_manifest(run_dir / "manifest.md")
+    audit_rows = load_jsonl(run_dir / "enterprise_audit_log.jsonl")
+
+    reports_dir = run_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    return RunArtifacts(
+        run_dir=run_dir,
+        reports_dir=reports_dir,
+        summary=summary,
+        control_map=control_map,
+        enterprise_installation=enterprise_installation,
+        manifest_text=manifest_text,
+        audit_rows=audit_rows,
+    )
+
+
+def count_auth_related_events(audit_rows: List[Dict[str, Any]]) -> int:
+    tokens = ("auth", "saml", "oauth", "token", "credential", "2fa", "mfa", "login", "sign_in", "signin")
+    count = 0
+    for row in audit_rows:
+        action = str(row.get("action", "")).lower()
+        raw = json.dumps(row.get("raw", {}), default=str).lower()
+        text = f"{action} {raw}"
+        if any(token in text for token in tokens):
+            count += 1
+    return count
+
+
+def first_nonempty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, (dict, list)) and value:
+            return json.dumps(value, indent=2, sort_keys=True, default=str)
+    return ""
+
+
+def summarize_control_map(control_map: Dict[str, List[str]]) -> List[Tuple[str, str]]:
+    rows: List[Tuple[str, str]] = []
+    for artifact, controls in sorted(control_map.items()):
+        rows.append((artifact, ", ".join(controls)))
+    return rows
+
+
+def build_markdown_report(artifacts: RunArtifacts) -> str:
+    summary = artifacts.summary
+    control_map = artifacts.control_map
+    install = artifacts.enterprise_installation
+    audit_rows = artifacts.audit_rows
+
+    enterprise_name = first_nonempty(
+        summary.get("enterprise"),
+        install.get("enterprise"),
+        "Unknown enterprise",
+    )
+
+    installation_id = first_nonempty(
+        summary.get("installation_id"),
+        install.get("installation_id"),
+    )
+
+    collected_at = first_nonempty(
+        summary.get("collected_at"),
+        install.get("collected_at"),
+    )
+
+    total_events = len(audit_rows)
+    auth_related_events = first_nonempty(
+        summary.get("auth_related_event_count"),
+        count_auth_related_events(audit_rows),
+    )
+
+    checkpoint_day = first_nonempty(summary.get("checkpoint_last_processed_day"), "N/A")
+    collection_mode = first_nonempty(summary.get("collection_mode"), "unknown")
+    audit_window_days = first_nonempty(summary.get("audit_window_days"), "N/A")
+    max_windows = first_nonempty(summary.get("max_windows_per_run"), "N/A")
+
+    potential_gaps = summary.get("potential_gaps") or []
+    controls_covered = summary.get("controls_covered") or []
 
     lines: List[str] = []
-    lines.append("# FedRAMP IA-2(8) Evidence Summary")
+    lines.append("# FedRAMP IA-2(8) Enterprise Audit Log Evidence Summary")
     lines.append("")
-    lines.append(f"- Organization: {summary.get('org')}")
-    lines.append(f"- Collection mode: {summary.get('collection_mode')}")
-    lines.append(f"- Collected at: {summary.get('collected_at')}")
-    lines.append(f"- Days collected: {summary.get('days_collected')}")
-    lines.append(f"- Checkpoint file: {summary.get('checkpoint_file')}")
-    lines.append(f"- Checkpoint last processed day: {summary.get('checkpoint_last_processed_day')}")
-    lines.append(f"- Backfill complete: {summary.get('checkpoint_backfill_complete')}")
-    lines.append(f"- Archive slice: {summary.get('persistent_archive_slice_dir')}")
-    lines.append("")
-
-    lines.append("## Control coverage")
-    for control in controls:
-        lines.append(f"- {control}")
+    lines.append(f"**Enterprise:** {enterprise_name}")
+    lines.append(f"**Enterprise installation ID:** {installation_id}")
+    lines.append(f"**Collected at:** {collected_at}")
+    lines.append(f"**Collection mode:** {collection_mode}")
+    lines.append(f"**Checkpoint last processed day:** {checkpoint_day}")
+    lines.append(f"**Audit window days:** {audit_window_days}")
+    lines.append(f"**Max windows per run:** {max_windows}")
     lines.append("")
 
-    lines.append("## Evidence inventory")
-    for item in manifest_entries:
-        lines.append(f"- {item}")
+    lines.append("## Scope")
+    lines.append("")
+    lines.append(
+        "This report summarizes evidence collected from the GitHub Enterprise Cloud enterprise audit log "
+        "for the purpose of demonstrating replay-resistant authentication support for IA-2(8)."
+    )
+    lines.append(
+        "The evidence package is enterprise-scoped and is intended to support review of authentication, "
+        "token, and administrative audit activity at the enterprise boundary."
+    )
     lines.append("")
 
-    lines.append("## File-to-control mapping")
-    for filename, mapped in control_map.items():
-        lines.append(f"- {filename}: {', '.join(mapped)}")
+    lines.append("## Evidence Summary")
+    lines.append("")
+    lines.append(f"- Enterprise audit log events collected: **{total_events}**")
+    lines.append(f"- Authentication-related enterprise audit log events: **{auth_related_events}**")
+    lines.append(f"- Controls covered: **{', '.join(controls_covered) if controls_covered else 'N/A'}**")
     lines.append("")
 
-    lines.append("## Key findings")
-    lines.append(f"- Organization 2FA requirement enabled: {summary.get('org_two_factor_requirement_enabled')}")
-    lines.append(f"- Audit events collected this run: {summary.get('audit_event_count')}")
-    lines.append(f"- Auth-related audit events: {summary.get('auth_related_event_count')}")
-    lines.append(f"- Credential authorizations count: {summary.get('credential_authorization_count')}")
-    lines.append(f"- Installations count: {summary.get('installation_count')}")
+    lines.append("## Enterprise Audit Log Artifacts")
+    lines.append("")
+    lines.append("| Artifact | Purpose |")
+    lines.append("|---|---|")
+    lines.append("| `enterprise_installation.json` | Records the enterprise installation used to access the enterprise audit log. |")
+    lines.append("| `enterprise_audit_log.jsonl` | Raw enterprise audit log events in JSON Lines format. |")
+    lines.append("| `enterprise_audit_log.csv` | Tabular enterprise audit log export for review and analysis. |")
+    lines.append("| `summary.json` | Machine-readable summary of the collection run. |")
+    lines.append("| `control_map.json` | Mapping between artifacts and controls supported. |")
+    lines.append("| `manifest.md` | File manifest for the collection package. |")
     lines.append("")
 
-    lines.append("## Potential gaps")
+    lines.append("## IA-2(8) Implementation Statement")
+    lines.append("")
+    lines.append(
+        "The organization collects and reviews GitHub Enterprise Cloud enterprise audit log data to support "
+        "evidence of replay-resistant authentication controls. Authentication to the enterprise is performed "
+        "through the approved GitHub App enterprise installation and associated GitHub enterprise access "
+        "controls. The enterprise audit log is retained and reviewed as part of the organization’s monitoring "
+        "and evidence collection process."
+    )
+    lines.append(
+        "Where authentication-related actions occur within the enterprise boundary, the enterprise audit log "
+        "provides traceability for authentication, token, and administrative events. This evidence is used to "
+        "support review of replay-resistant authentication implementation, monitoring, and auditability."
+    )
+    lines.append("")
+
+    lines.append("## Enterprise Audit Log Control Mapping")
+    lines.append("")
+    lines.append("| Artifact | Controls Supported |")
+    lines.append("|---|---|")
+    for artifact, controls in summarize_control_map(control_map):
+        lines.append(f"| `{artifact}` | {controls} |")
+    lines.append("")
+
+    lines.append("## Review Notes")
+    lines.append("")
     if potential_gaps:
+        lines.append("The following potential gaps were detected during collection:")
+        lines.append("")
         for gap in potential_gaps:
             lines.append(f"- {gap}")
     else:
-        lines.append("- None noted")
+        lines.append(
+            "No collection-time gaps were flagged by the collector. This does not replace a manual review "
+            "of enterprise access configuration, granted permissions, and event interpretation."
+        )
     lines.append("")
 
-    lines.append("## Notes for SSP insertion")
-    lines.append("- IA-2(8): evidence shows GitHub App installation + audit-log collection workflow.")
-    lines.append("- AC-2: organization-level context and installation visibility.")
-    lines.append("- AU-2 / AU-6 / AU-12: audit event capture, review, and retention slice.")
+    lines.append("## Enterprise Audit Log Observations")
     lines.append("")
-
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def build_pdf(run_dir: Path, summary: Dict[str, Any], manifest_entries: List[str]) -> Path:
-    reports_dir = run_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = reports_dir / "ssp_evidence_summary.pdf"
-
-    styles = getSampleStyleSheet()
-    styles.add(
-        ParagraphStyle(
-            name="BodySmall",
-            parent=styles["BodyText"],
-            fontSize=9,
-            leading=12,
-            spaceAfter=6,
-            alignment=TA_LEFT,
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="Section",
-            parent=styles["Heading2"],
-            spaceBefore=10,
-            spaceAfter=6,
-        )
-    )
-
-    story: List[Any] = []
-    story.append(Paragraph("FedRAMP IA-2(8) Evidence Summary", styles["Title"]))
-    story.append(Spacer(1, 0.15 * inch))
-    story.append(Paragraph(f"Organization: {escape(str(summary.get('org', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Collection mode: {escape(str(summary.get('collection_mode', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Collected at: {escape(str(summary.get('collected_at', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Days collected: {escape(str(summary.get('days_collected', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Checkpoint: {escape(str(summary.get('checkpoint_file', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Checkpoint last day: {escape(str(summary.get('checkpoint_last_processed_day', '')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"Archive slice: {escape(str(summary.get('persistent_archive_slice_dir', '')))}", styles["BodySmall"]))
-
-    story.append(Paragraph("Control coverage", styles["Section"]))
-    for control in summary.get("controls_covered", []):
-        story.append(Paragraph(f"• {escape(str(control))}", styles["BodySmall"]))
-
-    story.append(Paragraph("Evidence inventory", styles["Section"]))
-    for item in manifest_entries:
-        story.append(Paragraph(f"• {escape(item)}", styles["BodySmall"]))
-
-    story.append(Paragraph("File-to-control mapping", styles["Section"]))
-    for filename, mapped in summary.get("control_map", {}).items():
-        story.append(Paragraph(f"• {escape(filename)}: {escape(', '.join(mapped))}", styles["BodySmall"]))
-
-    story.append(Paragraph("Key findings", styles["Section"]))
-    story.append(Paragraph(f"• Organization 2FA requirement enabled: {escape(str(summary.get('org_two_factor_requirement_enabled')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"• Audit events collected this run: {escape(str(summary.get('audit_event_count')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"• Auth-related audit events: {escape(str(summary.get('auth_related_event_count')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"• Credential authorizations count: {escape(str(summary.get('credential_authorization_count')))}", styles["BodySmall"]))
-    story.append(Paragraph(f"• Installations count: {escape(str(summary.get('installation_count')))}", styles["BodySmall"]))
-
-    story.append(Paragraph("Potential gaps", styles["Section"]))
-    gaps = summary.get("potential_gaps") or []
-    if gaps:
-        for gap in gaps:
-            story.append(Paragraph(f"• {escape(str(gap))}", styles["BodySmall"]))
+    if audit_rows:
+        sample = audit_rows[:10]
+        lines.append("Representative enterprise audit log events:")
+        lines.append("")
+        lines.append("| created_at | action | actor | org | repo |")
+        lines.append("|---|---|---|---|---|")
+        for row in sample:
+            lines.append(
+                "| {created_at} | {action} | {actor} | {org} | {repo} |".format(
+                    created_at=str(row.get("created_at", ""))[:32],
+                    action=str(row.get("action", ""))[:80].replace("|", "\\|"),
+                    actor=str(row.get("actor", ""))[:80].replace("|", "\\|"),
+                    org=str(row.get("org", ""))[:80].replace("|", "\\|"),
+                    repo=str(row.get("repo", ""))[:80].replace("|", "\\|"),
+                )
+            )
     else:
-        story.append(Paragraph("• None noted", styles["BodySmall"]))
+        lines.append("No enterprise audit log events were available in the collection output.")
+    lines.append("")
 
-    story.append(Paragraph("SSP insertion notes", styles["Section"]))
-    story.append(Paragraph("• IA-2(8): GitHub App installation and audit-log evidence.", styles["BodySmall"]))
-    story.append(Paragraph("• AC-2: organization-level context and installation visibility.", styles["BodySmall"]))
-    story.append(Paragraph("• AU-2 / AU-6 / AU-12: audit event capture, review, and retention slice.", styles["BodySmall"]))
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=letter,
-        rightMargin=0.7 * inch,
-        leftMargin=0.7 * inch,
-        topMargin=0.7 * inch,
-        bottomMargin=0.7 * inch,
+    lines.append("## Reviewer Guidance")
+    lines.append("")
+    lines.append(
+        "For audit review, focus on whether the enterprise installation is valid, the enterprise audit log "
+        "is accessible, and the enterprise audit log contains the expected authentication and administrative "
+        "events required to support IA-2(8) evidence."
     )
-    doc.build(story)
+    lines.append(
+        "If additional proof is needed, pair the enterprise audit log with IdP authentication records to show "
+        "that the enterprise login sequence was preceded by MFA performed at the identity provider."
+    )
+    lines.append("")
 
-    return pdf_path
+    lines.append("## Manifest")
+    lines.append("")
+    lines.append("```text")
+    lines.append(artifacts.manifest_text.rstrip("\n"))
+    lines.append("```")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
-def append_report_index(archive_slice_dir: Path, record: Dict[str, Any]) -> None:
-    index_path = archive_slice_dir.parent.parent.parent.parent / "index.jsonl"
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    with index_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True))
-        f.write("\n")
+def build_plain_text_report(markdown: str) -> str:
+    replacements = [
+        ("**", ""),
+        ("`", ""),
+        ("|", " | "),
+    ]
+    text = markdown
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
 
 
-def sync_directory_to_s3(directory: Path, bucket: str, prefix: str, region: str | None) -> None:
-    try:
-        import boto3  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("boto3 is required for GH_ARCHIVE_S3_BUCKET uploads") from exc
+def write_report_files(artifacts: RunArtifacts, markdown: str) -> Dict[str, str]:
+    md_path = artifacts.reports_dir / "ssp_evidence_summary.md"
+    txt_path = artifacts.reports_dir / "ssp_evidence_summary.txt"
+    meta_path = artifacts.reports_dir / "report_metadata.json"
 
-    client = boto3.client("s3", region_name=region or None)
-    base_prefix = prefix.strip("/")
+    plain_text = build_plain_text_report(markdown)
 
-    for file_path in directory.rglob("*"):
-        if not file_path.is_file():
-            continue
-        rel = file_path.relative_to(directory).as_posix()
-        key = f"{base_prefix}/{rel}" if base_prefix else rel
-        client.upload_file(str(file_path), bucket, key)
+    md_path.write_text(markdown, encoding="utf-8")
+    txt_path.write_text(plain_text, encoding="utf-8")
+
+    meta = {
+        "run_dir": str(artifacts.run_dir),
+        "reports_dir": str(artifacts.reports_dir),
+        "enterprise": first_nonempty(
+            artifacts.summary.get("enterprise"),
+            artifacts.enterprise_installation.get("enterprise"),
+        ),
+        "installation_id": first_nonempty(
+            artifacts.summary.get("installation_id"),
+            artifacts.enterprise_installation.get("installation_id"),
+        ),
+        "collected_at": first_nonempty(
+            artifacts.summary.get("collected_at"),
+            artifacts.enterprise_installation.get("collected_at"),
+        ),
+        "audit_event_count": len(artifacts.audit_rows),
+        "auth_related_event_count": count_auth_related_events(artifacts.audit_rows),
+        "files_written": {
+            "markdown": str(md_path),
+            "text": str(txt_path),
+        },
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    return {
+        "markdown": str(md_path),
+        "text": str(txt_path),
+        "metadata": str(meta_path),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate enterprise-audit-log SSP evidence summary.")
+    parser.add_argument(
+        "--run-dir",
+        required=True,
+        help="Path to the output directory produced by github_enterprise_ia208_collector.py",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run-dir", required=True, help="Collector output directory")
-    args = parser.parse_args()
+    args = parse_args()
+    run_dir = Path(args.run_dir).expanduser().resolve()
 
-    run_dir = Path(args.run_dir).resolve()
-    summary_path = run_dir / "summary.json"
-    manifest_path = run_dir / "manifest.md"
+    if not run_dir.exists():
+        print(f"Run directory does not exist: {run_dir}", file=sys.stderr)
+        return 2
 
-    if not summary_path.exists():
-        print(f"Missing summary.json in {run_dir}", file=sys.stderr)
-        return 1
+    artifacts = load_artifacts(run_dir)
+    markdown = build_markdown_report(artifacts)
+    outputs = write_report_files(artifacts, markdown)
 
-    summary = load_json(summary_path)
-    manifest_entries = read_manifest_entries(manifest_path)
-
-    reports_dir = run_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    markdown_text = build_markdown(summary, manifest_entries)
-    markdown_path = reports_dir / "ssp_evidence_summary.md"
-    markdown_path.write_text(markdown_text, encoding="utf-8")
-
-    pdf_path = build_pdf(run_dir, summary, manifest_entries)
-
-    archive_slice = summary.get("persistent_archive_slice_dir")
-    if archive_slice:
-        archive_slice_dir = Path(str(archive_slice))
-        archive_slice_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(markdown_path, archive_slice_dir / markdown_path.name)
-        shutil.copy2(pdf_path, archive_slice_dir / pdf_path.name)
-
-        archive_index_record = {
-            "run_stamp": summary.get("run_stamp"),
-            "org": summary.get("org"),
-            "run_dir": str(run_dir),
-            "archive_slice_dir": str(archive_slice_dir),
-            "record_type": "report",
-            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "report_files": [markdown_path.name, pdf_path.name],
-        }
-        append_report_index(archive_slice_dir, archive_index_record)
-
-        bucket = os.environ.get("GH_ARCHIVE_S3_BUCKET") or None
-        if bucket:
-            prefix = os.environ.get("GH_ARCHIVE_S3_PREFIX", "irsdigitalservice").strip("/")
-            region = os.environ.get("GH_AWS_REGION") or None
-            sync_directory_to_s3(
-                archive_slice_dir,
-                bucket,
-                f"{prefix}/{archive_slice_dir.as_posix().split('archive/', 1)[-1]}",
-                region,
-            )
-
-    print(str(markdown_path))
-    print(str(pdf_path))
+    print(json.dumps(outputs, indent=2, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
+    import sys
     raise SystemExit(main())
