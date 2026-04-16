@@ -1,204 +1,103 @@
 #!/usr/bin/env python3
-"""FedRAMP IA-2(8) Enterprise Audit Log Evidence Collector"""
+"""
+FedRAMP IA-2(8) Enterprise Audit Log Evidence Collector
+"""
 
 from __future__ import annotations
-
-import csv
-import datetime as dt
-import json
-import os
-import random
-import shutil
-import subprocess
-import sys
-import time
-from dataclasses import dataclass
+import requests, jwt, time, os, json, datetime as dt
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-import jwt
-import requests
-
-
-CONTROL_MAP: Dict[str, List[str]] = {
-    "enterprise_installation.json": ["IA-2(8)", "AC-2"],
-    "enterprise_audit_log.jsonl": ["IA-2(8)", "AU-2", "AU-6", "AU-12"],
-    "enterprise_audit_log.csv": ["IA-2(8)", "AU-2", "AU-6", "AU-12"],
-    "summary.json": ["IA-2(8)", "AC-2", "AU-2"],
-    "control_map.json": ["IA-2(8)", "AC-2", "AU-2"],
-    "manifest.md": ["IA-2(8)"],
-}
-
+from dataclasses import dataclass
+from typing import List, Dict
 
 @dataclass
-class GitHubConfig:
+class Config:
     app_id: str
     private_key: str
     enterprise: str
-    api_url: str = "https://api.github.com"
-    api_version: str = "2022-11-28"
-    days: int = 90
+    api: str = "https://api.github.com"
+    version: str = "2022-11-28"
+    days: int = 30
 
-
-def utc_now() -> dt.datetime:
+def now():
     return dt.datetime.now(dt.timezone.utc)
 
+def jwt_token(cfg):
+    payload = {"iat": int(time.time()) - 60, "exp": int(time.time()) + 600, "iss": cfg.app_id}
+    return jwt.encode(payload, cfg.private_key, algorithm="RS256")
 
-def normalize_audit_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "created_at": event.get("created_at"),
-        "action": event.get("action"),
-        "actor": event.get("actor"),
-        "org": event.get("org"),
-        "repo": event.get("repo"),
-        "raw": event,
+def gh_request(cfg, method, path, token=None, params=None):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": cfg.version,
     }
+    headers["Authorization"] = f"Bearer {token}" if token else f"Bearer {jwt_token(cfg)}"
+    r = requests.request(method, cfg.api + path, headers=headers, params=params)
+    return r
 
+def get_installation_id(cfg):
+    installs = gh_request(cfg, "GET", "/app/installations").json()
+    for i in installs:
+        if str(i.get("target_type","")).lower() == "enterprise":
+            return i["id"]
+    raise Exception("No enterprise installation found")
 
-def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def get_installation_token(cfg, inst_id):
+    r = gh_request(cfg, "POST", f"/app/installations/{inst_id}/access_tokens")
+    return r.json()["token"]
 
-
-def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    with path.open("w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
-
-
-def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    if not rows:
+def preflight(cfg, token):
+    r = gh_request(cfg, "GET", f"/enterprises/{cfg.enterprise}/audit-log",
+                   token, {"per_page":1})
+    if r.status_code == 200:
         return
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
+    raise Exception(f"Preflight failed: {r.text}")
 
+def collect(cfg):
+    inst = get_installation_id(cfg)
+    token = get_installation_token(cfg, inst)
 
-class GitHubAppAuthenticator:
-    def __init__(self, cfg: GitHubConfig):
-        self.cfg = cfg
+    preflight(cfg, token)
 
-    def jwt_token(self) -> str:
-        now = int(time.time())
-        payload = {"iat": now - 60, "exp": now + 600, "iss": self.cfg.app_id}
-        return jwt.encode(payload, self.cfg.private_key, algorithm="RS256")
-
-    def headers(self):
-        return {
-            "Authorization": f"Bearer {self.jwt_token()}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": self.cfg.api_version,
-        }
-
-    def get(self, path):
-        return requests.get(self.cfg.api_url + path, headers=self.headers())
-
-    def paginate(self, path):
-        page = 1
-        while True:
-            r = requests.get(
-                self.cfg.api_url + path,
-                headers=self.headers(),
-                params={"per_page": 100, "page": page},
-            )
-            if r.status_code >= 400:
-                raise RuntimeError(r.text)
-            data = r.json()
-            if not data:
-                break
-            for item in data:
-                yield item
-            if 'rel="next"' not in r.headers.get("Link", ""):
-                break
-            page += 1
-
-    def get_installation_id(self) -> int:
-        installations = list(self.paginate("/app/installations"))
-
-        enterprise_installs = [
-            i for i in installations
-            if str(i.get("target_type", "")).lower() == "enterprise"
-        ]
-
-        if len(enterprise_installs) == 1:
-            return enterprise_installs[0]["id"]
-
-        raise RuntimeError(f"No enterprise installation found. Visible: {installations}")
-
-    def get_installation_token(self, installation_id: int) -> str:
-        r = requests.post(
-            f"{self.cfg.api_url}/app/installations/{installation_id}/access_tokens",
-            headers=self.headers(),
-        )
-        if r.status_code >= 400:
-            raise RuntimeError(r.text)
-        return r.json()["token"]
-
-
-class GitHubClient:
-    def __init__(self, cfg: GitHubConfig, token: str):
-        self.cfg = cfg
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-        }
-
-    def get(self, path, params=None):
-        r = requests.get(self.cfg.api_url + path, headers=self.headers, params=params)
-        if r.status_code >= 400:
-            raise RuntimeError(r.text)
-        return r.json()
-
-
-def collect(cfg: GitHubConfig) -> Path:
-    auth = GitHubAppAuthenticator(cfg)
-    inst_id = auth.get_installation_id()
-    token = auth.get_installation_token(inst_id)
-
-    client = GitHubClient(cfg, token)
-
-    output = Path(f"enterprise_evidence_{int(time.time())}")
-    output.mkdir()
-
-    events = []
-    today = utc_now().date()
+    events: List[Dict] = []
+    today = now().date()
 
     for i in range(cfg.days):
         day = today - dt.timedelta(days=i)
-        data = client.get(
+        r = gh_request(
+            cfg,
+            "GET",
             f"/enterprises/{cfg.enterprise}/audit-log",
-            params={"phrase": f"created:{day}..{day}"},
+            token,
+            {"phrase": f"created:{day}..{day}", "per_page": 100}
         )
-        for e in data:
-            events.append(normalize_audit_event(e))
+        if r.status_code != 200:
+            raise Exception(r.text)
+        events.extend(r.json())
 
-    write_jsonl(output / "enterprise_audit_log.jsonl", events)
-    write_csv(output / "enterprise_audit_log.csv", events)
+    out = Path("artifacts")
+    out.mkdir(exist_ok=True)
 
-    write_json(output / "enterprise_installation.json", {"installation_id": inst_id})
+    (out / "enterprise_audit_log.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events)
+    )
 
-    summary = {
+    (out / "summary.json").write_text(json.dumps({
         "enterprise": cfg.enterprise,
-        "event_count": len(events),
-        "collected_at": utc_now().isoformat(),
-    }
-    write_json(output / "summary.json", summary)
+        "count": len(events),
+        "collected": now().isoformat()
+    }, indent=2))
 
-    return output
-
+    return out
 
 def main():
-    cfg = GitHubConfig(
+    cfg = Config(
         app_id=os.environ["GH_APP_ID"],
         private_key=os.environ["GH_APP_PRIVATE_KEY"],
         enterprise=os.environ["GH_ENTERPRISE"],
-        days=int(os.environ.get("GH_DAYS", "90")),
+        days=int(os.environ.get("SINCE_DAYS", "30")),
     )
-
     out = collect(cfg)
     print(out)
-
 
 if __name__ == "__main__":
     main()
