@@ -7,8 +7,8 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "scripts/ia_compliance_enterprise.py"
-      - ".github/workflows/ia_compliance_enterprise.yml"
+      - "scripts/ia11_compliance_enterprise.py"
+      - ".github/workflows/ia11_compliance_enterprise.yml"
       - "evidence/**"
 
 jobs:
@@ -35,8 +35,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify required inputs
+        run: |
+          if [ -z "$GH_ENTERPRISE" ]; then
+            echo "GH_ENTERPRISE secret is missing."
+            exit 1
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GH_TOKEN secret is missing."
+            exit 1
+          fi
+
       - name: Run IA enterprise evidence collector
-        run: python scripts/ia_compliance_enterprise.py
+        run: python scripts/ia11_compliance_enterprise.py
 
       - name: Upload evidence artifacts
         uses: actions/upload-artifact@v4
@@ -53,3 +64,4 @@ jobs:
             cat artifacts/ia_enterprise_report.md >> "$GITHUB_STEP_SUMMARY"
           else
             echo "IA enterprise report not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
