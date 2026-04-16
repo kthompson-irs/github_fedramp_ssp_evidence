@@ -1,4 +1,4 @@
-name: IA-11 FedRAMP Enterprise Evidence Check
+name: IA FedRAMP Enterprise Evidence Check
 
 on:
   workflow_dispatch:
@@ -18,10 +18,12 @@ jobs:
 
     env:
       GH_ENTERPRISE: ${{ secrets.GH_ENTERPRISE }}
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
       GH_API_URL: https://api.github.com
       OUTPUT_DIR: artifacts
       SINCE_DAYS: "30"
+      PAGE_SIZE: "100"
+      MAX_PAGES: "10"
       IDP_POLICY_FILE: evidence/idp/idp_policy.json
       ENTERPRISE_SECURITY_FILE: evidence/github/enterprise_security.json
       MANUAL_EVIDENCE_DIR: evidence/manual
@@ -41,8 +43,8 @@ jobs:
             echo "GH_ENTERPRISE secret is missing."
             exit 1
           fi
-          if [ -z "$GH_TOKEN" ]; then
-            echo "GH_TOKEN secret is missing."
+          if [ -z "$GH_ENTERPRISE_TOKEN" ]; then
+            echo "GH_ENTERPRISE_TOKEN secret is missing."
             exit 1
           fi
 
