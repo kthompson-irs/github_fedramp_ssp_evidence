@@ -1,14 +1,10 @@
-name: FedRAMP IA-2(8) Evidence Collection
+name: FedRAMP IA-2(8) Enterprise Evidence Collection
 
 on:
   workflow_dispatch:
     inputs:
-      gh_org:
-        description: "GitHub organization login"
-        required: false
-        type: string
       gh_enterprise:
-        description: "Enterprise slug for optional reporting"
+        description: "Enterprise slug for audit-log collection"
         required: false
         type: string
       gh_days:
@@ -40,10 +36,9 @@ jobs:
     env:
       GH_APP_ID: ${{ secrets.GH_APP_ID }}
       GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-      GH_ORG: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_org || vars.GH_ORG }}
+      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
       GH_API_URL: https://api.github.com
       GH_API_VERSION: 2022-11-28
-      GH_ENTERPRISE: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_enterprise || vars.GH_ENTERPRISE }}
       GH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_days || vars.GH_DAYS || '90' }}
       GH_AUDIT_WINDOW_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_audit_window_days || vars.GH_AUDIT_WINDOW_DAYS || '1' }}
       GH_MAX_WINDOWS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.gh_max_windows_per_run || vars.GH_MAX_WINDOWS_PER_RUN || '7' }}
@@ -53,11 +48,11 @@ jobs:
       GH_MAX_RETRIES: ${{ vars.GH_MAX_RETRIES || '5' }}
       GH_MAX_RATE_LIMIT_SLEEP_SECONDS: ${{ vars.GH_MAX_RATE_LIMIT_SLEEP_SECONDS || '3600' }}
       GH_MAX_SERVER_SLEEP_SECONDS: ${{ vars.GH_MAX_SERVER_SLEEP_SECONDS || '300' }}
-      GH_CHECKPOINT_FILE: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
+      GH_CHECKPOINT_FILE: .github/evidence_state/checkpoints/enterprise_audit_checkpoint.json
       GH_ARCHIVE_ROOT: evidence/archive
       GH_AUTO_PUSH_CHECKPOINT: "1"
       GH_ARCHIVE_S3_BUCKET: ${{ vars.GH_ARCHIVE_S3_BUCKET }}
-      GH_ARCHIVE_S3_PREFIX: ${{ vars.GH_ARCHIVE_S3_PREFIX || 'irsdigitalservice' }}
+      GH_ARCHIVE_S3_PREFIX: ${{ vars.GH_ARCHIVE_S3_PREFIX || 'github-enterprise' }}
       GH_AWS_REGION: ${{ vars.GH_AWS_REGION }}
 
     steps:
@@ -87,13 +82,13 @@ jobs:
         run: |
           test -n "$GH_APP_ID"
           test -n "$GH_APP_PRIVATE_KEY"
-          test -n "$GH_ORG"
+          test -n "$GH_ENTERPRISE"
 
       - name: Run collector
         id: run_collector
         run: |
           set -euo pipefail
-          output_dir="$(python fedramp_ia208_evidence.py)"
+          output_dir="$(python github_enterprise_ia208_collector.py)"
           echo "output_dir=$output_dir" >> "$GITHUB_OUTPUT"
 
       - name: Generate SSP report
@@ -105,9 +100,9 @@ jobs:
         if: always()
         run: |
           {
-            echo "## FedRAMP IA-2(8) evidence collection"
+            echo "## FedRAMP IA-2(8) enterprise evidence collection"
             echo
-            echo "Organization: $GH_ORG"
+            echo "Enterprise: $GH_ENTERPRISE"
             echo "Days collected: $GH_DAYS"
             echo "Audit window days: $GH_AUDIT_WINDOW_DAYS"
             echo "Max windows per run: $GH_MAX_WINDOWS_PER_RUN"
@@ -115,10 +110,10 @@ jobs:
             echo "Archive root: $GH_ARCHIVE_ROOT"
             echo "Output directory: ${{ steps.run_collector.outputs.output_dir }}"
             echo
-            if [ -f "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md" ]; then
-              echo "### SSP-ready Markdown"
+            if [ -f "${{ steps.run_collector.outputs.output_dir }}/manifest.md" ]; then
+              echo "### Manifest"
               echo '```'
-              cat "${{ steps.run_collector.outputs.output_dir }}/reports/ssp_evidence_summary.md"
+              cat "${{ steps.run_collector.outputs.output_dir }}/manifest.md"
               echo '```'
             fi
             if [ -f "${{ steps.run_collector.outputs.output_dir }}/summary.json" ]; then
@@ -133,16 +128,16 @@ jobs:
         if: always() && steps.run_collector.outputs.output_dir != ''
         uses: actions/upload-artifact@v4
         with:
-          name: fedramp-ia208-evidence
+          name: fedramp-ia208-enterprise-evidence
           path: ${{ steps.run_collector.outputs.output_dir }}
           if-no-files-found: error
 
       - name: Upload checkpoint artifact
-        if: always() && hashFiles('.github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json') != ''
+        if: always() && hashFiles('.github/evidence_state/checkpoints/enterprise_audit_checkpoint.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: fedramp-ia208-checkpoint
-          path: .github/evidence_state/checkpoints/irsdigitalservice_audit_checkpoint.json
+          name: fedramp-ia208-enterprise-checkpoint
+          path: .github/evidence_state/checkpoints/enterprise_audit_checkpoint.json
           if-no-files-found: error
 
       - name: Commit updated checkpoint
@@ -152,7 +147,7 @@ jobs:
           if [ -f "$GH_CHECKPOINT_FILE" ]; then
             if ! git diff --quiet -- "$GH_CHECKPOINT_FILE"; then
               git add "$GH_CHECKPOINT_FILE"
-              git commit -m "Update audit checkpoint" || true
+              git commit -m "Update enterprise audit checkpoint" || true
               git push || true
             fi
           fi
