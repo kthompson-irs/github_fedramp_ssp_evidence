@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
-import csv, json, os, argparse
+import csv
 from pathlib import Path
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path)
-    parser.add_argument("--output", type=Path, default="data/terminations.csv")
-    args = parser.parse_args()
+    src = Path("data/terminations_source.csv")
+    dst = Path("data/terminations.csv")
 
-    rows = []
+    if not src.exists():
+        raise SystemExit("Missing source CSV")
 
-    if args.source and args.source.exists():
-        with args.source.open() as f:
-            rows = list(csv.DictReader(f))
-    else:
-        raw = os.getenv("TERMINATIONS_JSON", "")
-        if raw:
-            rows = json.loads(raw)
+    rows = list(csv.DictReader(src.open()))
 
     if not rows:
-        raise SystemExit("No termination data")
+        raise SystemExit("No termination rows")
 
-    args.output.parent.mkdir(exist_ok=True)
-
-    with args.output.open("w", newline="") as f:
+    with dst.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
