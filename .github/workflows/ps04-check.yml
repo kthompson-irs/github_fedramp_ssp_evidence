@@ -98,6 +98,7 @@ EOF
           pip install requests
 
       - name: Build data/terminations.csv
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -113,9 +114,11 @@ EOF
           fi
 
       - name: Verify populated termination file
+        shell: bash
         run: |
           python - <<'PY'
-          import csv, sys
+          import csv
+          import sys
           from pathlib import Path
 
           path = Path("data/terminations.csv")
@@ -123,7 +126,9 @@ EOF
               print("data/terminations.csv was not created", file=sys.stderr)
               sys.exit(1)
 
-          rows = list(csv.DictReader(path.open()))
+          with path.open(newline="", encoding="utf-8") as fh:
+              rows = list(csv.DictReader(fh))
+
           if not rows:
               print("data/terminations.csv contains no data rows", file=sys.stderr)
               sys.exit(1)
@@ -132,6 +137,7 @@ EOF
           PY
 
       - name: Run PS-04 verification script
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -149,6 +155,7 @@ EOF
           fi
 
       - name: Display report summary
+        shell: bash
         run: |
           echo "==== PS-04 REPORT ===="
           cat "$OUTPUT_FILE"
