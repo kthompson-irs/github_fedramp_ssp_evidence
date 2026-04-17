@@ -1,126 +1,76 @@
-name: FedRAMP PS-04 GitHub Offboarding Verification
+name: PS-04 Real-Time Evidence Pipeline
 
 on:
-  workflow_dispatch:
-    inputs:
-      sla_minutes:
-        description: "PS-04 SLA in minutes"
-        required: false
-        default: "60"
-      terminations_json:
-        description: "Inline JSON array used to build data/terminations.csv"
-        required: false
-        default: ""
-      terminations_source:
-        description: "Optional source file path"
-        required: false
-        default: "data/terminations_source.csv"
-      enterprise_audit_log_file:
-        description: "Enterprise audit log file"
-        required: false
-        default: ""
-      security_log_file:
-        description: "Security log file"
-        required: false
-        default: ""
-      scim_log_file:
-        description: "SCIM log file"
-        required: false
-        default: ""
-
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  ps04-check:
+  ps04:
     runs-on: ubuntu-22.04
 
     env:
-      BUILD_SCRIPT: scripts/build_terminations_csv.py
-      CHECK_SCRIPT: scripts/github_ps04_checker.py
+      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
+      GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
 
-      TERMINATIONS_FILE: data/terminations.csv
-      TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
-      TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
+      OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
+      OKTA_TOKEN: ${{ secrets.OKTA_TOKEN }}
 
-      #ENTERPRISE_AUDIT_LOG_FILE: ${{ github.event.inputs.enterprise_audit_log_file || '' }}
-      #SECURITY_LOG_FILE: ${{ github.event.inputs.security_log_file || '' }}
-      #SCIM_LOG_FILE: ${{ github.event.inputs.scim_log_file || '' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
 
-      ENTERPRISE_AUDIT_LOG_FILE: data/enterprise_audit_log.json
-      SCIM_LOG_FILE: data/scim_log.json
-      SECURITY_LOG_FILE: data/security_log.json
-
-      OUTPUT_FILE: ps04_report.json
-      SLA_MINUTES: ${{ github.event.inputs.sla_minutes || '60' }}
+      SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
+      SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Precheck
-        run: |
-          set -euo pipefail
-          test -f "$BUILD_SCRIPT" || exit 1
-          test -f "$CHECK_SCRIPT" || exit 1
-          mkdir -p data
-
-          if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
-            echo "Missing termination source"
-            exit 1
-          fi
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11.8"
+          python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests==2.31.0
+        run: |
+          pip install requests boto3
 
+      # 🔹 Pull real evidence
+      - name: Fetch GitHub audit logs
+        run: python scripts/fetch_github_audit_logs.py
+
+      - name: Fetch SCIM events
+        run: python scripts/fetch_scim_events.py
+
+      # 🔹 Build termination dataset
       - name: Build dataset
         run: |
-          set -euo pipefail
+          python scripts/build_terminations_csv.py \
+            --source data/terminations_source.csv \
+            --output data/terminations.csv
 
-          if [ -n "${TERMINATIONS_JSON:-}" ]; then
-            python "$BUILD_SCRIPT" \
-              --output "$TERMINATIONS_FILE"
-          else
-            python "$BUILD_SCRIPT" \
-              --source "$TERMINATIONS_SOURCE" \
-              --output "$TERMINATIONS_FILE"
-          fi
-
-      - name: Run PS-04 checker (fixed)
+      # 🔹 Run compliance check
+      - name: Run PS-04 check
         run: |
-          set -euo pipefail
-
-          CMD="python $CHECK_SCRIPT \
-            --terminations $TERMINATIONS_FILE \
-            --sla-minutes $SLA_MINUTES \
+          python scripts/github_ps04_checker.py \
+            --terminations data/terminations.csv \
+            --enterprise-audit-log data/enterprise_audit_log.json \
+            --scim-log data/scim_log.json \
             --fail-on-gaps \
-            --output $OUTPUT_FILE"
+            --output ps04_report.json
 
-          if [ -n "${ENTERPRISE_AUDIT_LOG_FILE:-}" ] && [ -f "$ENTERPRISE_AUDIT_LOG_FILE" ]; then
-            CMD="$CMD --enterprise-audit-log $ENTERPRISE_AUDIT_LOG_FILE"
-          fi
+      # 🔹 Evidence storage
+      - name: Upload to S3 (immutable)
+        run: python scripts/push_to_s3.py
 
-          if [ -n "${SECURITY_LOG_FILE:-}" ] && [ -f "$SECURITY_LOG_FILE" ]; then
-            CMD="$CMD --security-log $SECURITY_LOG_FILE"
-          fi
+      # 🔹 SIEM
+      - name: Send to Splunk
+        run: bash scripts/send_to_splunk.sh
 
-          if [ -n "${SCIM_LOG_FILE:-}" ] && [ -f "$SCIM_LOG_FILE" ]; then
-            CMD="$CMD --scim-log $SCIM_LOG_FILE"
-          fi
-
-          echo "$CMD"
-          eval $CMD
-
-      - name: Show report
-        run: cat "$OUTPUT_FILE"
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
