@@ -4,11 +4,16 @@ Build data/terminations.csv from either:
 - a source file (.csv, .json, .jsonl), or
 - the TERMINATIONS_JSON environment variable containing a JSON array.
 
+Each row must declare its evidence source explicitly so the checker can route
+the record to the correct feed.
+
 Expected row fields:
 - employee_id
 - github_identity
 - termination_time_utc
 - identity_model
+- evidence_source
+- expected_actions
 - deadline_minutes
 """
 
@@ -21,15 +26,23 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 FIELDNAMES = [
     "employee_id",
     "github_identity",
     "termination_time_utc",
     "identity_model",
+    "evidence_source",
+    "expected_actions",
     "deadline_minutes",
 ]
+
+VALID_EVIDENCE_SOURCES = {
+    "enterprise_audit_log",
+    "security_log",
+    "scim_log",
+}
 
 
 def parse_utc_datetime(value: str) -> datetime:
@@ -66,6 +79,34 @@ def normalize_identity_model(value: str) -> str:
     return "personal"
 
 
+def normalize_evidence_source(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v not in VALID_EVIDENCE_SOURCES:
+        raise ValueError(
+            f"invalid evidence_source={value!r}; expected one of {sorted(VALID_EVIDENCE_SOURCES)}"
+        )
+    return v
+
+
+def parse_expected_actions(value: str, evidence_source: str) -> List[str]:
+    raw = (value or "").strip()
+    if raw:
+        parts = [p.strip() for p in raw.replace(",", "|").replace(";", "|").split("|")]
+        actions = [p for p in parts if p]
+        if actions:
+            return actions
+
+    if evidence_source == "enterprise_audit_log":
+        return ["business.remove_member", "org.remove_member"]
+    if evidence_source == "scim_log":
+        return ["external_identity.deprovision"]
+
+    raise ValueError(
+        "expected_actions is required for security_log rows; "
+        "provide a pipe-delimited list of actions for that feed"
+    )
+
+
 def normalize_deadline_minutes(value: str, default: int) -> int:
     raw = (value or "").strip()
     if not raw:
@@ -87,13 +128,17 @@ def normalize_record(row: Dict[str, Any], default_deadline_minutes: int) -> Dict
 
     employee_id = row_get(row, "employee_id", "id", default="")
     identity_model = normalize_identity_model(row_get(row, "identity_model", default="personal"))
+    evidence_source = normalize_evidence_source(row_get(row, "evidence_source", default=""))
     deadline_minutes = normalize_deadline_minutes(row_get(row, "deadline_minutes", default=""), default_deadline_minutes)
+    expected_actions = parse_expected_actions(row_get(row, "expected_actions", default=""), evidence_source)
 
     return {
         "employee_id": employee_id,
         "github_identity": github_identity,
         "termination_time_utc": format_utc(parse_utc_datetime(termination_time_raw)),
         "identity_model": identity_model,
+        "evidence_source": evidence_source,
+        "expected_actions": "|".join(expected_actions),
         "deadline_minutes": str(deadline_minutes),
     }
 
@@ -140,12 +185,13 @@ def load_rows(source: Optional[Path], json_env_var: str) -> List[Dict[str, Any]]
     raise SystemExit(f"Unsupported source type: {source.suffix}. Use .csv, .json, or .jsonl")
 
 
-def write_csv(rows: List[Dict[str, str]], output: Path) -> None:
+def write_csv(rows: Iterable[Dict[str, str]], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow(row)
 
 
 def main() -> int:
@@ -168,7 +214,6 @@ def main() -> int:
         default="TERMINATIONS_JSON",
         help="Environment variable containing a JSON array of rows.",
     )
-    parser.add_argument("--allow-empty", action="store_true", help="Allow writing only the header row.")
     args = parser.parse_args()
 
     source_rows = load_rows(args.source, args.json_env)
@@ -187,8 +232,8 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    if not normalized_rows and not args.allow_empty:
-        print("ERROR: no termination rows found; refusing to write an empty file", file=sys.stderr)
+    if not normalized_rows:
+        print("ERROR: no termination rows found", file=sys.stderr)
         return 1
 
     write_csv(normalized_rows, args.output)
