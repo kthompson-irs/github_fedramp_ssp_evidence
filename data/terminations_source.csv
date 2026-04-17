@@ -1,0 +1,4 @@
+employee_id,github_identity,termination_time_utc,identity_model,deadline_minutes
+1001,jdoe,2026-04-17T18:30:00Z,personal,60
+1002,asmith,2026-04-17T19:00:00Z,emu,60
+1003,bwilliams,2026-04-17T20:15:00Z,personal,60
