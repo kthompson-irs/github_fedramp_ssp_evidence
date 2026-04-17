@@ -105,22 +105,24 @@ def validate_ia11():
 
     return "PASS"
 
-def main():
-    preflight()
-
-    ia11_status = validate_ia11()
-
+def write_report(status):
     os.makedirs(OUTPUT, exist_ok=True)
-
     report = {
         "enterprise": ENTERPRISE,
         "timestamp": dt.datetime.utcnow().isoformat(),
-        "ia11_status": ia11_status,
+        "ia11_status": status
     }
-
     with open(f"{OUTPUT}/ia_enterprise_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+    with open(f"{OUTPUT}/ia_enterprise_report.md", "w", encoding="utf-8") as f:
+        f.write("# IA-11 Enterprise Report\n\n")
+        f.write(f"Enterprise: `{ENTERPRISE}`\n\n")
+        f.write(f"Status: **{status}**\n")
 
+def main():
+    preflight()
+    ia11_status = validate_ia11()
+    write_report(ia11_status)
     print("\n=== FINAL STATUS ===")
     print(ia11_status)
 
