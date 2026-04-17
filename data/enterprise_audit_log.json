@@ -1,7 +1,6 @@
 [
   {
     "action": "org.remove_member",
-    "actor": "admin",
     "user": "jdoe",
     "created_at": "2026-04-17T18:45:00Z"
   }
