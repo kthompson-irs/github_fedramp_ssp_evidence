@@ -46,9 +46,13 @@ jobs:
       TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
       TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
 
-      ENTERPRISE_AUDIT_LOG_FILE: ${{ github.event.inputs.enterprise_audit_log_file || '' }}
-      SECURITY_LOG_FILE: ${{ github.event.inputs.security_log_file || '' }}
-      SCIM_LOG_FILE: ${{ github.event.inputs.scim_log_file || '' }}
+      #ENTERPRISE_AUDIT_LOG_FILE: ${{ github.event.inputs.enterprise_audit_log_file || '' }}
+      #SECURITY_LOG_FILE: ${{ github.event.inputs.security_log_file || '' }}
+      #SCIM_LOG_FILE: ${{ github.event.inputs.scim_log_file || '' }}
+
+      ENTERPRISE_AUDIT_LOG_FILE: data/enterprise_audit_log.json
+      SCIM_LOG_FILE: data/scim_log.json
+      SECURITY_LOG_FILE: data/security_log.json
 
       OUTPUT_FILE: ps04_report.json
       SLA_MINUTES: ${{ github.event.inputs.sla_minutes || '60' }}
