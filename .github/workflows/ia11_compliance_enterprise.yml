@@ -1,4 +1,4 @@
-name: IA-11 FedRAMP Enterprise Evidence Check
+name: IA FedRAMP Enterprise Evidence Check
 
 on:
   workflow_dispatch:
@@ -16,8 +16,6 @@ jobs:
       GH_API_URL: https://api.github.com
       OUTPUT_DIR: artifacts
       SINCE_DAYS: "30"
-      PAGE_SIZE: "100"
-      MAX_PAGES: "10"
       IDP_POLICY_FILE: evidence/idp/idp_policy.json
       ENTERPRISE_SECURITY_FILE: evidence/github/enterprise_security.json
       MANUAL_EVIDENCE_DIR: evidence/manual
@@ -31,8 +29,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 🔍 FULL DIAGNOSTIC PREFLIGHT
-      - name: Preflight - Identify token + enterprise access
+      - name: Preflight - identify token and enterprise audit-log access
         run: |
           python - <<'PY'
           import os, json
@@ -49,31 +46,41 @@ jobs:
                   headers={
                       "Authorization": f"Bearer {token}",
                       "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
                   },
               )
               try:
                   with urlopen(req) as r:
-                      return r.status, json.loads(r.read().decode())
+                      body = r.read().decode()
+                      try:
+                          return r.status, json.loads(body)
+                      except Exception:
+                          return r.status, body
               except HTTPError as e:
+                  raw = e.read().decode(errors="replace")
                   try:
-                      return e.code, json.loads(e.read().decode())
-                  except:
-                      return e.code, {"raw": str(e)}
+                      return e.code, json.loads(raw)
+                  except Exception:
+                      return e.code, raw
 
-          print("\n=== AUTHENTICATED USER ===")
+          print("=== AUTHENTICATED USER ===")
           status, user = call("/user")
           print("Status:", status)
-          print(json.dumps(user, indent=2))
-
-          print("\n=== ENTERPRISE METADATA ===")
-          status, ent = call(f"/enterprises/{enterprise}")
-          print("Status:", status)
-          print(json.dumps(ent, indent=2))
+          print(json.dumps(user, indent=2) if isinstance(user, dict) else user)
 
           print("\n=== ENTERPRISE AUDIT LOG TEST ===")
-          status, logs = call(f"/enterprises/{enterprise}/audit-log?per_page=1")
+          status, logs = call(f"/enterprises/{enterprise}/audit-log?per_page=1&include=all&order=desc")
           print("Status:", status)
-          print(json.dumps(logs, indent=2)[:1000])
+          print(json.dumps(logs, indent=2) if isinstance(logs, (dict, list)) else logs)
+
+          if status == 200:
+              print("\nAudit log access confirmed")
+          elif status == 404:
+              print("\n404 means the token user cannot access this enterprise audit log")
+          elif status == 403:
+              print("\n403 means the token is missing audit_log permission or SSO authorization")
+          else:
+              print(f"\nUnexpected audit log status: {status}")
           PY
 
       - name: Run IA enterprise compliance
