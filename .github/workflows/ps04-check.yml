@@ -67,10 +67,8 @@ jobs:
 
           mkdir -p data
 
-          # ✅ AUTO-CREATE TEMPLATE IF NOTHING PROVIDED
           if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
             echo "No termination source found. Creating default template at $TERMINATIONS_SOURCE"
-
             cat > "$TERMINATIONS_SOURCE" <<'EOF'
 employee_id,github_identity,termination_time_utc,identity_model,deadline_minutes
 1001,jdoe,2026-01-01T00:00:00Z,personal,60
@@ -150,8 +148,14 @@ EOF
               --output "$OUTPUT_FILE"
           fi
 
+      - name: Display report summary
+        run: |
+          echo "==== PS-04 REPORT ===="
+          cat "$OUTPUT_FILE"
+
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
+          retention-days: 30
