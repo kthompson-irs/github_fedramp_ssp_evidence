@@ -11,9 +11,16 @@ on:
         description: "Max audit log pages to query"
         required: false
         default: "10"
+      terminations_file:
+        description: "Path to the termination CSV in the repo"
+        required: false
+        default: "data/terminations.csv"
+      audit_log_file:
+        description: "Optional local GitHub audit log export path; leave blank to query the GitHub API"
+        required: false
+        default: ""
 
   schedule:
-    # Run every hour to continuously validate compliance
     - cron: "0 * * * *"
 
 permissions:
@@ -26,17 +33,21 @@ jobs:
 
     env:
       PYTHON_SCRIPT: scripts/github_ps04_checker.py
-      TERMINATIONS_FILE: data/terminations.csv
+      TERMINATIONS_FILE: ${{ github.event.inputs.terminations_file || 'data/terminations.csv' }}
+      AUDIT_LOG_FILE: ${{ github.event.inputs.audit_log_file || '' }}
       OUTPUT_FILE: ps04_report.json
       ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
-      GITHUB_TOKEN: ${{ secrets.GITHUB_AUDIT_TOKEN }}
+      GITHUB_AUDIT_TOKEN: ${{ secrets.GITHUB_AUDIT_TOKEN }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required files exist
+      - name: Preflight checks
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ ! -f "$PYTHON_SCRIPT" ]; then
             echo "Missing Python script at $PYTHON_SCRIPT"
             exit 1
@@ -44,6 +55,17 @@ jobs:
 
           if [ ! -f "$TERMINATIONS_FILE" ]; then
             echo "Missing termination file at $TERMINATIONS_FILE"
+            echo "Commit the CSV to the repo, update the workflow input, or download it earlier in the job."
+            exit 1
+          fi
+
+          if [ -z "${ENTERPRISE_SLUG:-}" ] && [ -z "${AUDIT_LOG_FILE:-}" ]; then
+            echo "Missing GH_ENTERPRISE_SLUG secret, and no local audit log was provided."
+            exit 1
+          fi
+
+          if [ -z "${GITHUB_AUDIT_TOKEN:-}" ] && [ -z "${AUDIT_LOG_FILE:-}" ]; then
+            echo "Missing GITHUB_AUDIT_TOKEN secret for API mode."
             exit 1
           fi
 
@@ -53,40 +75,47 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
       - name: Run PS-04 verification script
+        shell: bash
         run: |
-          python "$PYTHON_SCRIPT" \
-            --terminations "$TERMINATIONS_FILE" \
-            --enterprise "$ENTERPRISE_SLUG" \
-            --token "$GITHUB_TOKEN" \
-            --sla-minutes "${{ github.event.inputs.sla_minutes || '60' }}" \
-            --max-pages "${{ github.event.inputs.max_pages || '10' }}" \
-            --fail-on-gaps \
-            --output "$OUTPUT_FILE"
+          set -euo pipefail
+
+          SLA_MINUTES="${{ github.event.inputs.sla_minutes || '60' }}"
+          MAX_PAGES="${{ github.event.inputs.max_pages || '10' }}"
+
+          if [ -n "${AUDIT_LOG_FILE:-}" ]; then
+            python "$PYTHON_SCRIPT" \
+              --terminations "$TERMINATIONS_FILE" \
+              --audit-log "$AUDIT_LOG_FILE" \
+              --sla-minutes "$SLA_MINUTES" \
+              --fail-on-gaps \
+              --output "$OUTPUT_FILE"
+          else
+            python "$PYTHON_SCRIPT" \
+              --terminations "$TERMINATIONS_FILE" \
+              --enterprise "$ENTERPRISE_SLUG" \
+              --token "$GITHUB_AUDIT_TOKEN" \
+              --max-pages "$MAX_PAGES" \
+              --sla-minutes "$SLA_MINUTES" \
+              --fail-on-gaps \
+              --output "$OUTPUT_FILE"
+          fi
+
+      - name: Display report summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==== PS-04 REPORT ===="
+          cat "$OUTPUT_FILE"
 
       - name: Upload compliance report artifact
         uses: actions/upload-artifact@v4
         with:
           name: ps04-report
-          path: ${{ env.OUTPUT_FILE }}
-
-      - name: Display report summary
-        run: |
-          echo "==== PS-04 REPORT ===="
-          cat "$OUTPUT_FILE"
-
-      - name: Fail if gaps detected (explicit check)
-        run: |
-          GAP_COUNT=$(jq '.summary.gap_records' "$OUTPUT_FILE")
-          echo "Gap count: $GAP_COUNT"
-
-          if [ "$GAP_COUNT" -gt 0 ]; then
-            echo "PS-04 NON-COMPLIANT: gaps detected"
-            exit 1
-          else
-            echo "PS-04 compliant"
-          fi
+          path: ps04_report.json
+          retention-days: 30
