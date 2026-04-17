@@ -12,9 +12,13 @@ on:
         required: false
         default: "10"
       terminations_json:
-        description: "Inline JSON array used to create data/terminations_source.csv"
+        description: "Inline JSON array used to build data/terminations.csv"
         required: false
         default: ""
+      terminations_source:
+        description: "Optional source file path used to build data/terminations.csv"
+        required: false
+        default: "data/terminations_source.csv"
       audit_log_file:
         description: "Optional local GitHub audit log export path; leave blank to query the GitHub API"
         required: false
@@ -32,16 +36,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      POPULATE_SOURCE_SCRIPT: scripts/create_terminations_source.py
-      POPULATE_SCRIPT: scripts/populate_terminations_csv.py
+      BUILD_TERMINATIONS_SCRIPT: scripts/build_terminations_csv.py
       PYTHON_SCRIPT: scripts/github_ps04_checker.py
-      TERMINATIONS_SOURCE: data/terminations_source.csv
       TERMINATIONS_FILE: data/terminations.csv
       AUDIT_LOG_FILE: ${{ github.event.inputs.audit_log_file || '' }}
       OUTPUT_FILE: ps04_report.json
       GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
       GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
       TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
+      TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
 
     steps:
       - name: Checkout repository
@@ -52,18 +55,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ ! -f "$BUILD_TERMINATIONS_SCRIPT" ]; then
+            echo "Missing build script at $BUILD_TERMINATIONS_SCRIPT"
+            exit 1
+          fi
+
           if [ ! -f "$PYTHON_SCRIPT" ]; then
             echo "Missing Python script at $PYTHON_SCRIPT"
             exit 1
           fi
 
-          if [ ! -f "$POPULATE_SCRIPT" ]; then
-            echo "Missing populate script at $POPULATE_SCRIPT"
-            exit 1
-          fi
-
-          if [ ! -f "$POPULATE_SOURCE_SCRIPT" ]; then
-            echo "Missing source bootstrap script at $POPULATE_SOURCE_SCRIPT"
+          if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
+            echo "Missing termination source file at $TERMINATIONS_SOURCE"
+            echo "Either commit the source file or provide the terminations_json workflow input."
             exit 1
           fi
 
@@ -81,14 +85,6 @@ jobs:
 
           mkdir -p data
 
-          if [ -n "${TERMINATIONS_JSON:-}" ]; then
-            echo "Inline termination data provided; source file will be generated."
-          elif [ ! -f "$TERMINATIONS_SOURCE" ]; then
-            echo "Missing termination source file at $TERMINATIONS_SOURCE"
-            echo "Provide workflow input terminations_json or commit a source CSV at that path."
-            exit 1
-          fi
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -101,27 +97,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Create termination source file
+      - name: Build data/terminations.csv
         shell: bash
         run: |
           set -euo pipefail
 
           if [ -n "${TERMINATIONS_JSON:-}" ]; then
-            python "$POPULATE_SOURCE_SCRIPT" \
-              --output "$TERMINATIONS_SOURCE" \
+            python "$BUILD_TERMINATIONS_SCRIPT" \
+              --output "$TERMINATIONS_FILE" \
               --default-deadline-minutes "${{ github.event.inputs.sla_minutes || '60' }}"
           else
-            echo "Using committed source file at $TERMINATIONS_SOURCE"
+            python "$BUILD_TERMINATIONS_SCRIPT" \
+              --source "$TERMINATIONS_SOURCE" \
+              --output "$TERMINATIONS_FILE" \
+              --default-deadline-minutes "${{ github.event.inputs.sla_minutes || '60' }}"
           fi
-
-      - name: Populate data/terminations.csv
-        shell: bash
-        run: |
-          set -euo pipefail
-          python "$POPULATE_SCRIPT" \
-            --source "$TERMINATIONS_SOURCE" \
-            --output "$TERMINATIONS_FILE" \
-            --default-deadline-minutes "${{ github.event.inputs.sla_minutes || '60' }}"
 
       - name: Verify populated termination file
         shell: bash
