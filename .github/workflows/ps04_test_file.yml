@@ -1,0 +1,170 @@
+name: FedRAMP PS-04 GitHub Offboarding Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      sla_minutes:
+        description: "PS-04 SLA in minutes"
+        required: false
+        default: "60"
+      max_pages:
+        description: "Max audit log pages to query"
+        required: false
+        default: "10"
+      terminations_json:
+        description: "Inline JSON array used to build data/terminations.csv"
+        required: false
+        default: ""
+      terminations_source:
+        description: "Optional source file path used to build data/terminations.csv"
+        required: false
+        default: "data/terminations_source.csv"
+      audit_log_file:
+        description: "Optional local GitHub audit log export path; leave blank to query the GitHub API"
+        required: false
+        default: ""
+
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  ps04-check:
+    name: Run PS-04 Compliance Check
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_TERMINATIONS_SCRIPT: scripts/build_terminations_csv.py
+      PYTHON_SCRIPT: scripts/github_ps04_checker.py
+      TERMINATIONS_FILE: data/terminations.csv
+      AUDIT_LOG_FILE: ${{ github.event.inputs.audit_log_file || '' }}
+      OUTPUT_FILE: ps04_report.json
+      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
+      GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
+      TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
+      TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Precheck (with auto-create template)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$BUILD_TERMINATIONS_SCRIPT" ]; then
+            echo "Missing build script at $BUILD_TERMINATIONS_SCRIPT"
+            exit 1
+          fi
+
+          if [ ! -f "$PYTHON_SCRIPT" ]; then
+            echo "Missing Python script at $PYTHON_SCRIPT"
+            exit 1
+          fi
+
+          mkdir -p data
+
+          if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
+            echo "No termination source found. Creating default template at $TERMINATIONS_SOURCE"
+            cat > "$TERMINATIONS_SOURCE" <<'EOF'
+employee_id,github_identity,termination_time_utc,identity_model,deadline_minutes
+1001,jdoe,2026-01-01T00:00:00Z,personal,60
+EOF
+          fi
+
+          if [ -z "${AUDIT_LOG_FILE:-}" ]; then
+            if [ -z "${GH_ENTERPRISE_SLUG:-}" ]; then
+              echo "Missing GH_ENTERPRISE_SLUG"
+              exit 1
+            fi
+
+            if [ -z "${GH_AUDIT_TOKEN:-}" ]; then
+              echo "Missing GH_AUDIT_TOKEN"
+              exit 1
+            fi
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Build data/terminations.csv
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${TERMINATIONS_JSON:-}" ]; then
+            python "$BUILD_TERMINATIONS_SCRIPT" \
+              --output "$TERMINATIONS_FILE" \
+              --default-deadline-minutes "${{ github.event.inputs.sla_minutes || '60' }}"
+          else
+            python "$BUILD_TERMINATIONS_SCRIPT" \
+              --source "$TERMINATIONS_SOURCE" \
+              --output "$TERMINATIONS_FILE" \
+              --default-deadline-minutes "${{ github.event.inputs.sla_minutes || '60' }}"
+          fi
+
+      - name: Verify populated termination file
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import sys
+          from pathlib import Path
+
+          path = Path("data/terminations.csv")
+          if not path.exists():
+              print("data/terminations.csv was not created", file=sys.stderr)
+              sys.exit(1)
+
+          with path.open(newline="", encoding="utf-8") as fh:
+              rows = list(csv.DictReader(fh))
+
+          if not rows:
+              print("data/terminations.csv contains no data rows", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Validated {len(rows)} termination row(s)")
+          PY
+
+      - name: Run PS-04 verification script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${AUDIT_LOG_FILE:-}" ]; then
+            python "$PYTHON_SCRIPT" \
+              --terminations "$TERMINATIONS_FILE" \
+              --audit-log "$AUDIT_LOG_FILE" \
+              --output "$OUTPUT_FILE"
+          else
+            python "$PYTHON_SCRIPT" \
+              --terminations "$TERMINATIONS_FILE" \
+              --enterprise "$GH_ENTERPRISE_SLUG" \
+              --token "$GH_AUDIT_TOKEN" \
+              --output "$OUTPUT_FILE"
+          fi
+
+      - name: Display report summary
+        shell: bash
+        run: |
+          echo "==== PS-04 REPORT ===="
+          cat "$OUTPUT_FILE"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps04-report
+          path: ps04_report.json
+          retention-days: 30
