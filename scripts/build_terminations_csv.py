@@ -4,10 +4,6 @@ Build data/terminations.csv from either:
 - a source file (.csv, .json, .jsonl), or
 - the TERMINATIONS_JSON environment variable containing a JSON array.
 
-This script replaces both:
-- scripts/create_terminations_source.py
-- scripts/populate_terminations_csv.py
-
 Expected row fields:
 - employee_id
 - github_identity
