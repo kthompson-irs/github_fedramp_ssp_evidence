@@ -7,10 +7,6 @@ on:
         description: "PS-04 SLA in minutes"
         required: false
         default: "60"
-      max_pages:
-        description: "Max audit log pages to query"
-        required: false
-        default: "10"
       terminations_json:
         description: "Inline JSON array used to build data/terminations.csv"
         required: false
@@ -19,8 +15,16 @@ on:
         description: "Optional source file path used to build data/terminations.csv"
         required: false
         default: "data/terminations_source.csv"
-      audit_log_file:
-        description: "Optional local GitHub audit log export path; leave blank to query the GitHub API"
+      enterprise_audit_log_file:
+        description: "Enterprise/org audit log JSON or JSONL file"
+        required: false
+        default: ""
+      security_log_file:
+        description: "Security log JSON or JSONL file"
+        required: false
+        default: ""
+      scim_log_file:
+        description: "SCIM event JSON or JSONL file"
         required: false
         default: ""
 
@@ -39,14 +43,13 @@ jobs:
       BUILD_TERMINATIONS_SCRIPT: scripts/build_terminations_csv.py
       PYTHON_SCRIPT: scripts/github_ps04_checker.py
       TERMINATIONS_FILE: data/terminations.csv
-      AUDIT_LOG_FILE: ${{ github.event.inputs.audit_log_file || '' }}
-      OUTPUT_FILE: ps04_report.json
-      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
-      GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
       TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
       TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
+      ENTERPRISE_AUDIT_LOG_FILE: ${{ github.event.inputs.enterprise_audit_log_file || '' }}
+      SECURITY_LOG_FILE: ${{ github.event.inputs.security_log_file || '' }}
+      SCIM_LOG_FILE: ${{ github.event.inputs.scim_log_file || '' }}
+      OUTPUT_FILE: ps04_report.json
       SLA_MINUTES: ${{ github.event.inputs.sla_minutes || '60' }}
-      MAX_PAGES: ${{ github.event.inputs.max_pages || '10' }}
 
     steps:
       - name: Checkout repository
@@ -57,15 +60,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -f "$BUILD_TERMINATIONS_SCRIPT" ]; then
-            echo "Missing build script at $BUILD_TERMINATIONS_SCRIPT"
-            exit 1
-          fi
-
-          if [ ! -f "$PYTHON_SCRIPT" ]; then
-            echo "Missing Python script at $PYTHON_SCRIPT"
-            exit 1
-          fi
+          test -f "$BUILD_TERMINATIONS_SCRIPT" || { echo "Missing build script at $BUILD_TERMINATIONS_SCRIPT"; exit 1; }
+          test -f "$PYTHON_SCRIPT" || { echo "Missing Python script at $PYTHON_SCRIPT"; exit 1; }
 
           mkdir -p data
 
@@ -73,18 +69,6 @@ jobs:
             echo "Missing termination source file at $TERMINATIONS_SOURCE"
             echo "Provide committed source data or set the terminations_json workflow input."
             exit 1
-          fi
-
-          if [ -z "${AUDIT_LOG_FILE:-}" ]; then
-            if [ -z "${GH_ENTERPRISE_SLUG:-}" ]; then
-              echo "Missing GH_ENTERPRISE_SLUG"
-              exit 1
-            fi
-
-            if [ -z "${GH_AUDIT_TOKEN:-}" ]; then
-              echo "Missing GH_AUDIT_TOKEN"
-              exit 1
-            fi
           fi
 
       - name: Set up Python
@@ -145,24 +129,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -n "${AUDIT_LOG_FILE:-}" ]; then
-            python "$PYTHON_SCRIPT" \
-              --terminations "$TERMINATIONS_FILE" \
-              --audit-log "$AUDIT_LOG_FILE" \
-              --sla-minutes "$SLA_MINUTES" \
-              --max-pages "$MAX_PAGES" \
-              --fail-on-gaps \
-              --output "$OUTPUT_FILE"
-          else
-            python "$PYTHON_SCRIPT" \
-              --terminations "$TERMINATIONS_FILE" \
-              --enterprise "$GH_ENTERPRISE_SLUG" \
-              --token "$GH_AUDIT_TOKEN" \
-              --sla-minutes "$SLA_MINUTES" \
-              --max-pages "$MAX_PAGES" \
-              --fail-on-gaps \
-              --output "$OUTPUT_FILE"
-          fi
+          python "$PYTHON_SCRIPT" \
+            --terminations "$TERMINATIONS_FILE" \
+            --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
+            --security-log "$SECURITY_LOG_FILE" \
+            --scim-log "$SCIM_LOG_FILE" \
+            --sla-minutes "$SLA_MINUTES" \
+            --fail-on-gaps \
+            --output "$OUTPUT_FILE"
 
       - name: Hash evidence
         shell: bash
