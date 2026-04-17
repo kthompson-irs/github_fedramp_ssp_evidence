@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
-import os, sys, json, datetime as dt
+import os
+import sys
+import json
+import datetime as dt
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -21,7 +24,10 @@ def call(path):
         with urlopen(req) as r:
             return r.status, json.loads(r.read().decode())
     except HTTPError as e:
-        return e.code, e.read().decode()
+        try:
+            return e.code, json.loads(e.read().decode())
+        except:
+            return e.code, {"raw": str(e)}
 
 def fail(msg):
     print(f"ERROR: {msg}")
@@ -31,7 +37,7 @@ def warn(msg):
     print(f"WARN: {msg}")
 
 def preflight():
-    print("=== PREFLIGHT CHECK ===")
+    print("\n=== PREFLIGHT CHECK ===")
 
     if not ENTERPRISE:
         fail("GH_ENTERPRISE not set")
@@ -39,7 +45,6 @@ def preflight():
     if not TOKEN:
         fail("GH_ENTERPRISE_TOKEN not set")
 
-    # 1. Enterprise metadata check
     status, data = call(f"/enterprises/{ENTERPRISE}")
     print("Enterprise metadata status:", status)
 
@@ -49,18 +54,16 @@ def preflight():
     if status != 200:
         fail(f"Unexpected enterprise metadata response: {status}")
 
-    print("Enterprise found:", data.get("slug"))
+    print("Enterprise confirmed:", data.get("slug"))
 
-    # 2. Audit log check
     status, data = call(f"/enterprises/{ENTERPRISE}/audit-log?per_page=1")
-
     print("Audit log status:", status)
 
     if status == 404:
-        fail("Token is NOT enterprise admin OR missing audit_log scope")
+        fail("Token is NOT enterprise admin OR wrong token")
 
     if status == 403:
-        fail("Token missing required permissions (audit_log)")
+        fail("Token missing audit_log permission or SSO not authorized")
 
     if status != 200:
         fail(f"Unexpected audit log response: {status}")
@@ -70,7 +73,7 @@ def preflight():
 def validate_ia11():
     path = os.getenv("IDP_POLICY_FILE")
 
-    if not os.path.exists(path):
+    if not path or not os.path.exists(path):
         warn("No IdP policy file found")
         return "WARN"
 
@@ -80,34 +83,42 @@ def validate_ia11():
     reauth = data.get("reauth_required")
     mfa = data.get("mfa_required")
 
-    print("IA-11 policy:", data)
+    print("\n=== IA-11 POLICY ===")
+    print(json.dumps(data, indent=2))
 
     if timeout is None or reauth is None or mfa is None:
         warn("Incomplete IdP policy")
         return "WARN"
 
-    if timeout > 15 or not reauth or not mfa:
-        fail("IA-11 violation detected")
+    if timeout > 15:
+        fail("IA-11 FAIL: session timeout > 15 minutes")
+
+    if not reauth:
+        fail("IA-11 FAIL: reauthentication not enforced")
+
+    if not mfa:
+        fail("IA-11 FAIL: MFA not enforced")
 
     return "PASS"
 
 def main():
     preflight()
 
-    status = validate_ia11()
+    ia11_status = validate_ia11()
 
     os.makedirs(OUTPUT, exist_ok=True)
 
     report = {
         "enterprise": ENTERPRISE,
         "timestamp": dt.datetime.utcnow().isoformat(),
-        "ia11_status": status,
+        "ia11_status": ia11_status
     }
 
     with open(f"{OUTPUT}/ia_enterprise_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print("FINAL STATUS:", status)
+    print("\n=== FINAL STATUS ===")
+    print(ia11_status)
 
 if __name__ == "__main__":
     main()
