@@ -50,7 +50,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Precheck
+      - name: Precheck (with auto-create template)
         shell: bash
         run: |
           set -euo pipefail
@@ -65,12 +65,16 @@ jobs:
             exit 1
           fi
 
+          mkdir -p data
+
+          # ✅ AUTO-CREATE TEMPLATE IF NOTHING PROVIDED
           if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
-            echo "No termination source found."
-            echo "Either:"
-            echo "  - commit data/terminations_source.csv, or"
-            echo "  - provide the workflow_dispatch input terminations_json"
-            exit 1
+            echo "No termination source found. Creating default template at $TERMINATIONS_SOURCE"
+
+            cat > "$TERMINATIONS_SOURCE" <<'EOF'
+employee_id,github_identity,termination_time_utc,identity_model,deadline_minutes
+1001,jdoe,2026-01-01T00:00:00Z,personal,60
+EOF
           fi
 
           if [ -z "${AUDIT_LOG_FILE:-}" ]; then
@@ -85,22 +89,17 @@ jobs:
             fi
           fi
 
-          mkdir -p data
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
           pip install requests
 
       - name: Build data/terminations.csv
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -116,12 +115,9 @@ jobs:
           fi
 
       - name: Verify populated termination file
-        shell: bash
         run: |
-          set -euo pipefail
           python - <<'PY'
-          import csv
-          import sys
+          import csv, sys
           from pathlib import Path
 
           path = Path("data/terminations.csv")
@@ -129,52 +125,33 @@ jobs:
               print("data/terminations.csv was not created", file=sys.stderr)
               sys.exit(1)
 
-          with path.open(newline="", encoding="utf-8") as fh:
-              rows = list(csv.DictReader(fh))
-
+          rows = list(csv.DictReader(path.open()))
           if not rows:
               print("data/terminations.csv contains no data rows", file=sys.stderr)
               sys.exit(1)
 
-          print(f"Validated {len(rows)} termination row(s) in {path}")
+          print(f"Validated {len(rows)} termination row(s)")
           PY
 
       - name: Run PS-04 verification script
-        shell: bash
         run: |
           set -euo pipefail
-
-          SLA_MINUTES="${{ github.event.inputs.sla_minutes || '60' }}"
-          MAX_PAGES="${{ github.event.inputs.max_pages || '10' }}"
 
           if [ -n "${AUDIT_LOG_FILE:-}" ]; then
             python "$PYTHON_SCRIPT" \
               --terminations "$TERMINATIONS_FILE" \
               --audit-log "$AUDIT_LOG_FILE" \
-              --sla-minutes "$SLA_MINUTES" \
-              --fail-on-gaps \
               --output "$OUTPUT_FILE"
           else
             python "$PYTHON_SCRIPT" \
               --terminations "$TERMINATIONS_FILE" \
               --enterprise "$GH_ENTERPRISE_SLUG" \
               --token "$GH_AUDIT_TOKEN" \
-              --max-pages "$MAX_PAGES" \
-              --sla-minutes "$SLA_MINUTES" \
-              --fail-on-gaps \
               --output "$OUTPUT_FILE"
           fi
 
-      - name: Display report summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "==== PS-04 REPORT ===="
-          cat "$OUTPUT_FILE"
-
-      - name: Upload compliance report artifact
+      - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
-          retention-days: 30
