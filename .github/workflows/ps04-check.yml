@@ -1,9 +1,9 @@
 name: PS-04 Real-Time Evidence Pipeline
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,15 +12,6 @@ jobs:
   ps04:
     runs-on: ubuntu-22.04
 
-    env:
-      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
-      GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
-
-      OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
-      OKTA_TOKEN: ${{ secrets.OKTA_TOKEN }}
-
-      OUTPUT_FILE: ps04_report.json
-
     steps:
       - uses: actions/checkout@v4
 
@@ -28,36 +19,10 @@ jobs:
         with:
           python-version: "3.11.8"
 
-      - name: Install deps
-        run: |
-          pip install requests==2.31.0
+      - name: Install dependencies
+        run: pip install requests==2.31.0
 
-      # 🔹 GitHub audit logs
-      - name: Fetch GitHub audit logs
-        run: python scripts/fetch_github_audit_logs.py
-
-      # 🔹 SCIM logs (safe optional)
-      - name: Fetch SCIM events (optional)
-        run: |
-          set -euo pipefail
-
-          if [ -z "${OKTA_DOMAIN:-}" ] || [ -z "${OKTA_TOKEN:-}" ]; then
-            echo "Skipping SCIM fetch (OKTA not configured)"
-            mkdir -p data
-            echo "[]" > data/scim_log.json
-          else
-            python scripts/fetch_scim_events.py
-          fi
-
-      # 🔹 Build dataset
-      - name: Build termination dataset
-        run: |
-          python scripts/build_terminations_csv.py \
-            --source data/terminations_source.csv \
-            --output data/terminations.csv
-
-      # 🔹 Run checker
-      - name: Run PS-04 check
+      - name: Run PS-04 checker
         run: |
           set -euo pipefail
 
