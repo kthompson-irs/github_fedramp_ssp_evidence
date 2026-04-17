@@ -1,4 +1,4 @@
-name: IA-11 FedRAMP Enterprise Evidence Check
+name: IA FedRAMP Enterprise Evidence Check
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
 jobs:
   ia-evidence:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     env:
       GH_ENTERPRISE: ${{ secrets.GH_ENTERPRISE }}
@@ -15,21 +16,70 @@ jobs:
       GH_API_URL: https://api.github.com
       OUTPUT_DIR: artifacts
       SINCE_DAYS: "30"
+      PAGE_SIZE: "100"
+      MAX_PAGES: "10"
       IDP_POLICY_FILE: evidence/idp/idp_policy.json
       ENTERPRISE_SECURITY_FILE: evidence/github/enterprise_security.json
       MANUAL_EVIDENCE_DIR: evidence/manual
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # 🔍 FULL DIAGNOSTIC PREFLIGHT
+      - name: Preflight - Identify token + enterprise access
+        run: |
+          python - <<'PY'
+          import os, json
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          api = os.environ.get("GH_API_URL", "https://api.github.com").rstrip("/")
+          token = os.environ.get("GH_ENTERPRISE_TOKEN")
+          enterprise = os.environ.get("GH_ENTERPRISE")
+
+          def call(path):
+              req = Request(
+                  f"{api}{path}",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              try:
+                  with urlopen(req) as r:
+                      return r.status, json.loads(r.read().decode())
+              except HTTPError as e:
+                  try:
+                      return e.code, json.loads(e.read().decode())
+                  except:
+                      return e.code, {"raw": str(e)}
+
+          print("\n=== AUTHENTICATED USER ===")
+          status, user = call("/user")
+          print("Status:", status)
+          print(json.dumps(user, indent=2))
+
+          print("\n=== ENTERPRISE METADATA ===")
+          status, ent = call(f"/enterprises/{enterprise}")
+          print("Status:", status)
+          print(json.dumps(ent, indent=2))
+
+          print("\n=== ENTERPRISE AUDIT LOG TEST ===")
+          status, logs = call(f"/enterprises/{enterprise}/audit-log?per_page=1")
+          print("Status:", status)
+          print(json.dumps(logs, indent=2)[:1000])
+          PY
 
       - name: Run IA enterprise compliance
         run: python scripts/ia11_compliance_enterprise.py
 
-      - name: Upload artifacts
+      - name: Upload evidence artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ia-enterprise-evidence
