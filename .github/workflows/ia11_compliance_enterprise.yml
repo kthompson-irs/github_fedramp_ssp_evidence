@@ -1,4 +1,4 @@
-name: IA-11 FedRAMP Enterprise Evidence Check
+name: IA FedRAMP Enterprise Evidence Check
 
 on:
   workflow_dispatch:
@@ -16,6 +16,8 @@ jobs:
       GH_API_URL: https://api.github.com
       OUTPUT_DIR: artifacts
       SINCE_DAYS: "30"
+      PAGE_SIZE: "100"
+      MAX_PAGES: "10"
       IDP_POLICY_FILE: evidence/idp/idp_policy.json
       ENTERPRISE_SECURITY_FILE: evidence/github/enterprise_security.json
       MANUAL_EVIDENCE_DIR: evidence/manual
