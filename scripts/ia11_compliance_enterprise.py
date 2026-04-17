@@ -18,16 +18,22 @@ def call(path):
         headers={
             "Authorization": f"Bearer {TOKEN}",
             "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
         },
     )
     try:
         with urlopen(req) as r:
-            return r.status, json.loads(r.read().decode())
+            body = r.read().decode()
+            try:
+                return r.status, json.loads(body)
+            except Exception:
+                return r.status, body
     except HTTPError as e:
+        raw = e.read().decode(errors="replace")
         try:
-            return e.code, json.loads(e.read().decode())
-        except:
-            return e.code, {"raw": str(e)}
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw
 
 def fail(msg):
     print(f"ERROR: {msg}")
@@ -45,30 +51,27 @@ def preflight():
     if not TOKEN:
         fail("GH_ENTERPRISE_TOKEN not set")
 
-    status, data = call(f"/enterprises/{ENTERPRISE}")
-    print("Enterprise metadata status:", status)
-
-    if status == 404:
-        fail("Enterprise slug invalid OR token cannot access enterprise")
+    status, user = call("/user")
+    print("Authenticated user status:", status)
 
     if status != 200:
-        fail(f"Unexpected enterprise metadata response: {status}")
+        fail(f"Unable to read authenticated user: {user}")
 
-    print("Enterprise confirmed:", data.get("slug"))
+    login = user.get("login") if isinstance(user, dict) else None
+    print("Authenticated login:", login)
 
-    status, data = call(f"/enterprises/{ENTERPRISE}/audit-log?per_page=1")
+    status, logs = call(f"/enterprises/{ENTERPRISE}/audit-log?per_page=1&include=all&order=desc")
     print("Audit log status:", status)
 
+    if status == 200:
+        print("Audit log access confirmed")
+        return
+
     if status == 404:
-        fail("Token is NOT enterprise admin OR wrong token")
-
+        fail("Token cannot access this enterprise audit log, or the enterprise slug is wrong for this token.")
     if status == 403:
-        fail("Token missing audit_log permission or SSO not authorized")
-
-    if status != 200:
-        fail(f"Unexpected audit log response: {status}")
-
-    print("Audit log access confirmed")
+        fail("Token is missing audit_log permission or SSO authorization.")
+    fail(f"Unexpected audit log response: {status} -> {logs}")
 
 def validate_ia11():
     path = os.getenv("IDP_POLICY_FILE")
@@ -77,7 +80,8 @@ def validate_ia11():
         warn("No IdP policy file found")
         return "WARN"
 
-    data = json.load(open(path))
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
     timeout = data.get("session_timeout_minutes")
     reauth = data.get("reauth_required")
@@ -111,10 +115,10 @@ def main():
     report = {
         "enterprise": ENTERPRISE,
         "timestamp": dt.datetime.utcnow().isoformat(),
-        "ia11_status": ia11_status
+        "ia11_status": ia11_status,
     }
 
-    with open(f"{OUTPUT}/ia_enterprise_report.json", "w") as f:
+    with open(f"{OUTPUT}/ia_enterprise_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     print("\n=== FINAL STATUS ===")
