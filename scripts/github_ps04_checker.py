@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-PS-04 verifier for GitHub Enterprise Cloud.
+PS-04 verifier for GitHub evidence feeds.
 
-Matches the current workflow:
-- reads GH_ENTERPRISE_SLUG
-- reads GH_AUDIT_TOKEN
-- supports either --audit-log or GitHub API mode
-- checks for offboarding events within the SLA window
-- writes a JSON report
+This version routes each termination record to the evidence source declared in
+the CSV row:
+- enterprise_audit_log
+- security_log
+- scim_log
+
+It supports local JSON or JSONL evidence exports for each source.
 """
 
 from __future__ import annotations
@@ -15,16 +16,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-EMU_ACTIONS = {"external_identity.deprovision"}
-PERSONAL_ACTIONS = {"business.remove_member", "org.remove_member"}
+VALID_EVIDENCE_SOURCES = {
+    "enterprise_audit_log",
+    "security_log",
+    "scim_log",
+}
 
 
 @dataclass
@@ -33,6 +36,8 @@ class TerminationRecord:
     github_identity: str
     termination_time_utc: datetime
     identity_model: str
+    evidence_source: str
+    expected_actions: List[str]
     deadline_minutes: int
 
 
@@ -41,6 +46,7 @@ class Finding:
     employee_id: str
     github_identity: str
     identity_model: str
+    evidence_source: str
     termination_time_utc: str
     deadline_time_utc: str
     expected_actions: List[str]
@@ -86,10 +92,16 @@ def normalize_identity_model(value: str) -> str:
     return "personal"
 
 
-def expected_actions(identity_model: str) -> List[str]:
-    if identity_model == "emu":
-        return sorted(EMU_ACTIONS)
-    return sorted(PERSONAL_ACTIONS)
+def normalize_evidence_source(value: str) -> str:
+    v = (value or "").strip().lower()
+    if v not in VALID_EVIDENCE_SOURCES:
+        raise ValueError(f"invalid evidence_source={value!r}")
+    return v
+
+
+def parse_actions(value: str) -> List[str]:
+    parts = [p.strip() for p in (value or "").replace(",", "|").replace(";", "|").split("|")]
+    return [p for p in parts if p]
 
 
 def load_terminations(path: Path, default_deadline_minutes: int) -> List[TerminationRecord]:
@@ -105,7 +117,11 @@ def load_terminations(path: Path, default_deadline_minutes: int) -> List[Termina
             if not ts_raw:
                 raise ValueError(f"{path}:{idx}: missing termination_time_utc")
 
-            identity_model = normalize_identity_model(row_get(row, "identity_model", default="personal"))
+            evidence_source = normalize_evidence_source(row_get(row, "evidence_source", default=""))
+            actions = parse_actions(row_get(row, "expected_actions", default=""))
+            if not actions:
+                raise ValueError(f"{path}:{idx}: expected_actions is required")
+
             deadline_raw = row_get(row, "deadline_minutes", default=str(default_deadline_minutes))
             try:
                 deadline_minutes = int(deadline_raw)
@@ -116,6 +132,7 @@ def load_terminations(path: Path, default_deadline_minutes: int) -> List[Termina
                 raise ValueError(f"{path}:{idx}: deadline_minutes must be greater than 0")
 
             employee_id = row_get(row, "employee_id", "id", default="")
+            identity_model = normalize_identity_model(row_get(row, "identity_model", default="personal"))
 
             records.append(
                 TerminationRecord(
@@ -123,6 +140,8 @@ def load_terminations(path: Path, default_deadline_minutes: int) -> List[Termina
                     github_identity=github_identity,
                     termination_time_utc=parse_utc_datetime(ts_raw),
                     identity_model=identity_model,
+                    evidence_source=evidence_source,
+                    expected_actions=actions,
                     deadline_minutes=deadline_minutes,
                 )
             )
@@ -153,51 +172,6 @@ def load_events_from_json_path(path: Path) -> List[Dict[str, Any]]:
             raise ValueError(f"{path}:{line_no}: expected a JSON object per line")
         events.append(item)
     return events
-
-
-def load_events_from_github(
-    enterprise: str,
-    token: str,
-    api_base: str,
-    max_pages: int,
-    per_page: int,
-) -> List[Dict[str, Any]]:
-    try:
-        import requests
-    except ImportError as exc:
-        raise RuntimeError("requests is required for API mode") from exc
-
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-    all_events: List[Dict[str, Any]] = []
-    url = f"{api_base.rstrip('/')}/enterprises/{enterprise}/audit-log"
-
-    for page in range(1, max_pages + 1):
-        resp = requests.get(
-            url,
-            headers=headers,
-            params={"page": page, "per_page": per_page},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list):
-            raise RuntimeError("Unexpected GitHub audit-log response shape; expected a JSON array")
-        if not data:
-            break
-
-        for item in data:
-            if isinstance(item, dict):
-                all_events.append(item)
-
-        if len(data) < per_page:
-            break
-
-    return all_events
 
 
 def event_time(event: Dict[str, Any]) -> Optional[datetime]:
@@ -270,14 +244,13 @@ def summarize_event(event: Dict[str, Any]) -> Dict[str, Any]:
 def check_record(record: TerminationRecord, events: Sequence[Dict[str, Any]]) -> Finding:
     start = record.termination_time_utc
     end = start + timedelta(minutes=record.deadline_minutes)
-    expected = expected_actions(record.identity_model)
 
     best_event: Optional[Dict[str, Any]] = None
     best_event_time: Optional[datetime] = None
 
     for event in events:
         action = str(event.get("action", "")).strip()
-        if action not in expected:
+        if action not in record.expected_actions:
             continue
 
         et = event_time(event)
@@ -298,51 +271,52 @@ def check_record(record: TerminationRecord, events: Sequence[Dict[str, Any]]) ->
         employee_id=record.employee_id,
         github_identity=record.github_identity,
         identity_model=record.identity_model,
+        evidence_source=record.evidence_source,
         termination_time_utc=format_utc(start),
         deadline_time_utc=format_utc(end),
-        expected_actions=expected,
+        expected_actions=record.expected_actions,
         compliant=compliant,
         matched_action=str(best_event.get("action")) if best_event else None,
         matched_event_time_utc=format_utc(best_event_time) if best_event_time else None,
         matched_actor=str(best_event.get("actor")) if best_event else None,
         matched_event_summary=summarize_event(best_event) if best_event else None,
-        note=None if compliant else "No matching GitHub offboarding event found inside the SLA window.",
+        note=None if compliant else "No matching evidence event found inside the SLA window.",
     )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify GitHub PS-04 offboarding evidence.")
     parser.add_argument("--terminations", required=True, type=Path, help="CSV file of termination records")
-    parser.add_argument("--enterprise", default=os.getenv("GH_ENTERPRISE_SLUG"), help="GitHub enterprise slug")
-    parser.add_argument("--token", default=os.getenv("GH_AUDIT_TOKEN"), help="GitHub audit-log token")
-    parser.add_argument("--api-base", default=os.getenv("GH_API_BASE", "https://api.github.com"))
-    parser.add_argument("--max-pages", type=int, default=10)
-    parser.add_argument("--per-page", type=int, default=100)
+    parser.add_argument("--enterprise-audit-log", type=Path, default=None, help="Enterprise/org audit log JSON or JSONL")
+    parser.add_argument("--security-log", type=Path, default=None, help="Security log JSON or JSONL")
+    parser.add_argument("--scim-log", type=Path, default=None, help="SCIM log JSON or JSONL")
     parser.add_argument("--sla-minutes", type=int, default=60)
-    parser.add_argument("--audit-log", type=Path, help="Local audit log export instead of API mode")
     parser.add_argument("--output", type=Path, default=Path("ps04_report.json"))
     parser.add_argument("--fail-on-gaps", action="store_true")
     args = parser.parse_args()
 
-    if args.audit_log:
-        events = load_events_from_json_path(args.audit_log)
-    else:
-        if not args.enterprise:
-            print("Missing GH_ENTERPRISE_SLUG", file=sys.stderr)
-            return 1
-        if not args.token:
-            print("Missing GH_AUDIT_TOKEN", file=sys.stderr)
-            return 1
-        events = load_events_from_github(
-            enterprise=args.enterprise,
-            token=args.token,
-            api_base=args.api_base,
-            max_pages=args.max_pages,
-            per_page=args.per_page,
-        )
+    events_by_source: Dict[str, List[Dict[str, Any]]] = {}
+
+    if args.enterprise_audit_log:
+        events_by_source["enterprise_audit_log"] = load_events_from_json_path(args.enterprise_audit_log)
+    if args.security_log:
+        events_by_source["security_log"] = load_events_from_json_path(args.security_log)
+    if args.scim_log:
+        events_by_source["scim_log"] = load_events_from_json_path(args.scim_log)
 
     terminations = load_terminations(args.terminations, args.sla_minutes)
-    findings = [check_record(record, events) for record in terminations]
+
+    missing_sources = sorted(
+        {record.evidence_source for record in terminations if record.evidence_source not in events_by_source}
+    )
+    if missing_sources:
+        print(
+            "Missing evidence file(s) for source(s): " + ", ".join(missing_sources),
+            file=sys.stderr,
+        )
+        return 1
+
+    findings = [check_record(record, events_by_source[record.evidence_source]) for record in terminations]
 
     compliant_count = sum(1 for f in findings if f.compliant)
     gap_count = len(findings) - compliant_count
