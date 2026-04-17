@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse, csv, json, sys
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 
-def load_json_file(path):
+def load_json(path):
     if not path:
         return []
     p = Path(path)
@@ -14,27 +14,22 @@ def load_json_file(path):
         return []
     if raw.startswith("["):
         return json.loads(raw)
-    return [json.loads(line) for line in raw.splitlines() if line.strip()]
+    return [json.loads(l) for l in raw.splitlines() if l.strip()]
 
-def load_terminations(path):
-    with open(path) as f:
-        return list(csv.DictReader(f))
-
-def parse_time(t):
+def parse(t):
     return datetime.fromisoformat(t.replace("Z","+00:00"))
 
 def match(events, identity, actions, start, end):
     for e in events:
         if e.get("action") not in actions:
             continue
-        et = e.get("created_at") or e.get("@timestamp")
-        if not et:
+        ts = e.get("created_at") or e.get("@timestamp")
+        if not ts:
             continue
-        et = parse_time(et)
-        if not (start <= et <= end):
+        ts = parse(ts)
+        if not (start <= ts <= end):
             continue
-        blob = json.dumps(e).lower()
-        if identity.lower() in blob:
+        if identity.lower() in json.dumps(e).lower():
             return e
     return None
 
@@ -42,41 +37,34 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--terminations")
     p.add_argument("--enterprise-audit-log")
-    p.add_argument("--security-log")
     p.add_argument("--scim-log")
     p.add_argument("--sla-minutes", type=int, default=60)
     p.add_argument("--output")
     p.add_argument("--fail-on-gaps", action="store_true")
     args = p.parse_args()
 
-    enterprise_events = load_json_file(args.enterprise_audit_log)
-    security_events = load_json_file(args.security_log)
-    scim_events = load_json_file(args.scim_log)
+    enterprise = load_json(args.enterprise_audit_log)
+    scim = load_json(args.scim_log)
 
-    terms = load_terminations(args.terminations)
+    rows = list(csv.DictReader(open(args.terminations)))
 
     findings = []
 
-    for t in terms:
-        start = parse_time(t["termination_time_utc"])
-        end = start + timedelta(minutes=int(t.get("deadline_minutes", args.sla_minutes)))
+    for r in rows:
+        start = parse(r["termination_time_utc"])
+        end = start + timedelta(minutes=int(r.get("deadline_minutes", 60)))
 
-        source = t.get("evidence_source")
-        identity = t["github_identity"]
+        identity = r["github_identity"]
+        source = r["evidence_source"]
 
         if source == "enterprise_audit_log":
-            events = enterprise_events
-            actions = ["business.remove_member","org.remove_member"]
+            ev = match(enterprise, identity,
+                ["org.remove_member","business.remove_member"], start, end)
         elif source == "scim_log":
-            events = scim_events
-            actions = ["external_identity.deprovision"]
-        elif source == "security_log":
-            events = security_events
-            actions = t["expected_actions"].split("|")
+            ev = match(scim, identity,
+                ["external_identity.deprovision"], start, end)
         else:
-            raise SystemExit(f"Invalid evidence_source: {source}")
-
-        ev = match(events, identity, actions, start, end)
+            ev = None
 
         findings.append({
             "user": identity,
@@ -86,17 +74,9 @@ def main():
 
     gaps = [f for f in findings if not f["compliant"]]
 
-    report = {
-        "summary": {
-            "total": len(findings),
-            "gaps": len(gaps)
-        },
-        "findings": findings
-    }
+    report = {"summary": {"total": len(findings), "gaps": len(gaps)}, "findings": findings}
 
-    with open(args.output, "w") as f:
-        json.dump(report, f, indent=2)
-
+    json.dump(report, open(args.output, "w"), indent=2)
     print(json.dumps(report, indent=2))
 
     if args.fail_on_gaps and gaps:
