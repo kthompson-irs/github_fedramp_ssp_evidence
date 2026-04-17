@@ -12,19 +12,19 @@ on:
         required: false
         default: ""
       terminations_source:
-        description: "Optional source file path used to build data/terminations.csv"
+        description: "Optional source file path"
         required: false
         default: "data/terminations_source.csv"
       enterprise_audit_log_file:
-        description: "Enterprise/org audit log JSON or JSONL file"
+        description: "Enterprise audit log file"
         required: false
         default: ""
       security_log_file:
-        description: "Security log JSON or JSONL file"
+        description: "Security log file"
         required: false
         default: ""
       scim_log_file:
-        description: "SCIM event JSON or JSONL file"
+        description: "SCIM log file"
         required: false
         default: ""
 
@@ -36,124 +36,87 @@ permissions:
 
 jobs:
   ps04-check:
-    name: Run PS-04 Compliance Check
     runs-on: ubuntu-22.04
 
     env:
-      BUILD_TERMINATIONS_SCRIPT: scripts/build_terminations_csv.py
-      PYTHON_SCRIPT: scripts/github_ps04_checker.py
+      BUILD_SCRIPT: scripts/build_terminations_csv.py
+      CHECK_SCRIPT: scripts/github_ps04_checker.py
+
       TERMINATIONS_FILE: data/terminations.csv
-      TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
       TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
+      TERMINATIONS_JSON: ${{ github.event.inputs.terminations_json || '' }}
+
       ENTERPRISE_AUDIT_LOG_FILE: ${{ github.event.inputs.enterprise_audit_log_file || '' }}
       SECURITY_LOG_FILE: ${{ github.event.inputs.security_log_file || '' }}
       SCIM_LOG_FILE: ${{ github.event.inputs.scim_log_file || '' }}
+
       OUTPUT_FILE: ps04_report.json
       SLA_MINUTES: ${{ github.event.inputs.sla_minutes || '60' }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Precheck
-        shell: bash
         run: |
           set -euo pipefail
-
-          test -f "$BUILD_TERMINATIONS_SCRIPT" || { echo "Missing build script at $BUILD_TERMINATIONS_SCRIPT"; exit 1; }
-          test -f "$PYTHON_SCRIPT" || { echo "Missing Python script at $PYTHON_SCRIPT"; exit 1; }
-
+          test -f "$BUILD_SCRIPT" || exit 1
+          test -f "$CHECK_SCRIPT" || exit 1
           mkdir -p data
 
           if [ -z "${TERMINATIONS_JSON:-}" ] && [ ! -f "$TERMINATIONS_SOURCE" ]; then
-            echo "Missing termination source file at $TERMINATIONS_SOURCE"
-            echo "Provide committed source data or set the terminations_json workflow input."
+            echo "Missing termination source"
             exit 1
           fi
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11.8"
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install requests==2.31.0
+      - name: Install deps
+        run: pip install requests==2.31.0
 
-      - name: Build data/terminations.csv
-        shell: bash
+      - name: Build dataset
         run: |
           set -euo pipefail
 
           if [ -n "${TERMINATIONS_JSON:-}" ]; then
-            python "$BUILD_TERMINATIONS_SCRIPT" \
-              --output "$TERMINATIONS_FILE" \
-              --default-deadline-minutes "$SLA_MINUTES"
+            python "$BUILD_SCRIPT" \
+              --output "$TERMINATIONS_FILE"
           else
-            python "$BUILD_TERMINATIONS_SCRIPT" \
+            python "$BUILD_SCRIPT" \
               --source "$TERMINATIONS_SOURCE" \
-              --output "$TERMINATIONS_FILE" \
-              --default-deadline-minutes "$SLA_MINUTES"
+              --output "$TERMINATIONS_FILE"
           fi
 
-      - name: Verify populated termination file
-        shell: bash
+      - name: Run PS-04 checker (fixed)
         run: |
           set -euo pipefail
 
-          python - <<'PY'
-          import csv
-          import sys
-          from pathlib import Path
-
-          path = Path("data/terminations.csv")
-          if not path.exists():
-              print("data/terminations.csv was not created", file=sys.stderr)
-              sys.exit(1)
-
-          with path.open(newline="", encoding="utf-8") as fh:
-              rows = list(csv.DictReader(fh))
-
-          if not rows:
-              print("data/terminations.csv contains no data rows", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"Validated {len(rows)} termination row(s)")
-          PY
-
-      - name: Run PS-04 verification script
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python "$PYTHON_SCRIPT" \
-            --terminations "$TERMINATIONS_FILE" \
-            --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
-            --security-log "$SECURITY_LOG_FILE" \
-            --scim-log "$SCIM_LOG_FILE" \
-            --sla-minutes "$SLA_MINUTES" \
+          CMD="python $CHECK_SCRIPT \
+            --terminations $TERMINATIONS_FILE \
+            --sla-minutes $SLA_MINUTES \
             --fail-on-gaps \
-            --output "$OUTPUT_FILE"
+            --output $OUTPUT_FILE"
 
-      - name: Hash evidence
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha256sum "$OUTPUT_FILE"
+          if [ -n "${ENTERPRISE_AUDIT_LOG_FILE:-}" ] && [ -f "$ENTERPRISE_AUDIT_LOG_FILE" ]; then
+            CMD="$CMD --enterprise-audit-log $ENTERPRISE_AUDIT_LOG_FILE"
+          fi
 
-      - name: Display report summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "==== PS-04 REPORT ===="
-          cat "$OUTPUT_FILE"
+          if [ -n "${SECURITY_LOG_FILE:-}" ] && [ -f "$SECURITY_LOG_FILE" ]; then
+            CMD="$CMD --security-log $SECURITY_LOG_FILE"
+          fi
 
-      - name: Upload report
-        uses: actions/upload-artifact@v4
+          if [ -n "${SCIM_LOG_FILE:-}" ] && [ -f "$SCIM_LOG_FILE" ]; then
+            CMD="$CMD --scim-log $SCIM_LOG_FILE"
+          fi
+
+          echo "$CMD"
+          eval $CMD
+
+      - name: Show report
+        run: cat "$OUTPUT_FILE"
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
-          retention-days: 90
