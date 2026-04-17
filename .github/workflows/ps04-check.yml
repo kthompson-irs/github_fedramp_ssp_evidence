@@ -19,58 +19,69 @@ jobs:
       OKTA_DOMAIN: ${{ secrets.OKTA_DOMAIN }}
       OKTA_TOKEN: ${{ secrets.OKTA_TOKEN }}
 
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-east-1
-
-      SPLUNK_HEC_URL: ${{ secrets.SPLUNK_HEC_URL }}
-      SPLUNK_HEC_TOKEN: ${{ secrets.SPLUNK_HEC_TOKEN }}
+      OUTPUT_FILE: ps04_report.json
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.11.8"
 
       - name: Install deps
         run: |
-          pip install requests boto3
+          pip install requests==2.31.0
 
-      # 🔹 Pull real evidence
+      # 🔹 GitHub audit logs
       - name: Fetch GitHub audit logs
         run: python scripts/fetch_github_audit_logs.py
 
-      - name: Fetch SCIM events
-        run: python scripts/fetch_scim_events.py
+      # 🔹 SCIM logs (safe optional)
+      - name: Fetch SCIM events (optional)
+        run: |
+          set -euo pipefail
 
-      # 🔹 Build termination dataset
-      - name: Build dataset
+          if [ -z "${OKTA_DOMAIN:-}" ] || [ -z "${OKTA_TOKEN:-}" ]; then
+            echo "Skipping SCIM fetch (OKTA not configured)"
+            mkdir -p data
+            echo "[]" > data/scim_log.json
+          else
+            python scripts/fetch_scim_events.py
+          fi
+
+      # 🔹 Build dataset
+      - name: Build termination dataset
         run: |
           python scripts/build_terminations_csv.py \
             --source data/terminations_source.csv \
             --output data/terminations.csv
 
-      # 🔹 Run compliance check
+      # 🔹 Run checker
       - name: Run PS-04 check
         run: |
-          python scripts/github_ps04_checker.py \
+          set -euo pipefail
+
+          CMD="python scripts/github_ps04_checker.py \
             --terminations data/terminations.csv \
-            --enterprise-audit-log data/enterprise_audit_log.json \
-            --scim-log data/scim_log.json \
+            --sla-minutes 60 \
             --fail-on-gaps \
-            --output ps04_report.json
+            --output ps04_report.json"
 
-      # 🔹 Evidence storage
-      - name: Upload to S3 (immutable)
-        run: python scripts/push_to_s3.py
+          if [ -f data/enterprise_audit_log.json ]; then
+            CMD="$CMD --enterprise-audit-log data/enterprise_audit_log.json"
+          fi
 
-      # 🔹 SIEM
-      - name: Send to Splunk
-        run: bash scripts/send_to_splunk.sh
+          if [ -f data/scim_log.json ]; then
+            CMD="$CMD --scim-log data/scim_log.json"
+          fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          echo "$CMD"
+          eval $CMD
+
+      - name: Show report
+        run: cat ps04_report.json
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
