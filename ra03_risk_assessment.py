@@ -25,7 +25,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 
 WORKFLOW_GLOBS = (".github/workflows/*.yml", ".github/workflows/*.yaml")
@@ -81,8 +81,6 @@ DANGEROUS_RUN_PATTERNS = [
 ]
 
 ACTION_USE_RE = re.compile(r"^\s*uses:\s*([^\s#]+)\s*$", re.MULTILINE)
-RUN_BLOCK_RE = re.compile(r"^\s*run:\s*\|?-?\s*$", re.MULTILINE)
-PULL_REQUEST_TARGET_RE = re.compile(r"pull_request_target\s*:")
 WRITE_PERMISSION_RE = re.compile(r"permissions:\s*\n(?P<body>(?:\s+[A-Za-z0-9_-]+:\s*[A-Za-z_-]+\s*\n?)+)", re.MULTILINE)
 WRITE_ALL_RE = re.compile(r"permissions:\s*\bwrite-all\b")
 SHA_RE = re.compile(r"@[0-9a-fA-F]{40}$")
@@ -110,7 +108,6 @@ def discover_files(repo_root: Path) -> List[Path]:
         files.extend(sorted(repo_root.glob(pattern)))
     for name in TEXT_FILE_NAMES:
         files.extend(sorted(repo_root.rglob(name)))
-    # Deduplicate while preserving order.
     seen = set()
     deduped = []
     for path in files:
@@ -156,7 +153,7 @@ def analyze_workflow(path: Path) -> List[Finding]:
     findings: List[Finding] = []
     rel = str(path)
 
-    if PULL_REQUEST_TARGET_RE.search(text):
+    if "pull_request_target" in text:
         findings.append(
             Finding(
                 id=f"wf-{short_sha(path.as_posix().encode())}-prtarget",
@@ -303,7 +300,6 @@ def analyze_repo(repo_root: Path) -> Report:
     for wf in wf_files:
         findings.extend(analyze_workflow(wf))
 
-    # Deduplicate by (title, file, details) so repeated patterns across workflows do not overwhelm the report.
     unique: List[Finding] = []
     seen = set()
     for f in findings:
@@ -326,9 +322,9 @@ def analyze_repo(repo_root: Path) -> Report:
     else:
         status = "fail"
 
-    repo = os.getenv("GITHUB_REPOSITORY", repo_root.name)
-    ref = os.getenv("GITHUB_REF_NAME", os.getenv("GITHUB_REF", "local"))
-    sha = os.getenv("GITHUB_SHA", "local")
+    repo = os.getenv("GH_REPOSITORY", os.getenv("GITHUB_REPOSITORY", repo_root.name))
+    ref = os.getenv("GH_REF_NAME", os.getenv("GITHUB_REF_NAME", os.getenv("GITHUB_REF", "local")))
+    sha = os.getenv("GH_SHA", os.getenv("GITHUB_SHA", "local"))
 
     return Report(
         repository=repo,
@@ -344,7 +340,7 @@ def analyze_repo(repo_root: Path) -> Report:
 
 def render_markdown(report: Report) -> str:
     lines = [
-        f"# RA-03 Repository Risk Assessment",
+        "# RA-03 Repository Risk Assessment",
         "",
         f"Repository: `{report.repository}`",
         f"Ref: `{report.ref}`",
