@@ -1,0 +1,76 @@
+name: ra-03-risk-assessment
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/**"
+      - "**/*.py"
+      - "**/*.yml"
+      - "**/*.yaml"
+      - "**/*.json"
+      - "**/*.toml"
+      - "**/*.txt"
+      - "**/*.md"
+  pull_request:
+  schedule:
+    # Weekly review to keep the risk assessment current.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      fail_below:
+        description: "Fail the workflow when the score is below this value"
+        required: false
+        default: "70"
+      output_dir:
+        description: "Directory for generated artifacts"
+        required: false
+        default: "ra03-artifacts"
+
+permissions:
+  contents: read
+
+jobs:
+  assess-repo-risk:
+    name: Assess repository risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run RA-03 assessment
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          python ra03_risk_assessment.py \
+            --repo-root . \
+            --output-dir "${{ github.event.inputs.output_dir || 'ra03-artifacts' }}" \
+            --fail-below "${{ github.event.inputs.fail_below || '70' }}"
+
+      - name: Upload assessment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ra-03-risk-assessment
+          path: |
+            ra03-artifacts/ra-03-report.json
+            ra03-artifacts/ra-03-report.md
+          if-no-files-found: error
+
+      - name: Publish summary to job summary
+        if: always()
+        run: |
+          echo "RA-03 assessment completed for ${{ github.repository }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the uploaded artifact for the full report." >> "$GITHUB_STEP_SUMMARY"
