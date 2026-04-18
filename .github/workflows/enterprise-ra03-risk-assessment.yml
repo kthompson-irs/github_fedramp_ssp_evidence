@@ -1,0 +1,74 @@
+name: enterprise-ra03-risk-assessment
+
+on:
+  workflow_dispatch:
+    inputs:
+      orgs:
+        description: 'Comma-separated GitHub organizations to assess'
+        required: true
+        default: 'my-org'
+      fail_below:
+        description: 'Fail the workflow when the enterprise score is below this value'
+        required: false
+        default: '75'
+      output_dir:
+        description: 'Directory for generated artifacts'
+        required: false
+        default: 'enterprise-ra03-artifacts'
+  schedule:
+    - cron: '0 10 * * 1'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/enterprise_ra03_assessment.yml'
+      - 'enterprise_ra03_assessment.py'
+
+permissions:
+  contents: read
+
+jobs:
+  assess-enterprise-risk:
+    name: Assess enterprise risk posture
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run enterprise RA-03 assessment
+        env:
+          GH_TOKEN: ${{ secrets.ENTERPRISE_AUDIT_TOKEN }}
+          GH_ORGS: ${{ github.event.inputs.orgs || vars.RA03_ORGS || 'my-org' }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          python enterprise_ra03_assessment.py \
+            --orgs "${GH_ORGS}" \
+            --repo-root . \
+            --output-dir "${{ github.event.inputs.output_dir || 'enterprise-ra03-artifacts' }}" \
+            --fail-below "${{ github.event.inputs.fail_below || '75' }}"
+
+      - name: Upload enterprise assessment artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enterprise-ra03-risk-assessment
+          path: |
+            enterprise-ra03-artifacts/enterprise-ra03-report.json
+            enterprise-ra03-artifacts/enterprise-ra03-report.md
+            enterprise-ra03-artifacts/repos/*.json
+          if-no-files-found: error
+
+      - name: Publish summary
+        if: always()
+        run: |
+          echo "Enterprise RA-03 assessment completed." >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the uploaded artifacts for the full inventory and findings." >> "$GITHUB_STEP_SUMMARY"
