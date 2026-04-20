@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,7 +23,7 @@ border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build SA-04(10) 30-day spreadsheets.")
+    parser = argparse.ArgumentParser(description="Build enterprise SA-04(10) 30-day spreadsheets.")
 
     parser.add_argument("--input-dir", dest="input_dir", default=None)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
@@ -42,84 +40,209 @@ def parse_args() -> argparse.Namespace:
 def read_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def utc_date_from_iso(value: str) -> Optional[datetime.date]:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default
+
+
+def safe_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-def latest_snapshot(input_dir: Path) -> Dict[str, Any]:
-    current = read_json(input_dir / "current_snapshot.json")
-    if isinstance(current, dict) and current:
-        return current
-    summary = read_json(input_dir / "summary.json")
-    if isinstance(summary, dict) and summary:
-        return summary
-    raise SystemExit("summary.json or current_snapshot.json not found or empty")
+def utc_date_from_iso(value: Optional[str]) -> Optional[str]:
+    dt = safe_dt(value)
+    return dt.date().isoformat() if dt else None
 
 
 def read_history(input_dir: Path) -> List[Dict[str, Any]]:
     history_dir = input_dir / "history"
-    items: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
 
-    jsonl = history_dir / "history.jsonl"
-    if jsonl.exists():
-        for line in jsonl.read_text(encoding="utf-8").splitlines():
+    history_jsonl = history_dir / "history.jsonl"
+    if history_jsonl.exists():
+        for line in history_jsonl.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line:
-                try:
-                    items.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    records.append(record)
+            except json.JSONDecodeError:
+                continue
 
-    if not items:
-        items.append(latest_snapshot(input_dir))
+    if not records:
+        current = read_json(input_dir / "current_snapshot.json")
+        if isinstance(current, dict) and current:
+            records.append(current)
+        else:
+            summary = read_json(input_dir / "summary.json")
+            if isinstance(summary, dict) and summary:
+                records.append(summary)
 
-    # keep most recent snapshot per day
-    dedup: Dict[str, Dict[str, Any]] = {}
-    for item in items:
-        day = item.get("date") or (item.get("generated_at") or "")[:10]
+    # Keep the latest record per day
+    per_day: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        day = rec.get("date") or utc_date_from_iso(rec.get("generated_at")) or ""
         if day:
-            dedup[day] = item
+            per_day[day] = rec
 
-    return [dedup[k] for k in sorted(dedup.keys())]
+    ordered = [per_day[k] for k in sorted(per_day.keys())]
+    return ordered
 
 
 def last_30_days(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return history[-30:] if len(history) > 30 else history
 
 
-def tableize(ws, ref: str, name: str) -> None:
-    t = Table(displayName=name, ref=ref)
-    t.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    ws.add_table(t)
+def severity_rank(value: str) -> int:
+    return {"low": 1, "medium": 2, "moderate": 2, "high": 3, "critical": 4}.get((value or "").lower(), 0)
 
 
-def style_header(ws, row: int, headers: List[str]) -> None:
-    for idx, h in enumerate(headers, 1):
-        c = ws.cell(row, idx, h)
-        c.font = Font(color=WHITE, bold=True)
-        c.fill = PatternFill("solid", fgColor=DARK)
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        c.border = border
+def normalize_severity(value: Optional[str]) -> str:
+    if not value:
+        return "unknown"
+    return str(value).strip().lower()
 
 
-def apply_common_sheet_layout(ws, title: str, subtitle: str, header_row: int, table_name: str, rows: List[List[Any]], widths: List[int]) -> None:
-    cols = len(widths)
+def org_from_snapshot(snapshot: Dict[str, Any]) -> str:
+    owner = snapshot.get("owner") or ""
+    if owner:
+        return str(owner)
+    repository = snapshot.get("repository") or ""
+    if "/" in repository:
+        return repository.split("/", 1)[0]
+    return ""
+
+
+def repo_from_snapshot(snapshot: Dict[str, Any]) -> str:
+    repository = snapshot.get("repository") or ""
+    if "/" in repository:
+        return repository.split("/", 1)[1]
+    return repository
+
+
+def findings_from_snapshot(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Build a normalized alert-entry list for one snapshot.
+    """
+    entries: List[Dict[str, Any]] = []
+    results = snapshot.get("results", {}) or {}
+    date = snapshot.get("date") or utc_date_from_iso(snapshot.get("generated_at")) or ""
+    scope = snapshot.get("scope") or ""
+    repository_full = snapshot.get("repository") or ""
+    org = snapshot.get("organization") or snapshot.get("owner") or org_from_snapshot(snapshot)
+    repo = snapshot.get("repo") or repo_from_snapshot(snapshot)
+
+    # Code scanning alerts
+    for alert in (results.get("code_scanning", {}) or {}).get("alerts", []) or []:
+        rule = alert.get("rule") or {}
+        severity = normalize_severity(rule.get("severity"))
+        loc = (alert.get("most_recent_instance") or {}).get("location") or {}
+        entries.append({
+            "date": date,
+            "scope": scope,
+            "organization": org,
+            "repository": repo,
+            "repository_full": repository_full,
+            "category": "CodeQL",
+            "severity": severity,
+            "severity_rank": severity_rank(severity),
+            "status": str(alert.get("state") or "open"),
+            "identifier": rule.get("id") or "unknown-rule",
+            "title": rule.get("name") or "unknown-title",
+            "source": "code_scanning",
+            "source_url": alert.get("html_url") or "",
+            "path": loc.get("path") or "",
+            "manifest": "",
+            "evidence_ref": snapshot.get("generated_at") or "",
+            "notes": "Historical CodeQL alert",
+        })
+
+    # Dependabot alerts
+    for alert in (results.get("dependabot", {}) or {}).get("alerts", []) or []:
+        advisory = alert.get("security_advisory") or {}
+        severity = normalize_severity(advisory.get("severity"))
+        dependency = (((alert.get("dependency") or {}).get("package") or {}).get("name")) or "unknown-package"
+        entries.append({
+            "date": date,
+            "scope": scope,
+            "organization": org,
+            "repository": repo,
+            "repository_full": repository_full,
+            "category": "Dependabot",
+            "severity": severity,
+            "severity_rank": severity_rank(severity),
+            "status": str(alert.get("state") or "open"),
+            "identifier": advisory.get("ghsa_id") or advisory.get("cve_id") or "unknown-advisory",
+            "title": advisory.get("summary") or "unknown-advisory",
+            "source": "dependabot",
+            "source_url": alert.get("html_url") or "",
+            "path": dependency,
+            "manifest": (((alert.get("dependency") or {}).get("manifest_path")) or ""),
+            "evidence_ref": snapshot.get("generated_at") or "",
+            "notes": "Historical Dependabot alert",
+        })
+
+    # Secret scanning alerts
+    for alert in (results.get("secret_scanning", {}) or {}).get("alerts", []) or []:
+        severity = "high" if str(alert.get("state") or "").lower() == "open" else "low"
+        entries.append({
+            "date": date,
+            "scope": scope,
+            "organization": org,
+            "repository": repo,
+            "repository_full": repository_full,
+            "category": "Secret Scanning",
+            "severity": severity,
+            "severity_rank": severity_rank(severity),
+            "status": str(alert.get("state") or "open"),
+            "identifier": alert.get("secret_type") or alert.get("secret_type_display_name") or "unknown-secret",
+            "title": alert.get("secret_type_display_name") or alert.get("secret_type") or "unknown-secret",
+            "source": "secret_scanning",
+            "source_url": alert.get("html_url") or "",
+            "path": "",
+            "manifest": "",
+            "evidence_ref": snapshot.get("generated_at") or "",
+            "notes": "Historical secret scanning alert",
+        })
+
+    return entries
+
+
+def sort_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Highest severity first, then most recent date, then category, then identifier
+    def key(item: Dict[str, Any]):
+        return (
+            -int(item.get("severity_rank", 0)),
+            str(item.get("date", "")),
+            str(item.get("category", "")),
+            str(item.get("identifier", "")),
+        )
+
+    return sorted(entries, key=key, reverse=False)
+
+
+def write_table_sheet(
+    ws,
+    title: str,
+    subtitle: str,
+    headers: List[str],
+    rows: List[List[Any]],
+    table_name: str,
+    widths: List[int],
+) -> None:
+    cols = len(headers)
     end_col = chr(64 + cols)
 
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = f"A{header_row + 1}"
+    ws.freeze_panes = "A4"
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=cols)
     ws["A1"] = title
@@ -132,221 +255,167 @@ def apply_common_sheet_layout(ws, title: str, subtitle: str, header_row: int, ta
     ws["A2"].fill = PatternFill("solid", fgColor=LIGHT)
     ws["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
+    for idx, header in enumerate(headers, 1):
+        c = ws.cell(3, idx, header)
+        c.font = Font(color=WHITE, bold=True)
+        c.fill = PatternFill("solid", fgColor=DARK)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = border
+
+    for r_idx, row in enumerate(rows, 4):
+        for c_idx, value in enumerate(row, 1):
+            c = ws.cell(r_idx, c_idx, value)
+            c.border = border
+            c.alignment = Alignment(
+                horizontal="left" if c_idx in {3, 8, 9, 10, 11, 12, 13, 14} else "center",
+                vertical="center",
+                wrap_text=True,
+            )
+            if c_idx == 1 and value:
+                c.number_format = "yyyy-mm-dd"
+
+            if c_idx == 5:  # severity column
+                sev = str(value).lower()
+                if sev in {"critical", "high"}:
+                    c.fill = PatternFill("solid", fgColor=RED)
+                elif sev in {"medium", "moderate"}:
+                    c.fill = PatternFill("solid", fgColor=AMBER)
+                elif sev == "low":
+                    c.fill = PatternFill("solid", fgColor=GREEN)
+
     if rows:
-        table_ref = f"A{header_row}:{end_col}{header_row + len(rows)}"
-        tableize(ws, table_ref, table_name)
+        ref = f"A3:{end_col}{len(rows) + 3}"
+        table = Table(displayName=table_name, ref=ref)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
 
     for idx, width in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + idx)].width = width
 
 
-def snapshot_summary_rows(kind: str, snapshot: Dict[str, Any]) -> List[List[Any]]:
-    results = snapshot.get("results", {})
-    overall = snapshot.get("overall", {})
+def write_summary_sheet(ws, title: str, rows: List[List[Any]]) -> None:
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:B1")
+    ws["A1"] = title
+    ws["A1"].font = Font(color=WHITE, bold=True, size=13)
+    ws["A1"].fill = PatternFill("solid", fgColor=DARK)
+    ws["A1"].alignment = Alignment(horizontal="center")
 
-    if kind == "dependabot":
-        dep = results.get("dependabot", {})
-        return [
-            ["Generated At", snapshot.get("generated_at", "")],
-            ["Date", snapshot.get("date", "")],
-            ["Scope", snapshot.get("scope", "")],
-            ["Repository", snapshot.get("repository", "")],
-            ["Open Alerts", dep.get("count", 0)],
-            ["Blocking Findings", dep.get("blocking_count", 0)],
-            ["Accessible", "Yes" if dep.get("accessible") else "No"],
-            ["Skipped", "Yes" if dep.get("skipped") else "No"],
-            ["Skip Reason", dep.get("skip_reason") or ""],
-            ["Status", "Open" if dep.get("blocking_count", 0) else "Clear"],
-        ]
+    for i, (k, v) in enumerate(rows, 3):
+        ws.cell(i, 1, k).font = Font(bold=True)
+        ws.cell(i, 1).fill = PatternFill("solid", fgColor=LIGHT)
+        ws.cell(i, 1).border = border
+        ws.cell(i, 2, v).border = border
+        ws.cell(i, 2).alignment = Alignment(wrap_text=True)
 
-    if kind == "codeql":
-        code = results.get("code_scanning", {})
-        return [
-            ["Generated At", snapshot.get("generated_at", "")],
-            ["Date", snapshot.get("date", "")],
-            ["Scope", snapshot.get("scope", "")],
-            ["Repository", snapshot.get("repository", "")],
-            ["Open Alerts", code.get("count", 0)],
-            ["Blocking Findings", code.get("blocking_count", 0)],
-            ["Accessible", "Yes" if code.get("accessible") else "No"],
-            ["Skipped", "Yes" if code.get("skipped") else "No"],
-            ["Skip Reason", code.get("skip_reason") or ""],
-            ["Status", "Open" if code.get("blocking_count", 0) else "Clear"],
-        ]
-
-    sec = results.get("secret_scanning", {})
-    return [
-        ["Generated At", snapshot.get("generated_at", "")],
-        ["Date", snapshot.get("date", "")],
-        ["Scope", snapshot.get("scope", "")],
-        ["Repository", snapshot.get("repository", "")],
-        ["Open Code Scanning", results.get("code_scanning", {}).get("count", 0)],
-        ["Open Dependabot", results.get("dependabot", {}).get("count", 0)],
-        ["Open Secret Scanning", sec.get("count", 0)],
-        ["Blocking Findings", overall.get("blocking_count", 0)],
-        ["Collection Errors", overall.get("error_count", 0)],
-        ["Status", overall.get("status", "").title()],
-    ]
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 95
 
 
-def build_workbook(path: Path, title: str, kind: str, rows: List[List[Any]], snapshot: Dict[str, Any]) -> None:
+def build_workbook(
+    path: Path,
+    sheet_title: str,
+    rows: List[List[Any]],
+    summary_rows: List[List[Any]],
+    notes: List[str],
+    table_name: str,
+    widths: List[int],
+    headers: List[str],
+) -> None:
     wb = Workbook()
     ws = wb.active
     ws.title = "30-Day Log"
 
-    if kind == "security":
-        headers = ["Date", "Scope", "Repository", "Code Scanning", "Dependabot", "Secret Scanning", "Blocking Findings", "Status", "Evidence Ref", "Notes"]
-        widths = [12, 16, 44, 14, 14, 16, 16, 14, 26, 34]
-        row_len = 10
-    else:
-        headers = ["Date", "Scope", "Repository", "Open Alerts", "Blocking Findings", "Highest Severity", "Status", "Evidence Ref", "Notes"]
-        widths = [12, 16, 44, 14, 16, 16, 14, 26, 34]
-        row_len = 9
-
-    apply_common_sheet_layout(
-        ws,
-        title=title,
-        subtitle="Historical rows are aggregated from real snapshot files in artifacts/sa-04-10/history.",
-        header_row=4,
-        table_name=path.stem.replace("-", "_"),
+    write_table_sheet(
+        ws=ws,
+        title=sheet_title,
+        subtitle="Real historical alert entries aggregated from artifacts/sa-04-10/history. No placeholder rows are inserted.",
+        headers=headers,
         rows=rows,
+        table_name=table_name,
         widths=widths,
     )
-    style_header(ws, 4, headers)
-
-    for r_idx, row in enumerate(rows, 5):
-        for c_idx, val in enumerate(row, 1):
-            c = ws.cell(r_idx, c_idx, val)
-            c.border = border
-            c.alignment = Alignment(
-                horizontal="left" if c_idx in {2, 3, row_len - 1, row_len} else "center",
-                vertical="center",
-                wrap_text=True,
-            )
-            if c_idx == 1 and val:
-                c.number_format = "yyyy-mm-dd"
-
-            # light color coding
-            if kind != "security" and c_idx == 7:
-                v = str(val).lower()
-                if v in {"open", "high", "critical"}:
-                    c.fill = PatternFill("solid", fgColor=RED)
-                elif v == "clear":
-                    c.fill = PatternFill("solid", fgColor=GREEN)
-                elif v.startswith("pending") or v.startswith("historical"):
-                    c.fill = PatternFill("solid", fgColor=AMBER)
-
-            if kind == "security" and c_idx == 8:
-                v = str(val).lower()
-                if v in {"open", "fail", "error"}:
-                    c.fill = PatternFill("solid", fgColor=RED)
-                elif v in {"clear", "pass"}:
-                    c.fill = PatternFill("solid", fgColor=GREEN)
-                elif v.startswith("pending") or v.startswith("historical"):
-                    c.fill = PatternFill("solid", fgColor=AMBER)
 
     summary = wb.create_sheet("Snapshot Summary")
-    summary.sheet_view.showGridLines = False
-    summary.merge_cells("A1:B1")
-    summary["A1"] = f"{title} Summary"
-    summary["A1"].font = Font(color=WHITE, bold=True, size=13)
-    summary["A1"].fill = PatternFill("solid", fgColor=DARK)
-    summary["A1"].alignment = Alignment(horizontal="center")
+    write_summary_sheet(summary, f"{sheet_title} Summary", summary_rows)
 
-    summary_rows = snapshot_summary_rows(kind, snapshot)
-    for i, (k, v) in enumerate(summary_rows, 3):
-        summary.cell(i, 1, k).font = Font(bold=True)
-        summary.cell(i, 1).fill = PatternFill("solid", fgColor=LIGHT)
-        summary.cell(i, 1).border = border
-        summary.cell(i, 2, v).border = border
-        summary.cell(i, 2).alignment = Alignment(wrap_text=True)
+    readme = wb.create_sheet("Read Me")
+    readme.sheet_view.showGridLines = False
+    readme.merge_cells("A1:B1")
+    readme["A1"] = f"{sheet_title} — Audit Notes"
+    readme["A1"].font = Font(color=WHITE, bold=True, size=13)
+    readme["A1"].fill = PatternFill("solid", fgColor=DARK)
 
-    summary.column_dimensions["A"].width = 28
-    summary.column_dimensions["B"].width = 92
+    for i, note in enumerate(notes, 3):
+        readme.cell(i, 1, f"Note {i-2}").font = Font(bold=True)
+        readme.cell(i, 1).fill = PatternFill("solid", fgColor=LIGHT)
+        readme.cell(i, 1).border = border
+        readme.cell(i, 2, note).border = border
+        readme.cell(i, 2).alignment = Alignment(wrap_text=True)
 
-    notes = wb.create_sheet("Read Me")
-    notes.sheet_view.showGridLines = False
-    notes.merge_cells("A1:B1")
-    notes["A1"] = f"{title} — Audit Notes"
-    notes["A1"].font = Font(color=WHITE, bold=True, size=13)
-    notes["A1"].fill = PatternFill("solid", fgColor=DARK)
-    notes_rows = [
-        ("Purpose", "30-day FedRAMP SA-04(10) log generated from actual historical snapshots."),
-        ("Source", "artifacts/sa-04-10/history/history.jsonl and daily snapshot JSON files."),
-        ("Behavior", "Only real history is rendered; missing days are not padded with placeholder rows."),
-        ("Audit cue", "Use with the evidence binder and OSCAL SSP package."),
-    ]
-    for i, (k, v) in enumerate(notes_rows, 3):
-        notes.cell(i, 1, k).font = Font(bold=True)
-        notes.cell(i, 1).fill = PatternFill("solid", fgColor=LIGHT)
-        notes.cell(i, 1).border = border
-        notes.cell(i, 2, v).border = border
-        notes.cell(i, 2).alignment = Alignment(wrap_text=True)
-
-    notes.column_dimensions["A"].width = 18
-    notes.column_dimensions["B"].width = 92
+    readme.column_dimensions["A"].width = 18
+    readme.column_dimensions["B"].width = 95
 
     wb.save(path)
 
 
-def render_rows(history: List[Dict[str, Any]]) -> Dict[str, List[List[Any]]]:
-    history = last_30_days(history)
+def aggregate_entries(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for snapshot in history:
+        entries.extend(findings_from_snapshot(snapshot))
+    return entries
+
+
+def make_sheet_rows(entries: List[Dict[str, Any]]) -> Dict[str, List[List[Any]]]:
     dep_rows: List[List[Any]] = []
     code_rows: List[List[Any]] = []
     sec_rows: List[List[Any]] = []
 
-    for snap in history:
-        day = snap.get("date") or (snap.get("generated_at") or "")[:10]
-        scope = snap.get("scope", "")
-        repo = snap.get("repository", "")
-        results = snap.get("results", {})
-        overall = snap.get("overall", {})
+    for e in entries:
+        row = [
+            e.get("date", ""),
+            e.get("scope", ""),
+            e.get("organization", ""),
+            e.get("repository", ""),
+            e.get("severity", ""),
+            e.get("status", ""),
+            e.get("identifier", ""),
+            e.get("title", ""),
+            e.get("source_url", ""),
+            e.get("path", ""),
+            e.get("manifest", ""),
+            e.get("evidence_ref", ""),
+            e.get("notes", ""),
+            e.get("repository_full", ""),
+        ]
+        if e.get("source") == "dependabot":
+            dep_rows.append(row)
+        elif e.get("source") == "code_scanning":
+            code_rows.append(row)
+        elif e.get("source") == "secret_scanning":
+            sec_rows.append(row)
 
-        dep = results.get("dependabot", {})
-        code = results.get("code_scanning", {})
-        sec = results.get("secret_scanning", {})
+    # Sort each workbook by severity, then date, then identifier
+    dep_rows = sorted(dep_rows, key=lambda r: (-severity_rank(str(r[4])), str(r[0]), str(r[6])), reverse=False)
+    code_rows = sorted(code_rows, key=lambda r: (-severity_rank(str(r[4])), str(r[0]), str(r[6])), reverse=False)
+    sec_rows = sorted(sec_rows, key=lambda r: (-severity_rank(str(r[4])), str(r[0]), str(r[6])), reverse=False)
 
-        dep_rows.append([
-            day,
-            scope,
-            repo,
-            dep.get("count", 0),
-            dep.get("blocking_count", 0),
-            "High" if dep.get("blocking_count", 0) else "Low",
-            "Open" if dep.get("blocking_count", 0) else "Clear",
-            snap.get("generated_at", ""),
-            dep.get("skip_reason") or "Historical snapshot",
-        ])
-
-        code_rows.append([
-            day,
-            scope,
-            repo,
-            code.get("count", 0),
-            code.get("blocking_count", 0),
-            "High" if code.get("blocking_count", 0) else "Low",
-            "Open" if code.get("blocking_count", 0) else "Clear",
-            snap.get("generated_at", ""),
-            code.get("skip_reason") or "Historical snapshot",
-        ])
-
-        sec_rows.append([
-            day,
-            scope,
-            repo,
-            code.get("count", 0),
-            dep.get("count", 0),
-            sec.get("count", 0),
-            overall.get("blocking_count", 0),
-            overall.get("status", "").title(),
-            snap.get("generated_at", ""),
-            "Historical snapshot",
-        ])
+    security_rows = sorted(
+        dep_rows + code_rows + sec_rows,
+        key=lambda r: (-severity_rank(str(r[4])), str(r[0]), str(r[3]), str(r[6])),
+        reverse=False,
+    )
 
     return {
         "dependabot": dep_rows,
         "codeql": code_rows,
-        "security": sec_rows,
+        "security": security_rows,
     }
 
 
@@ -354,41 +423,97 @@ def main() -> int:
     args = parse_args()
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     history = read_history(input_dir)
     if not history:
         raise SystemExit("No historical snapshots found in artifacts/sa-04-10")
 
-    rows = render_rows(history)
+    entries = sort_entries(aggregate_entries(last_30_days(history)))
+    rows = make_sheet_rows(entries)
+
     latest = history[-1]
+    results = latest.get("results", {}) or {}
 
+    headers = ["Date", "Scope", "Organization", "Repository", "Severity", "Status", "Identifier", "Title", "Source URL", "Path", "Manifest", "Evidence Ref", "Notes", "Repository Full"]
+
+    # Dependabot workbook
     build_workbook(
-        output_dir / "dependabot_30_day_log.xlsx",
-        "Dependabot 30-Day Log",
-        "dependabot",
-        rows["dependabot"],
-        latest,
+        path=output_dir / "dependabot_30_day_log.xlsx",
+        sheet_title="Dependabot 30-Day Log",
+        rows=rows["dependabot"],
+        summary_rows=[
+            ["Generated At", latest.get("generated_at", "")],
+            ["Scope", latest.get("scope", "")],
+            ["Organization", latest.get("organization") or latest.get("owner") or ""],
+            ["Repository", latest.get("repository", "")],
+            ["Entry Count", len(rows["dependabot"])],
+            ["Blocking Findings", latest.get("overall", {}).get("blocking_count", 0)],
+            ["Status", latest.get("overall", {}).get("status", "").title()],
+        ],
+        notes=[
+            "This workbook lists real Dependabot alert entries from the last 30 days.",
+            "Rows are sorted by severity first, then by date.",
+            "No synthetic placeholder rows are inserted.",
+        ],
+        table_name="dependabot_30_day_log",
+        widths=[12, 16, 16, 28, 12, 12, 24, 34, 44, 30, 24, 24, 30, 32],
+        headers=headers,
     )
 
+    # CodeQL workbook
     build_workbook(
-        output_dir / "security_30_day_log.xlsx",
-        "Security 30-Day Log",
-        "security",
-        rows["security"],
-        latest,
+        path=output_dir / "codeql_30_day_log.xlsx",
+        sheet_title="CodeQL 30-Day Log",
+        rows=rows["codeql"],
+        summary_rows=[
+            ["Generated At", latest.get("generated_at", "")],
+            ["Scope", latest.get("scope", "")],
+            ["Organization", latest.get("organization") or latest.get("owner") or ""],
+            ["Repository", latest.get("repository", "")],
+            ["Entry Count", len(rows["codeql"])],
+            ["Blocking Findings", latest.get("overall", {}).get("blocking_count", 0)],
+            ["Status", latest.get("overall", {}).get("status", "").title()],
+        ],
+        notes=[
+            "This workbook lists real CodeQL alert entries from the last 30 days.",
+            "Rows are sorted by severity first, then by date.",
+            "Evidence references point back to the originating snapshot.",
+        ],
+        table_name="codeql_30_day_log",
+        widths=[12, 16, 16, 28, 12, 12, 24, 34, 44, 30, 24, 24, 30, 32],
+        headers=headers,
     )
 
+    # Security workbook
     build_workbook(
-        output_dir / "codeql_30_day_log.xlsx",
-        "CodeQL 30-Day Log",
-        "codeql",
-        rows["codeql"],
-        latest,
+        path=output_dir / "security_30_day_log.xlsx",
+        sheet_title="Security 30-Day Log",
+        rows=rows["security"],
+        summary_rows=[
+            ["Generated At", latest.get("generated_at", "")],
+            ["Scope", latest.get("scope", "")],
+            ["Organization", latest.get("organization") or latest.get("owner") or ""],
+            ["Repository", latest.get("repository", "")],
+            ["Entry Count", len(rows["security"])],
+            ["Blocking Findings", latest.get("overall", {}).get("blocking_count", 0)],
+            ["Collection Errors", latest.get("overall", {}).get("error_count", 0)],
+            ["Status", latest.get("overall", {}).get("status", "").title()],
+        ],
+        notes=[
+            "This workbook combines CodeQL, Dependabot, and Secret Scanning entries from the last 30 days.",
+            "Entries are sorted by severity first, then by date.",
+            "Use this workbook as the aggregate security evidence log for the enterprise package.",
+        ],
+        table_name="security_30_day_log",
+        widths=[12, 16, 16, 28, 12, 12, 24, 34, 44, 30, 24, 24, 30, 32],
+        headers=headers,
     )
 
     print(f"Spreadsheets generated in {output_dir}")
+    print(f"Dependabot rows: {len(rows['dependabot'])}")
+    print(f"CodeQL rows: {len(rows['codeql'])}")
+    print(f"Security rows: {len(rows['security'])}")
     return 0
 
 
