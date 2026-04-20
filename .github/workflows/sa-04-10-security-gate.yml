@@ -1,4 +1,4 @@
-name: SA-04(10) Security Gate
+name: SA-04(10) Security Gate and FedRAMP Package
 
 on:
   push:
@@ -7,10 +7,6 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      run_full_scan:
-        description: "Run full SA-04(10) scan (manual/audit trigger)"
-        required: false
-        default: "true"
       fail_on_severity:
         description: "Severity threshold (low, medium, high, critical)"
         required: false
@@ -23,8 +19,8 @@ permissions:
   pull-requests: read
 
 jobs:
-  security-gate:
-    name: SA-04(10) Security Gate (AWS + GitHub)
+  build-evidence-package:
+    name: SA-04(10) Security Gate + FedRAMP Package
     runs-on: ubuntu-latest
 
     steps:
@@ -59,9 +55,52 @@ jobs:
           upload: always
           wait-for-processing: true
 
-      - name: Poll GitHub security alerts (SA-04(10))
+      - name: Poll GitHub security alerts and collect evidence
         env:
           GH_DEPENDABOT_TOKEN: ${{ secrets.GH_DEPENDABOT_TOKEN }}
           GH_REPO: ${{ github.repository }}
           FAIL_ON_SEVERITY: ${{ github.event.inputs.fail_on_severity || 'high' }}
-        run: python scripts/gh_sa_04_10_poll_alerts.py
+          SA04_SOFT_FAIL: "1"
+        run: python scripts/gh_sa_04_10_poll_alerts.py --output-dir artifacts/sa-04-10 --soft-fail
+
+      - name: Build FedRAMP submission package
+        if: always()
+        run: python scripts/build_fedramp_submission_package.py --input-dir artifacts/sa-04-10 --output-dir fedramp_ato_package
+
+      - name: Upload FedRAMP submission package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-ato-package
+          path: |
+            fedramp_ato_package
+            artifacts/sa-04-10
+
+      - name: Enforce SA-04(10) result
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          summary_path = Path("artifacts/sa-04-10/summary.json")
+          if not summary_path.exists():
+              print("SA-04(10) COMPLIANCE FAILURE: summary.json was not produced.")
+              sys.exit(2)
+
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          overall = summary.get("overall", {})
+          error_count = int(overall.get("error_count", 0))
+          blocking_count = int(overall.get("blocking_count", 0))
+
+          if error_count > 0:
+              print(f"SA-04(10) COMPLIANCE FAILURE: {error_count} collection error(s) were recorded.")
+              sys.exit(2)
+
+          if blocking_count > 0:
+              print(f"SA-04(10) COMPLIANCE FAILURE: {blocking_count} blocking finding(s) were detected.")
+              sys.exit(1)
+
+          print("SA-04(10) COMPLIANCE PASS: no blocking findings and no collection errors were detected.")
+          PY
