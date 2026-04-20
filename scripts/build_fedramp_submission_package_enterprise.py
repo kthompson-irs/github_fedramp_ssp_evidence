@@ -10,7 +10,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 
 def utc_now() -> str:
@@ -81,14 +81,6 @@ def copy_tree(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
-def copy_if_exists(src: Path, dst: Path) -> bool:
-    if not src.exists():
-        return False
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    return True
-
-
 def make_manifest(root: Path) -> Dict[str, Any]:
     files: List[Dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
@@ -112,12 +104,10 @@ def make_manifest(root: Path) -> Dict[str, Any]:
 
 def repo_from_env_or_summary(summary: Dict[str, Any]) -> Dict[str, str]:
     full = os.getenv("GH_REPOSITORY") or summary.get("repository") or ""
-    owner = os.getenv("GH_ORG_NAME") or summary.get("owner") or ""
-    if not owner and "/" in full:
-        owner = full.split("/", 1)[0]
+    owner = os.getenv("GH_ORG_NAME") or summary.get("organization") or summary.get("owner") or ""
     return {
         "repository": full,
-        "owner": owner,
+        "organization": owner,
         "workflow": os.getenv("GH_WORKFLOW", ""),
         "run_id": os.getenv("GH_RUN_ID", ""),
         "run_attempt": os.getenv("GH_RUN_ATTEMPT", ""),
@@ -133,7 +123,21 @@ def csv_quote(value: str) -> str:
 
 
 def build_poam_csv(findings: List[Dict[str, Any]]) -> str:
-    rows = [["id", "category", "identifier", "severity", "title", "source_url", "status", "recommended_due_date"]]
+    rows = [
+        [
+            "id",
+            "category",
+            "organization",
+            "repository",
+            "repository_full",
+            "identifier",
+            "severity",
+            "title",
+            "source_url",
+            "status",
+            "recommended_due_date",
+        ]
+    ]
     for idx, finding in enumerate(findings, start=1):
         severity = str(finding.get("severity", "")).lower()
         due = "30 days" if severity in {"high", "critical"} else "90 days"
@@ -141,6 +145,9 @@ def build_poam_csv(findings: List[Dict[str, Any]]) -> str:
             [
                 f"POAM-{idx:03d}",
                 str(finding.get("category", "")),
+                str(finding.get("organization", "")),
+                str(finding.get("repository", "")),
+                str(finding.get("repository_full", "")),
                 str(finding.get("identifier", "")),
                 severity,
                 str(finding.get("title", "")),
@@ -185,12 +192,18 @@ def load_controls_manifest(path: Path) -> Dict[str, Any]:
 
 
 def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str]) -> str:
+    scope = summary.get("scope", "unknown")
+    repository = summary.get("repository", "unknown")
+    repo_count = summary.get("repository_count", 0)
+
     lines = [
         "# Treasury Cloud SSP",
         "",
         f"- Generated: `{summary.get('generated_at', utc_now())}`",
-        f"- Scope: `{summary.get('scope', '')}`",
-        f"- Repository: `{summary.get('repository', '')}`",
+        f"- Scope: `{scope}`",
+        f"- Organization: `{summary.get('organization', '')}`",
+        f"- Repository: `{repository}`",
+        f"- Repository count: `{repo_count}`",
         f"- Workflow: `{run_context.get('workflow', '')}`",
         f"- Run ID: `{run_context.get('run_id', '')}`",
         "",
@@ -210,6 +223,18 @@ def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], 
             "",
         ]
     )
+
+    if scope == "enterprise":
+        lines.extend(
+            [
+                "## Enterprise Coverage",
+                "",
+                f"- Enterprise slug: `{summary.get('enterprise', '')}`",
+                f"- Covered repositories: `{repo_count}`",
+                "",
+            ]
+        )
+
     return "\n".join(lines)
 
 
@@ -342,6 +367,10 @@ def build_oscal_ssp(
 
 
 def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str]) -> str:
+    scope = summary.get("scope", "unknown")
+    repository = summary.get("repository", "unknown")
+    repo_count = summary.get("repository_count", 0)
+
     return "\n".join(
         [
             "# FedRAMP Submission Package",
@@ -353,8 +382,10 @@ def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_co
             "SA-04(10) – Developer Security Testing and Evaluation",
             "",
             f"Generated: {summary.get('generated_at', utc_now())}",
-            f"Repository: {summary.get('repository', 'unknown')}",
-            f"Scope: {summary.get('scope', 'unknown')}",
+            f"Repository: {repository}",
+            f"Organization: {summary.get('organization', '')}",
+            f"Scope: {scope}",
+            f"Repository count: {repo_count}",
             f"Workflow: {run_context.get('workflow', '')}",
             f"Run ID: {run_context.get('run_id', '')}",
             "",
@@ -422,9 +453,7 @@ def copy_spreadsheets(spreadsheets_dir: Path, output_dir: Path) -> List[str]:
 
     # Copy any other workbook/zip artifacts if present
     for src in sorted(spreadsheets_dir.iterdir()):
-        if src.name in copied:
-            continue
-        if src.is_file() and src.suffix.lower() in {".xlsx", ".zip"}:
+        if src.is_file() and src.suffix.lower() in {".xlsx", ".zip"} and src.name not in copied:
             dst = output_dir / "Spreadsheets" / src.name
             shutil.copy2(src, dst)
             copied.append(src.name)
@@ -440,6 +469,27 @@ def zip_directory(source_dir: Path, zip_path: Path) -> None:
             if path == zip_path:
                 continue
             zf.write(path, arcname=str(path.relative_to(source_dir)))
+
+
+def make_manifest(root: Path) -> Dict[str, Any]:
+    files: List[Dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        if path.name == "fedramp_ato_package.zip":
+            continue
+        files.append(
+            {
+                "path": str(path.relative_to(root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return {
+        "generated_at": utc_now(),
+        "file_count": len(files),
+        "files": files,
+    }
 
 
 def main() -> int:
@@ -486,7 +536,12 @@ def main() -> int:
     run_context = repo_from_env_or_summary(summary)
     has_sarif = (output_dir / "Evidence" / "CI_CD" / "codeql_results" / "python.sarif").exists()
 
-    # Add spreadsheet references to the evidence area if they were copied
+    if summary.get("scope") == "enterprise" and summary.get("repositories"):
+        write_text(
+            output_dir / "Evidence" / "CI_CD" / "enterprise_repositories.txt",
+            "\n".join(summary.get("repositories", [])) + "\n",
+        )
+
     if copied_spreadsheets:
         write_text(
             output_dir / "Evidence" / "CI_CD" / "spreadsheets_manifest.txt",
