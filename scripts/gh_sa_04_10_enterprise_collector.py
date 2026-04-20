@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -159,7 +160,11 @@ def probe(scope: str, base_path: str, headers: Dict[str, str]) -> Tuple[bool, Li
     diagnostics: List[Dict[str, Any]] = []
 
     if scope == "enterprise":
-        endpoints = [("dependabot", f"{GH_API}{base_path}/dependabot/alerts")]
+        endpoints = [
+            ("code_scanning", f"{GH_API}{base_path}/code-scanning/alerts"),
+            ("dependabot", f"{GH_API}{base_path}/dependabot/alerts"),
+            ("secret_scanning", f"{GH_API}{base_path}/secret-scanning/alerts"),
+        ]
     else:
         endpoints = [
             ("code_scanning", f"{GH_API}{base_path}/code-scanning/alerts"),
@@ -277,6 +282,46 @@ def blocking(severity: str, threshold: str) -> bool:
     return rank(severity) >= rank(threshold) > 0
 
 
+def parse_repo_context(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, str]:
+    repository = alert.get("repository") or {}
+    repo_full = ""
+    organization = ""
+    repo_name = ""
+
+    if isinstance(repository, dict) and repository:
+        repo_full = str(repository.get("full_name") or "").strip()
+        repo_name = str(repository.get("name") or "").strip()
+        owner = repository.get("owner") or {}
+        if isinstance(owner, dict):
+            organization = str(owner.get("login") or "").strip()
+
+    if not repo_full:
+        repo_url = str(alert.get("repository_url") or "").strip()
+        if repo_url:
+            parsed = urlparse(repo_url)
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 3 and parts[0] == "repos":
+                organization = organization or parts[1]
+                repo_name = repo_name or parts[2]
+                repo_full = f"{organization}/{repo_name}"
+
+    if not repo_full and fallback_repository_full:
+        repo_full = fallback_repository_full
+        if "/" in fallback_repository_full:
+            organization, repo_name = fallback_repository_full.split("/", 1)
+
+    if not organization and repo_full and "/" in repo_full:
+        organization = repo_full.split("/", 1)[0]
+    if not repo_name and repo_full and "/" in repo_full:
+        repo_name = repo_full.split("/", 1)[1]
+
+    return {
+        "organization": organization,
+        "repository": repo_name,
+        "repository_full": repo_full,
+    }
+
+
 def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     for alert in alerts:
@@ -284,6 +329,7 @@ def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[s
         severity = str(rule.get("severity") or "").lower()
         if blocking(severity, threshold):
             loc = (alert.get("most_recent_instance") or {}).get("location") or {}
+            repo_ctx = parse_repo_context(alert)
             findings.append(
                 {
                     "category": "code_scanning",
@@ -292,6 +338,9 @@ def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[s
                     "severity": severity,
                     "state": alert.get("state") or "open",
                     "html_url": alert.get("html_url"),
+                    "organization": repo_ctx["organization"],
+                    "repository": repo_ctx["repository"],
+                    "repository_full": repo_ctx["repository_full"],
                     "path": loc.get("path"),
                     "start_line": loc.get("start_line"),
                     "end_line": loc.get("end_line"),
@@ -307,6 +356,7 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
         severity = str(advisory.get("severity") or "").lower()
         if blocking(severity, threshold):
             dependency = (((alert.get("dependency") or {}).get("package") or {}).get("name")) or "unknown-package"
+            repo_ctx = parse_repo_context(alert)
             findings.append(
                 {
                     "category": "dependabot",
@@ -315,6 +365,9 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
                     "severity": severity,
                     "state": alert.get("state") or "open",
                     "html_url": alert.get("html_url"),
+                    "organization": repo_ctx["organization"],
+                    "repository": repo_ctx["repository"],
+                    "repository_full": repo_ctx["repository_full"],
                     "dependency": dependency,
                     "manifest_path": ((alert.get("dependency") or {}).get("manifest_path")),
                 }
@@ -325,6 +378,7 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
 def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     for alert in alerts:
+        repo_ctx = parse_repo_context(alert)
         findings.append(
             {
                 "category": "secret_scanning",
@@ -333,6 +387,9 @@ def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "severity": "open",
                 "state": alert.get("state") or "open",
                 "html_url": alert.get("html_url"),
+                "organization": repo_ctx["organization"],
+                "repository": repo_ctx["repository"],
+                "repository_full": repo_ctx["repository_full"],
                 "secret_type": alert.get("secret_type"),
             }
         )
@@ -341,6 +398,47 @@ def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def list_alerts(base_path: str, headers: Dict[str, str], endpoint: str) -> List[Dict[str, Any]]:
     return paged_get(f"{GH_API}{base_path}/{endpoint}", headers, params={"state": "open"})
+
+
+def normalize_category_alerts(
+    alerts: List[Dict[str, Any]],
+    category: str,
+    threshold: str,
+    fallback_repository_full: str = "",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (normalized_alerts, blocking_findings).
+    """
+    normalized: List[Dict[str, Any]] = []
+    blocking_items: List[Dict[str, Any]] = []
+
+    for alert in alerts:
+        repo_ctx = parse_repo_context(alert, fallback_repository_full=fallback_repository_full)
+        normalized_alert = dict(alert)
+        normalized_alert["organization"] = repo_ctx["organization"]
+        normalized_alert["repository"] = repo_ctx["repository"]
+        normalized_alert["repository_full"] = repo_ctx["repository_full"]
+        normalized_alert["enterprise_scope"] = True
+
+        if category == "code_scanning":
+            rule = alert.get("rule") or {}
+            severity = str(rule.get("severity") or "").lower()
+            normalized.append(normalized_alert)
+            if blocking(severity, threshold):
+                blocking_items.extend(codeql_findings([normalized_alert], threshold))
+        elif category == "dependabot":
+            advisory = alert.get("security_advisory") or {}
+            severity = str(advisory.get("severity") or "").lower()
+            normalized.append(normalized_alert)
+            if blocking(severity, threshold):
+                blocking_items.extend(dependabot_findings([normalized_alert], threshold))
+        elif category == "secret_scanning":
+            normalized.append(normalized_alert)
+            blocking_items.extend(secret_findings([normalized_alert]))
+        else:
+            normalized.append(normalized_alert)
+
+    return normalized, blocking_items
 
 
 def build_snapshot(
@@ -353,6 +451,7 @@ def build_snapshot(
     results: Dict[str, Any],
     blocking_findings: List[Dict[str, Any]],
     errors: List[str],
+    repositories: List[str],
 ) -> Dict[str, Any]:
     generated_at = utc_now()
     date = generated_at[:10]
@@ -371,6 +470,8 @@ def build_snapshot(
         "repository": repository,
         "repository_full": repository_full,
         "enterprise": enterprise,
+        "repository_count": len(repositories),
+        "repositories": repositories,
         "auth_kind": auth_kind,
         "results": results,
         "blocking_findings": blocking_findings,
@@ -416,6 +517,7 @@ def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, An
         f"- Repository: `{snapshot.get('repository', '')}`",
         f"- Repository full: `{snapshot.get('repository_full', '')}`",
         f"- Enterprise: `{snapshot.get('enterprise', '')}`",
+        f"- Repository count: `{snapshot.get('repository_count', 0)}`",
         f"- Auth kind: `{snapshot.get('auth_kind', '')}`",
         f"- Blocking findings: `{overall.get('blocking_count', 0)}`",
         f"- Collection errors: `{overall.get('error_count', 0)}`",
@@ -431,6 +533,17 @@ def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, An
         lines.append(
             f"| {attempt.get('token_env', '')} | {attempt.get('auth_kind', '')} | {attempt.get('status', '')} |"
         )
+
+    lines.extend(
+        [
+            "",
+            "## Covered Repositories",
+            "",
+        ]
+    )
+
+    for repo in snapshot.get("repositories", []) or []:
+        lines.append(f"- {repo}")
 
     lines.extend(
         [
@@ -462,6 +575,44 @@ def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, An
     return "\n".join(lines) + "\n"
 
 
+def collect_category(
+    scope: str,
+    base_path: str,
+    headers: Dict[str, str],
+    category: str,
+    threshold: str,
+    fallback_repository_full: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    endpoint_map = {
+        "code_scanning": "code-scanning/alerts",
+        "dependabot": "dependabot/alerts",
+        "secret_scanning": "secret-scanning/alerts",
+    }
+
+    if category not in endpoint_map:
+        fail(f"unsupported category: {category}", exit_code=2)
+
+    alerts = list_alerts(base_path, headers, endpoint_map[category])
+    normalized_alerts, blocking_items = normalize_category_alerts(
+        alerts=alerts,
+        category=category,
+        threshold=threshold,
+        fallback_repository_full=fallback_repository_full,
+    )
+
+    result = {
+        "accessible": True,
+        "skipped": False,
+        "skip_reason": None,
+        "count": len(normalized_alerts),
+        "blocking_count": len(blocking_items),
+        "alerts": normalized_alerts,
+    }
+
+    evidence_lines = [f"SSP-EVIDENCE: {category} alert polling completed successfully"]
+    return result, blocking_items, evidence_lines
+
+
 def main() -> int:
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -469,10 +620,8 @@ def main() -> int:
 
     owner_default, repo_default = repo_parts()
 
-    # Prefer explicit arguments, then env, then GH_REPOSITORY-derived defaults.
     organization = args.owner or owner_default
     repository = args.repo or repo_default
-    repository_full = f"{organization}/{repository}" if organization and repository else os.getenv("GH_REPOSITORY", f"{organization}/{repository}")
     enterprise = args.enterprise or os.getenv("GH_ENTERPRISE_SLUG", "")
     scope = normalize_scope(args.scope)
 
@@ -489,7 +638,6 @@ def main() -> int:
     print(f"Scope: {scope}")
     print(f"Organization: {organization}")
     print(f"Repository: {repository}")
-    print(f"Repository full: {repository_full}")
     print(f"Enterprise: {enterprise}")
     print(f"Blocking threshold: {threshold}")
     print(f"Soft fail: {soft_fail}")
@@ -499,168 +647,142 @@ def main() -> int:
     evidence_lines: List[str] = []
     errors: List[str] = []
     blocking_findings: List[Dict[str, Any]] = []
+    repositories_seen: set[str] = set()
 
-    # Enterprise scope only exposes Dependabot here; repo/org scope includes all three streams.
     if scope == "enterprise":
-        try:
-            print("Phase 1: Dependabot alert polling (enterprise)")
-            alerts = list_alerts(base_path, headers, "dependabot/alerts")
-            results["dependabot"] = {
-                "accessible": True,
-                "skipped": False,
-                "skip_reason": None,
-                "count": len(alerts),
-                "blocking_count": len(dependabot_findings(alerts, threshold)),
-                "alerts": alerts,
-            }
-            blocking_findings.extend(dependabot_findings(alerts, threshold))
-            evidence_lines.append("SSP-EVIDENCE: enterprise Dependabot alert polling completed successfully")
-            write_json(output_dir / "dependabot_alerts.json", alerts)
-        except Exception as exc:
-            if soft_fail:
-                results["dependabot"] = {
-                    "accessible": False,
-                    "skipped": True,
-                    "skip_reason": str(exc),
-                    "count": 0,
-                    "blocking_count": 0,
-                    "alerts": [],
-                }
-                errors.append(str(exc))
-                evidence_lines.append(f"SSP-EVIDENCE: enterprise Dependabot polling issue recorded: {exc}")
-                write_json(output_dir / "dependabot_skip.json", results["dependabot"])
-            else:
-                fail(str(exc), exit_code=2)
-
-        # Keep fields present and consistent for downstream spreadsheets.
-        results["code_scanning"] = {
-            "accessible": False,
-            "skipped": True,
-            "skip_reason": "enterprise scope does not expose code scanning alerts in this collector path",
-            "count": 0,
-            "blocking_count": 0,
-            "alerts": [],
-        }
-        results["secret_scanning"] = {
-            "accessible": False,
-            "skipped": True,
-            "skip_reason": "enterprise scope does not expose secret scanning alerts in this collector path",
-            "count": 0,
-            "blocking_count": 0,
-            "alerts": [],
-        }
+        display_organization = "enterprise-wide"
+        display_repository = "enterprise-wide"
+        display_repository_full = f"enterprise/{enterprise}" if enterprise else "enterprise-wide"
     else:
-        try:
-            print("Phase 1: code scanning alert polling")
-            alerts = list_alerts(base_path, headers, "code-scanning/alerts")
+        display_organization = organization
+        display_repository = repository
+        display_repository_full = f"{organization}/{repository}"
+
+    try:
+        print("Phase 1: code scanning alert polling")
+        code_result, code_blocking, code_evidence = collect_category(
+            scope=scope,
+            base_path=base_path,
+            headers=headers,
+            category="code_scanning",
+            threshold=threshold,
+            fallback_repository_full=display_repository_full,
+        )
+        results["code_scanning"] = code_result
+        blocking_findings.extend(code_blocking)
+        evidence_lines.extend(code_evidence)
+        write_json(output_dir / "code_scanning_alerts.json", code_result["alerts"])
+    except Exception as exc:
+        if soft_fail:
             results["code_scanning"] = {
-                "accessible": True,
-                "skipped": False,
-                "skip_reason": None,
-                "count": len(alerts),
-                "blocking_count": len(codeql_findings(alerts, threshold)),
-                "alerts": alerts,
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": str(exc),
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
             }
-            blocking_findings.extend(codeql_findings(alerts, threshold))
-            evidence_lines.append("SSP-EVIDENCE: code scanning alert polling completed successfully")
-            write_json(output_dir / "code_scanning_alerts.json", alerts)
-        except Exception as exc:
-            if soft_fail:
-                results["code_scanning"] = {
-                    "accessible": False,
-                    "skipped": True,
-                    "skip_reason": str(exc),
-                    "count": 0,
-                    "blocking_count": 0,
-                    "alerts": [],
-                }
-                errors.append(str(exc))
-                evidence_lines.append(f"SSP-EVIDENCE: code scanning collection error recorded for review: {exc}")
-                write_json(output_dir / "code_scanning_error.json", {"error": str(exc)})
-            else:
-                fail(str(exc), exit_code=2)
+            errors.append(str(exc))
+            evidence_lines.append(f"SSP-EVIDENCE: code scanning collection error recorded for review: {exc}")
+            write_json(output_dir / "code_scanning_error.json", {"error": str(exc)})
+        else:
+            fail(str(exc), exit_code=2)
 
-        try:
-            print("Phase 2: Dependabot alert polling")
-            alerts = list_alerts(base_path, headers, "dependabot/alerts")
+    try:
+        print("Phase 2: Dependabot alert polling")
+        dep_result, dep_blocking, dep_evidence = collect_category(
+            scope=scope,
+            base_path=base_path,
+            headers=headers,
+            category="dependabot",
+            threshold=threshold,
+            fallback_repository_full=display_repository_full,
+        )
+        results["dependabot"] = dep_result
+        blocking_findings.extend(dep_blocking)
+        evidence_lines.extend(dep_evidence)
+        write_json(output_dir / "dependabot_alerts.json", dep_result["alerts"])
+    except Exception as exc:
+        if soft_fail:
             results["dependabot"] = {
-                "accessible": True,
-                "skipped": False,
-                "skip_reason": None,
-                "count": len(alerts),
-                "blocking_count": len(dependabot_findings(alerts, threshold)),
-                "alerts": alerts,
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": str(exc),
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
             }
-            blocking_findings.extend(dependabot_findings(alerts, threshold))
-            evidence_lines.append("SSP-EVIDENCE: dependabot alert polling completed successfully")
-            write_json(output_dir / "dependabot_alerts.json", alerts)
-        except Exception as exc:
-            if soft_fail:
-                results["dependabot"] = {
-                    "accessible": False,
-                    "skipped": True,
-                    "skip_reason": str(exc),
-                    "count": 0,
-                    "blocking_count": 0,
-                    "alerts": [],
-                }
-                errors.append(str(exc))
-                evidence_lines.append(f"SSP-EVIDENCE: Dependabot polling issue recorded: {exc}")
-                write_json(output_dir / "dependabot_skip.json", results["dependabot"])
-            else:
-                fail(str(exc), exit_code=2)
+            errors.append(str(exc))
+            evidence_lines.append(f"SSP-EVIDENCE: Dependabot collection error recorded for review: {exc}")
+            write_json(output_dir / "dependabot_error.json", {"error": str(exc)})
+        else:
+            fail(str(exc), exit_code=2)
 
-        try:
-            print("Phase 3: secret scanning alert polling")
-            alerts = list_alerts(base_path, headers, "secret-scanning/alerts")
+    try:
+        print("Phase 3: secret scanning alert polling")
+        sec_result, sec_blocking, sec_evidence = collect_category(
+            scope=scope,
+            base_path=base_path,
+            headers=headers,
+            category="secret_scanning",
+            threshold=threshold,
+            fallback_repository_full=display_repository_full,
+        )
+        results["secret_scanning"] = sec_result
+        blocking_findings.extend(sec_blocking)
+        evidence_lines.extend(sec_evidence)
+        write_json(output_dir / "secret_scanning_alerts.json", sec_result["alerts"])
+    except Exception as exc:
+        if soft_fail:
             results["secret_scanning"] = {
-                "accessible": True,
-                "skipped": False,
-                "skip_reason": None,
-                "count": len(alerts),
-                "blocking_count": len(secret_findings(alerts)),
-                "alerts": alerts,
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": str(exc),
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
             }
-            blocking_findings.extend(secret_findings(alerts))
-            evidence_lines.append("SSP-EVIDENCE: secret scanning alert polling completed successfully")
-            write_json(output_dir / "secret_scanning_alerts.json", alerts)
-        except Exception as exc:
-            if soft_fail:
-                results["secret_scanning"] = {
-                    "accessible": False,
-                    "skipped": True,
-                    "skip_reason": str(exc),
-                    "count": 0,
-                    "blocking_count": 0,
-                    "alerts": [],
-                }
-                errors.append(str(exc))
-                evidence_lines.append(f"SSP-EVIDENCE: secret scanning polling issue recorded: {exc}")
-                write_json(output_dir / "secret_scanning_skip.json", results["secret_scanning"])
-            else:
-                fail(str(exc), exit_code=2)
+            errors.append(str(exc))
+            evidence_lines.append(f"SSP-EVIDENCE: secret scanning collection error recorded for review: {exc}")
+            write_json(output_dir / "secret_scanning_error.json", {"error": str(exc)})
+        else:
+            fail(str(exc), exit_code=2)
+
+    # Build repository list from normalized alert rows across all categories.
+    for category_name in ("code_scanning", "dependabot", "secret_scanning"):
+        for alert in (results.get(category_name, {}) or {}).get("alerts", []) or []:
+            repo_full = str(alert.get("repository_full") or "").strip()
+            if repo_full:
+                repositories_seen.add(repo_full)
+
+    repositories = sorted(repositories_seen)
 
     snapshot = build_snapshot(
         scope=scope,
-        organization=organization,
-        repository=repository,
-        repository_full=repository_full,
+        organization=display_organization,
+        repository=display_repository,
+        repository_full=display_repository_full,
         enterprise=enterprise,
         auth_kind=auth_kind,
         results=results,
         blocking_findings=blocking_findings,
         errors=errors,
+        repositories=repositories,
     )
 
+    # keep the evidence lines and summary files aligned with the enterprise header
+    snapshot["evidence_lines"] = evidence_lines
     append_history(output_dir, snapshot)
     write_summary_files(output_dir, snapshot, auth_attempts, evidence_lines)
     write_text(output_dir / "summary.md", render_summary_md(snapshot, auth_attempts))
+    write_text(output_dir / "repositories.txt", "\n".join(repositories) + ("\n" if repositories else ""))
 
     print("")
     print("SA-04(10) collection complete")
     print(f"Organization: {snapshot['organization']}")
     print(f"Repository: {snapshot['repository']}")
     print(f"Repository full: {snapshot['repository_full']}")
+    print(f"Repository count: {snapshot['repository_count']}")
     print(f"Blocking findings: {snapshot['overall']['blocking_count']}")
     print(f"Collection errors: {snapshot['overall']['error_count']}")
 
