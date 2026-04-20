@@ -24,6 +24,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import shutil
 import uuid
 import zipfile
@@ -87,23 +88,6 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8192), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def collect_manifest(root: Path) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_dir():
-            continue
-        if path.name == "fedramp_ato_package.zip":
-            continue
-        entries.append(
-            {
-                "path": str(path.relative_to(root)),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-        )
-    return entries
 
 
 def markdown_table(rows: List[List[str]]) -> str:
@@ -214,11 +198,8 @@ def build_ssp_markdown(summary: Dict[str, Any], run_context: Dict[str, Any]) -> 
 
 
 def build_oscal_ssp(summary: Dict[str, Any], run_context: Dict[str, Any]) -> Dict[str, Any]:
-    repo = summary.get("repository", "unknown")
     generated_at = summary.get("generated_at", utc_now())
     threshold = summary.get("threshold", "high")
-    results = summary.get("results", {})
-    overall = summary.get("overall", {})
     blocking_findings = summary.get("blocking_findings", [])
 
     aws_uuid = str(uuid.uuid4())
@@ -316,8 +297,8 @@ def build_oscal_ssp(summary: Dict[str, Any], run_context: Dict[str, Any]) -> Dic
                         "props": [
                             {"name": "control-origination", "value": "shared"},
                             {"name": "threshold", "value": threshold},
-                            {"name": "blocking-count", "value": str(overall.get("blocking_count", 0))},
-                            {"name": "error-count", "value": str(overall.get("error_count", 0))},
+                            {"name": "blocking-count", "value": str(len(blocking_findings))},
+                            {"name": "error-count", "value": str(summary.get("overall", {}).get("error_count", 0))},
                         ],
                         "by-components": [
                             {
@@ -368,7 +349,7 @@ def build_oscal_ssp(summary: Dict[str, Any], run_context: Dict[str, Any]) -> Dic
                         ],
                         "remarks": (
                             f"Generated from {len(blocking_findings)} blocking findings and "
-                            f"{overall.get('error_count', 0)} collection errors recorded during evidence collection."
+                            f"{summary.get('overall', {}).get('error_count', 0)} collection errors recorded during evidence collection."
                         ),
                     }
                 ]
@@ -411,7 +392,6 @@ def csv_quote(value: str) -> str:
 
 
 def build_readme(summary: Dict[str, Any]) -> str:
-    repo = summary.get("repository", "unknown")
     generated_at = summary.get("generated_at", utc_now())
     overall = summary.get("overall", {})
     results = summary.get("results", {})
@@ -428,7 +408,10 @@ SA-04(10) – Developer Security Testing and Evaluation
 {generated_at}
 
 ## Repository
-{repo}
+{summary.get("repository", "unknown")}
+
+## Scope
+{summary.get("scope", "repository")}
 
 ## Package Status
 - Overall status: {overall.get("status", "unknown")}
@@ -513,14 +496,6 @@ def make_manifest_json(root: Path) -> Dict[str, Any]:
     }
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8192), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def zip_directory(source_dir: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(source_dir.rglob("*")):
@@ -541,12 +516,12 @@ def main() -> int:
         raise SystemExit(f"summary.json not found in {input_dir}")
 
     run_context = {
-        "repository": os.getenv("GITHUB_REPOSITORY", summary.get("repository")),
-        "workflow": os.getenv("GITHUB_WORKFLOW"),
-        "run_id": os.getenv("GITHUB_RUN_ID"),
-        "run_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
-        "sha": os.getenv("GITHUB_SHA"),
-        "ref": os.getenv("GITHUB_REF"),
+        "repository": os.getenv("GH_REPOSITORY", summary.get("repository")),
+        "workflow": os.getenv("GH_WORKFLOW"),
+        "run_id": os.getenv("GH_RUN_ID"),
+        "run_attempt": os.getenv("GH_RUN_ATTEMPT"),
+        "sha": os.getenv("GH_SHA"),
+        "ref": os.getenv("GH_REF"),
     }
 
     clean_dir(output_dir)
@@ -563,7 +538,6 @@ def main() -> int:
     ]:
         folder.mkdir(parents=True, exist_ok=True)
 
-    # Core evidence copies
     copy_if_exists(input_dir / "summary.json", output_dir / "Evidence" / "CI_CD" / "summary.json")
     copy_if_exists(input_dir / "summary.md", output_dir / "Evidence" / "CI_CD" / "summary.md")
     copy_if_exists(input_dir / "evidence_lines.txt", output_dir / "Evidence" / "CI_CD" / "evidence_lines.txt")
@@ -581,22 +555,17 @@ def main() -> int:
     ]:
         copy_if_exists(input_dir / name, output_dir / "Evidence" / "CI_CD" / name)
 
-    # Run context
     run_context["codeql_sarif_exists"] = copy_codeql_sarif(output_dir)
     write_json(output_dir / "Evidence" / "CI_CD" / "run_context.json", run_context)
 
-    # Copy source files for traceability
     copy_repo_source_files(output_dir)
 
-    # SSP control response
     ssp_md = build_ssp_markdown(summary, run_context)
     write_text(output_dir / "SSP" / "sa-04-10-control-response.md", ssp_md)
 
-    # OSCAL SSP
     oscal = build_oscal_ssp(summary, run_context)
     write_json(output_dir / "OSCAL" / "ssp.json", oscal)
 
-    # POA&M artifacts
     blocking_findings = summary.get("blocking_findings", [])
     write_text(output_dir / "POAM" / "poam_candidate.csv", build_poam_candidate_csv(blocking_findings))
     write_text(
@@ -611,7 +580,6 @@ def main() -> int:
         ),
     )
 
-    # Placeholder folders for human review / additional agency artifacts
     write_text(
         output_dir / "Evidence" / "GitHub" / "README.md",
         build_placeholder_readme(
@@ -634,14 +602,11 @@ def main() -> int:
         ),
     )
 
-    # Root README
     write_text(output_dir / "README.md", build_readme(summary))
 
-    # Manifest
     manifest = make_manifest_json(output_dir)
     write_json(output_dir / "manifest.json", manifest)
 
-    # Zip archive
     zip_directory(output_dir, output_dir / "fedramp_ato_package.zip")
 
     print(f"FedRAMP submission package built at: {output_dir}")
