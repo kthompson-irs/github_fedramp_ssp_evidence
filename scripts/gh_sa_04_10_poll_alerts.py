@@ -10,16 +10,18 @@ Scope support:
 Auth support:
 - repository / organization:
     * GH_DEPENDABOT_TOKEN (fine-grained PAT or classic PAT)
-    * GH_APP_TOKEN (GitHub App installation/user token, if already minted)
+    * GH_APP_TOKEN (GitHub App token)
+    * GH_AUTH_TOKEN (optional fallback)
 - enterprise:
     * GH_ENTERPRISE_TOKEN (classic PAT or OAuth app token)
+    * GH_AUTH_TOKEN (optional fallback)
 
 Behavior:
+- Selects a token that GitHub actually accepts for the selected scope.
+- If GitHub returns 403/404, logs X-Accepted-GitHub-Permissions when present.
 - Collects JSON evidence files for each category.
 - Records structured SSP evidence lines.
 - Supports soft-fail collection so the evidence binder can still be built.
-- Produces summary.json, summary.md, evidence_lines.txt, blocking_findings.json,
-  and category-specific evidence files under the output directory.
 
 Exit codes:
 - 0 = compliant or soft-fail collection completed
@@ -106,37 +108,12 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def select_token(scope: str) -> Tuple[str, str]:
-    if scope == "enterprise":
-        token = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_AUTH_TOKEN")
-        if not token:
-            fail(
-                "enterprise scope requires GH_ENTERPRISE_TOKEN (classic PAT or OAuth app token). "
-                "GitHub does not support GitHub App user access tokens, GitHub App installation access tokens, "
-                "or fine-grained PATs for enterprise Dependabot alerts and enterprise secret scanning alerts.",
-                exit_code=2,
-            )
-        return token, "enterprise_token"
-
-    token = os.getenv("GH_DEPENDABOT_TOKEN") or os.getenv("GH_APP_TOKEN") or os.getenv("GH_AUTH_TOKEN")
-    if not token:
-        fail(
-            "repository/organization scope requires GH_DEPENDABOT_TOKEN or GH_APP_TOKEN. "
-            "For repository and organization alerts, GitHub supports GitHub App user access tokens, "
-            "GitHub App installation access tokens, and fine-grained PATs with the documented read permissions.",
-            exit_code=2,
-        )
-    return token, "repo_org_token"
-
-
-def make_headers(scope: str) -> Dict[str, str]:
-    token, auth_kind = select_token(scope)
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "X-SA04-AUTH-KIND": auth_kind,
-    }
+def repo_parts() -> Tuple[str, str]:
+    repo_full = get_env("GH_REPOSITORY")
+    if "/" not in repo_full:
+        fail(f"GH_REPOSITORY is malformed: {repo_full}", exit_code=2)
+    owner, repo = repo_full.split("/", 1)
+    return owner, repo
 
 
 def scope_base(scope: str, owner: str, repo: str, enterprise: str) -> str:
@@ -153,6 +130,159 @@ def scope_base(scope: str, owner: str, repo: str, enterprise: str) -> str:
             fail("enterprise scope requires GH_ENTERPRISE_SLUG or --enterprise", exit_code=2)
         return f"/enterprises/{enterprise}"
     fail(f"unsupported scope: {scope}", exit_code=2)
+
+
+def token_candidates(scope: str) -> List[Tuple[str, str]]:
+    """
+    Returns (env_var_name, auth_kind).
+    """
+    if scope == "enterprise":
+        return [
+            ("GH_ENTERPRISE_TOKEN", "enterprise_classic_pat_or_oauth"),
+            ("GH_AUTH_TOKEN", "enterprise_fallback"),
+        ]
+
+    return [
+        ("GH_APP_TOKEN", "github_app_token"),
+        ("GH_DEPENDABOT_TOKEN", "fine_grained_pat_or_classic_pat"),
+        ("GH_AUTH_TOKEN", "fallback_token"),
+    ]
+
+
+def make_headers(token: str, auth_kind: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "X-SA04-AUTH-KIND": auth_kind,
+    }
+
+
+def endpoint_map(base_path: str, scope: str) -> Dict[str, Optional[str]]:
+    if scope == "enterprise":
+        return {
+            "code_scanning": None,
+            "dependabot": f"{base_path}/dependabot/alerts",
+            "secret_scanning": None,
+        }
+    return {
+        "code_scanning": f"{base_path}/code-scanning/alerts",
+        "dependabot": f"{base_path}/dependabot/alerts",
+        "secret_scanning": f"{base_path}/secret-scanning/alerts",
+    }
+
+
+def request_one(url: str, headers: Dict[str, str]) -> requests.Response:
+    return requests.get(
+        url,
+        headers=headers,
+        params={"state": "open", "per_page": 1, "page": 1},
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
+def accepted_permissions(response: requests.Response) -> Optional[str]:
+    return response.headers.get("X-Accepted-GitHub-Permissions")
+
+
+def probe_token_for_scope(
+    base_path: str,
+    scope: str,
+    headers: Dict[str, str],
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Probe all endpoints required for the selected scope.
+    Returns (ok, diagnostics).
+    """
+    diagnostics: List[Dict[str, Any]] = []
+    endpoints = endpoint_map(base_path, scope)
+
+    for category, url in endpoints.items():
+        if url is None:
+            continue
+
+        response = request_one(f"{GH_API}{url}", headers)
+        if response.status_code == 200:
+            diagnostics.append(
+                {
+                    "category": category,
+                    "status_code": 200,
+                    "message": "accessible",
+                    "accepted_permissions": accepted_permissions(response),
+                }
+            )
+            continue
+
+        diag = {
+            "category": category,
+            "status_code": response.status_code,
+            "message": "",
+            "accepted_permissions": accepted_permissions(response),
+        }
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                diag["message"] = payload.get("message") or response.text[:300]
+            else:
+                diag["message"] = response.text[:300]
+        except Exception:
+            diag["message"] = response.text[:300]
+
+        diagnostics.append(diag)
+        return False, diagnostics
+
+    return True, diagnostics
+
+
+def select_auth(
+    scope: str,
+    base_path: str,
+) -> Tuple[Optional[Dict[str, str]], List[Dict[str, Any]]]:
+    """
+    Returns headers for the first token that can access the required endpoints.
+    """
+    diagnostics: List[Dict[str, Any]] = []
+
+    for env_name, auth_kind in token_candidates(scope):
+        token = os.getenv(env_name)
+        if not token:
+            diagnostics.append(
+                {
+                    "token_env": env_name,
+                    "status": "missing",
+                    "message": "token not set",
+                }
+            )
+            continue
+
+        headers = make_headers(token, auth_kind)
+        ok, token_diagnostics = probe_token_for_scope(base_path, scope, headers)
+        diagnostics.append(
+            {
+                "token_env": env_name,
+                "auth_kind": auth_kind,
+                "status": "ok" if ok else "rejected",
+                "probe": token_diagnostics,
+            }
+        )
+        if ok:
+            return headers, diagnostics
+
+    return None, diagnostics
+
+
+def severity_rank(value: str) -> int:
+    mapping = {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 4,
+    }
+    return mapping.get(value.lower(), 0)
+
+
+def severity_is_blocking(severity: str, threshold: str) -> bool:
+    return severity_rank(severity) >= severity_rank(threshold) > 0
 
 
 def paged_get(
@@ -172,8 +302,10 @@ def paged_get(
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
+            perm = accepted_permissions(response)
             raise RuntimeError(
-                f"GitHub API request failed for {url}: {exc} | body={response.text[:300]}"
+                f"GitHub API request failed for {url}: {exc} | "
+                f"accepted_permissions={perm!r} | body={response.text[:300]}"
             ) from exc
 
         payload = response.json()
@@ -191,20 +323,6 @@ def paged_get(
         page += 1
 
     return results
-
-
-def severity_rank(value: str) -> int:
-    mapping = {
-        "low": 1,
-        "medium": 2,
-        "high": 3,
-        "critical": 4,
-    }
-    return mapping.get(value.lower(), 0)
-
-
-def severity_is_blocking(severity: str, threshold: str) -> bool:
-    return severity_rank(severity) >= severity_rank(threshold) > 0
 
 
 def extract_code_scanning_finding(alert: Dict[str, Any]) -> Dict[str, Any]:
@@ -250,41 +368,7 @@ def extract_secret_scanning_finding(alert: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def probe_optional_endpoint(url: str, headers: Dict[str, str], label: str) -> Tuple[bool, Dict[str, Any]]:
-    response = requests.get(
-        url,
-        headers=headers,
-        params={"state": "open", "per_page": 1, "page": 1},
-        timeout=TIMEOUT_SECONDS,
-    )
-
-    if response.status_code == 200:
-        return True, {"status_code": 200, "message": "accessible"}
-
-    if response.status_code in {403, 404}:
-        try:
-            body = response.json()
-            message = body.get("message") if isinstance(body, dict) else None
-        except Exception:
-            message = None
-        if not message:
-            message = response.text[:300]
-        return False, {"status_code": response.status_code, "message": message}
-
-    if response.status_code == 401:
-        fail(f"{label} endpoint returned 401 Unauthorized. Check the token assigned to this scope.", exit_code=2)
-
-    fail(
-        f"unexpected response from {label} endpoint: {response.status_code} {response.text[:300]}",
-        exit_code=2,
-    )
-
-
-def collect_code_scanning(
-    base_path: str,
-    headers: Dict[str, str],
-    threshold: str,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+def collect_code_scanning(base_path: str, headers: Dict[str, str], threshold: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
     url = f"{GH_API}{base_path}/code-scanning/alerts"
     alerts = paged_get(url, headers, params={"state": "open"})
 
@@ -308,58 +392,18 @@ def collect_code_scanning(
     return result, blocking_findings, evidence_lines
 
 
-def collect_alert_category(
-    base_path: str,
-    headers: Dict[str, str],
-    label: str,
-    threshold: str,
-    soft_fail: bool,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str], List[str]]:
-    endpoint_map = {
-        "dependabot": f"{base_path}/dependabot/alerts",
-        "secret_scanning": f"{base_path}/secret-scanning/alerts",
-    }
-    if label not in endpoint_map:
-        fail(f"unsupported alert label: {label}", exit_code=2)
-
-    url = f"{GH_API}{endpoint_map[label]}"
-    accessible, access_info = probe_optional_endpoint(url, headers, label)
-
-    if not accessible:
-        skip_reason = (
-            f"GitHub returned {access_info.get('status_code')} for {label}; "
-            "access is not available to the token or endpoint."
-        )
-        result = {
-            "accessible": False,
-            "skipped": True,
-            "skip_reason": skip_reason,
-            "status_code": access_info.get("status_code"),
-            "count": 0,
-            "blocking_count": 0,
-            "alerts": [],
-        }
-        evidence_line = (
-            f"SSP-EVIDENCE: {label} alert polling skipped because GitHub returned "
-            f"{access_info.get('status_code')} for the alerts endpoint; documented for SA-04(10) review."
-        )
-        if soft_fail:
-            return result, [], [evidence_line], []
-        fail(evidence_line, exit_code=2)
-
+def collect_dependabot(base_path: str, headers: Dict[str, str], threshold: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    url = f"{GH_API}{base_path}/dependabot/alerts"
     alerts = paged_get(url, headers, params={"state": "open"})
-    blocking_findings: List[Dict[str, Any]] = []
 
-    if label == "dependabot":
-        for alert in alerts:
-            advisory = alert.get("security_advisory") or {}
-            severity = str(advisory.get("severity") or "").lower()
-            if severity_is_blocking(severity, threshold):
-                blocking_findings.append(extract_dependabot_finding(alert))
-    elif label == "secret_scanning":
-        for alert in alerts:
-            if alert.get("state") == "open" or not alert.get("state"):
-                blocking_findings.append(extract_secret_scanning_finding(alert))
+    blocking_findings: List[Dict[str, Any]] = []
+    evidence_lines = ["SSP-EVIDENCE: dependabot alert polling completed successfully"]
+
+    for alert in alerts:
+        advisory = alert.get("security_advisory") or {}
+        severity = str(advisory.get("severity") or "").lower()
+        if severity_is_blocking(severity, threshold):
+            blocking_findings.append(extract_dependabot_finding(alert))
 
     result = {
         "accessible": True,
@@ -369,8 +413,87 @@ def collect_alert_category(
         "blocking_count": len(blocking_findings),
         "alerts": alerts,
     }
-    evidence_line = f"SSP-EVIDENCE: {label} alert polling completed successfully"
-    return result, blocking_findings, [evidence_line], []
+    return result, blocking_findings, evidence_lines
+
+
+def collect_secret_scanning(base_path: str, headers: Dict[str, str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    url = f"{GH_API}{base_path}/secret-scanning/alerts"
+    alerts = paged_get(url, headers, params={"state": "open"})
+
+    blocking_findings: List[Dict[str, Any]] = []
+    evidence_lines = ["SSP-EVIDENCE: secret scanning alert polling completed successfully"]
+
+    for alert in alerts:
+        if alert.get("state") == "open" or not alert.get("state"):
+            blocking_findings.append(extract_secret_scanning_finding(alert))
+
+    result = {
+        "accessible": True,
+        "skipped": False,
+        "skip_reason": None,
+        "count": len(alerts),
+        "blocking_count": len(blocking_findings),
+        "alerts": alerts,
+    }
+    return result, blocking_findings, evidence_lines
+
+
+def render_summary_md(summary: Dict[str, Any]) -> str:
+    overall = summary["overall"]
+    results = summary["results"]
+
+    lines = [
+        "# SA-04(10) Evidence Collection Summary",
+        "",
+        f"- Scope: `{summary['scope']}`",
+        f"- Repository: `{summary['repository']}`",
+        f"- Organization: `{summary['organization']}`",
+        f"- Enterprise: `{summary['enterprise']}`",
+        f"- Threshold: `{summary['threshold']}`",
+        f"- Generated: `{summary['generated_at']}`",
+        f"- Status: `{overall['status']}`",
+        f"- Blocking findings: `{overall['blocking_count']}`",
+        f"- Collection errors: `{overall['error_count']}`",
+        "",
+        "## Authentication Selection",
+        "",
+        f"- Auth kind: `{summary.get('auth_kind', 'unknown')}`",
+        "",
+        "| Token Source | Status |",
+        "|---|---|",
+    ]
+
+    for attempt in summary.get("auth_attempts", []):
+        lines.append(f"| {attempt.get('token_env', 'unknown')} | {attempt.get('status', 'unknown')} |")
+
+    lines.extend(
+        [
+            "",
+            "## Category Results",
+            "",
+            "| Category | Accessible | Skipped | Count | Blocking |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+
+    for category in ("code_scanning", "dependabot", "secret_scanning"):
+        item = results.get(category, {})
+        lines.append(
+            f"| {category} | {str(item.get('accessible', False)).lower()} | "
+            f"{str(item.get('skipped', False)).lower()} | {item.get('count', 0)} | "
+            f"{item.get('blocking_count', 0)} |"
+        )
+
+    lines.extend(["", "## Evidence Lines", ""])
+    for entry in summary.get("evidence_lines", []):
+        lines.append(f"- {entry}")
+
+    if summary.get("errors"):
+        lines.extend(["", "## Collection Errors", ""])
+        for entry in summary["errors"]:
+            lines.append(f"- {entry}")
+
+    return "\n".join(lines) + "\n"
 
 
 def build_summary(
@@ -381,6 +504,8 @@ def build_summary(
     enterprise: str,
     threshold: str,
     soft_fail: bool,
+    auth_kind: str,
+    auth_attempts: List[Dict[str, Any]],
     results: Dict[str, Any],
     blocking_findings: List[Dict[str, Any]],
     errors: List[str],
@@ -403,6 +528,8 @@ def build_summary(
         "enterprise": enterprise,
         "threshold": threshold,
         "soft_fail": soft_fail,
+        "auth_kind": auth_kind,
+        "auth_attempts": auth_attempts,
         "results": results,
         "blocking_findings": blocking_findings,
         "overall": {
@@ -415,47 +542,15 @@ def build_summary(
     }
 
 
-def render_summary_md(summary: Dict[str, Any]) -> str:
-    overall = summary["overall"]
-    results = summary["results"]
-
-    lines = [
-        "# SA-04(10) Evidence Collection Summary",
-        "",
-        f"- Scope: `{summary['scope']}`",
-        f"- Repository: `{summary['repository']}`",
-        f"- Organization: `{summary['organization']}`",
-        f"- Enterprise: `{summary['enterprise']}`",
-        f"- Threshold: `{summary['threshold']}`",
-        f"- Generated: `{summary['generated_at']}`",
-        f"- Status: `{overall['status']}`",
-        f"- Blocking findings: `{overall['blocking_count']}`",
-        f"- Collection errors: `{overall['error_count']}`",
-        "",
-        "## Category Results",
-        "",
-        "| Category | Accessible | Skipped | Count | Blocking |",
-        "|---|---:|---:|---:|---:|",
-    ]
-
-    for category in ("code_scanning", "dependabot", "secret_scanning"):
-        item = results.get(category, {})
-        lines.append(
-            f"| {category} | {str(item.get('accessible', False)).lower()} | "
-            f"{str(item.get('skipped', False)).lower()} | {item.get('count', 0)} | "
-            f"{item.get('blocking_count', 0)} |"
-        )
-
-    lines.extend(["", "## Evidence Lines", ""])
-    for entry in summary.get("evidence_lines", []):
-        lines.append(f"- {entry}")
-
-    if summary.get("errors"):
-        lines.extend(["", "## Collection Errors", ""])
-        for entry in summary["errors"]:
-            lines.append(f"- {entry}")
-
-    return "\n".join(lines) + "\n"
+def write_placeholder_skips_for_enterprise() -> Dict[str, Any]:
+    return {
+        "accessible": False,
+        "skipped": True,
+        "skip_reason": "not applicable to enterprise scope",
+        "count": 0,
+        "blocking_count": 0,
+        "alerts": [],
+    }
 
 
 def main() -> int:
@@ -463,8 +558,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    repo_full = get_env("GH_REPOSITORY")
-    owner_default, repo_default = repo_full.split("/", 1)
+    owner_default, repo_default = repo_parts()
 
     owner = args.owner or owner_default
     repo = args.repo or repo_default
@@ -479,11 +573,64 @@ def main() -> int:
         fail(f"invalid FAIL_ON_SEVERITY value: {threshold}", exit_code=2)
 
     base_path = scope_base(scope, owner=owner, repo=repo, enterprise=enterprise)
-    headers = make_headers(scope)
+
+    headers, auth_attempts = select_auth(scope, base_path)
+    if headers is None:
+        if soft_fail:
+            summary = build_summary(
+                scope=scope,
+                repo=f"{owner}/{repo}",
+                owner=owner,
+                org=org,
+                enterprise=enterprise,
+                threshold=threshold,
+                soft_fail=soft_fail,
+                auth_kind="none",
+                auth_attempts=auth_attempts,
+                results={
+                    "code_scanning": write_placeholder_skips_for_enterprise() if scope == "enterprise" else {
+                        "accessible": False,
+                        "skipped": True,
+                        "skip_reason": "no usable token found",
+                        "count": 0,
+                        "blocking_count": 0,
+                        "alerts": [],
+                    },
+                    "dependabot": {
+                        "accessible": False,
+                        "skipped": True,
+                        "skip_reason": "no usable token found",
+                        "count": 0,
+                        "blocking_count": 0,
+                        "alerts": [],
+                    },
+                    "secret_scanning": write_placeholder_skips_for_enterprise() if scope == "enterprise" else {
+                        "accessible": False,
+                        "skipped": True,
+                        "skip_reason": "no usable token found",
+                        "count": 0,
+                        "blocking_count": 0,
+                        "alerts": [],
+                    },
+                },
+                blocking_findings=[],
+                errors=[],
+                evidence_lines=["SSP-EVIDENCE: no usable token found; collection was not performed."],
+            )
+            write_json(output_dir / "summary.json", summary)
+            write_text(output_dir / "summary.md", render_summary_md(summary))
+            write_text(output_dir / "evidence_lines.txt", "\n".join(summary["evidence_lines"]) + "\n")
+            write_json(output_dir / "blocking_findings.json", [])
+            return 0
+        fail(
+            "no usable token was able to access the required alerts endpoints. "
+            "Check token scope, org approval, repository selection, or use a classic PAT for enterprise alerts.",
+            exit_code=2,
+        )
 
     print("SA-04(10) security gate starting")
     print(f"Scope: {scope}")
-    print(f"Repository: {repo_full}")
+    print(f"Repository: {repo}")
     print(f"Blocking threshold: {threshold}")
     print(f"Soft fail: {soft_fail}")
     print(f"Auth kind: {headers.get('X-SA04-AUTH-KIND')}")
@@ -494,98 +641,81 @@ def main() -> int:
     blocking_findings: List[Dict[str, Any]] = []
 
     try:
-        print("Phase 1: code scanning alert polling")
-        code_scanning_result, code_scanning_blocking, code_scanning_evidence = collect_code_scanning(
-            base_path, headers, threshold
-        )
-        results["code_scanning"] = code_scanning_result
-        blocking_findings.extend(code_scanning_blocking)
-        evidence_lines.extend(code_scanning_evidence)
-        write_json(output_dir / "code_scanning_alerts.json", code_scanning_result["alerts"])
-    except Exception as exc:
-        message = f"code scanning collection error: {exc}"
-        if soft_fail:
-            errors.append(message)
-            results["code_scanning"] = {
-                "accessible": False,
-                "skipped": True,
-                "skip_reason": str(exc),
-                "count": 0,
-                "blocking_count": 0,
-                "alerts": [],
-            }
-            evidence_lines.append(f"SSP-EVIDENCE: code scanning collection error recorded for review: {exc}")
-            write_json(output_dir / "code_scanning_error.json", {"error": str(exc)})
-        else:
-            fail(message, exit_code=2)
+        if scope == "enterprise":
+            results["code_scanning"] = write_placeholder_skips_for_enterprise()
+            results["secret_scanning"] = write_placeholder_skips_for_enterprise()
 
-    try:
-        print("Phase 2: Dependabot alert polling")
-        dependabot_result, dependabot_blocking, dependabot_evidence, dependabot_errors = collect_alert_category(
-            base_path=base_path,
-            headers=headers,
-            label="dependabot",
-            threshold=threshold,
-            soft_fail=soft_fail,
-        )
-        results["dependabot"] = dependabot_result
-        blocking_findings.extend(dependabot_blocking)
-        evidence_lines.extend(dependabot_evidence)
-        errors.extend(dependabot_errors)
-        if dependabot_result.get("accessible"):
+            print("Phase 1: Dependabot alert polling (enterprise)")
+            dependabot_result, dependabot_blocking, dependabot_evidence = collect_dependabot(base_path, headers, threshold)
+            results["dependabot"] = dependabot_result
+            blocking_findings.extend(dependabot_blocking)
+            evidence_lines.extend(dependabot_evidence)
             write_json(output_dir / "dependabot_alerts.json", dependabot_result["alerts"])
-        else:
-            write_json(output_dir / "dependabot_skip.json", dependabot_result)
-    except Exception as exc:
-        message = f"dependabot collection error: {exc}"
-        if soft_fail:
-            errors.append(message)
-            results["dependabot"] = {
-                "accessible": False,
-                "skipped": True,
-                "skip_reason": str(exc),
-                "count": 0,
-                "blocking_count": 0,
-                "alerts": [],
-            }
-            evidence_lines.append(f"SSP-EVIDENCE: Dependabot collection error recorded for review: {exc}")
-            write_json(output_dir / "dependabot_error.json", {"error": str(exc)})
-        else:
-            fail(message, exit_code=2)
 
-    try:
-        print("Phase 3: secret scanning alert polling")
-        secret_result, secret_blocking, secret_evidence, secret_errors = collect_alert_category(
-            base_path=base_path,
-            headers=headers,
-            label="secret_scanning",
-            threshold=threshold,
-            soft_fail=soft_fail,
-        )
-        results["secret_scanning"] = secret_result
-        blocking_findings.extend(secret_blocking)
-        evidence_lines.extend(secret_evidence)
-        errors.extend(secret_errors)
-        if secret_result.get("accessible"):
+        else:
+            print("Phase 1: code scanning alert polling")
+            code_scanning_result, code_scanning_blocking, code_scanning_evidence = collect_code_scanning(
+                base_path, headers, threshold
+            )
+            results["code_scanning"] = code_scanning_result
+            blocking_findings.extend(code_scanning_blocking)
+            evidence_lines.extend(code_scanning_evidence)
+            write_json(output_dir / "code_scanning_alerts.json", code_scanning_result["alerts"])
+
+            print("Phase 2: Dependabot alert polling")
+            dependabot_result, dependabot_blocking, dependabot_evidence = collect_dependabot(base_path, headers, threshold)
+            results["dependabot"] = dependabot_result
+            blocking_findings.extend(dependabot_blocking)
+            evidence_lines.extend(dependabot_evidence)
+            write_json(output_dir / "dependabot_alerts.json", dependabot_result["alerts"])
+
+            print("Phase 3: secret scanning alert polling")
+            secret_result, secret_blocking, secret_evidence = collect_secret_scanning(base_path, headers)
+            results["secret_scanning"] = secret_result
+            blocking_findings.extend(secret_blocking)
+            evidence_lines.extend(secret_evidence)
             write_json(output_dir / "secret_scanning_alerts.json", secret_result["alerts"])
-        else:
-            write_json(output_dir / "secret_scanning_skip.json", secret_result)
+
     except Exception as exc:
-        message = f"secret scanning collection error: {exc}"
         if soft_fail:
-            errors.append(message)
-            results["secret_scanning"] = {
-                "accessible": False,
-                "skipped": True,
-                "skip_reason": str(exc),
-                "count": 0,
-                "blocking_count": 0,
-                "alerts": [],
-            }
-            evidence_lines.append(f"SSP-EVIDENCE: secret scanning collection error recorded for review: {exc}")
-            write_json(output_dir / "secret_scanning_error.json", {"error": str(exc)})
+            errors.append(str(exc))
+            if scope == "enterprise":
+                results.setdefault("dependabot", {
+                    "accessible": False,
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "count": 0,
+                    "blocking_count": 0,
+                    "alerts": [],
+                })
+            else:
+                results.setdefault("code_scanning", {
+                    "accessible": False,
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "count": 0,
+                    "blocking_count": 0,
+                    "alerts": [],
+                })
+                results.setdefault("dependabot", {
+                    "accessible": False,
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "count": 0,
+                    "blocking_count": 0,
+                    "alerts": [],
+                })
+                results.setdefault("secret_scanning", {
+                    "accessible": False,
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "count": 0,
+                    "blocking_count": 0,
+                    "alerts": [],
+                })
+            evidence_lines.append(f"SSP-EVIDENCE: collection error recorded for review: {exc}")
         else:
-            fail(message, exit_code=2)
+            fail(str(exc), exit_code=2)
 
     overall = {
         "status": "pass",
@@ -599,12 +729,14 @@ def main() -> int:
 
     summary = build_summary(
         scope=scope,
-        repo=repo_full,
+        repo=f"{owner}/{repo}",
         owner=owner,
         org=org,
         enterprise=enterprise,
         threshold=threshold,
         soft_fail=soft_fail,
+        auth_kind=headers.get("X-SA04-AUTH-KIND", "unknown"),
+        auth_attempts=auth_attempts,
         results=results,
         blocking_findings=blocking_findings,
         errors=errors,
@@ -616,6 +748,7 @@ def main() -> int:
     write_text(output_dir / "summary.md", render_summary_md(summary))
     write_text(output_dir / "evidence_lines.txt", "\n".join(evidence_lines) + "\n")
     write_json(output_dir / "blocking_findings.json", blocking_findings)
+    write_json(output_dir / "auth_attempts.json", auth_attempts)
 
     print("")
     print("SA-04(10) collection complete")
