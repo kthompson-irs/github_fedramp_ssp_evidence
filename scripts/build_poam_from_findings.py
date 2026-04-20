@@ -44,12 +44,6 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def csv_quote(value: str) -> str:
-    if any(ch in value for ch in [",", "\"", "\n"]):
-        return '"' + value.replace('"', '""') + '"'
-    return value
-
-
 def due_date_for_severity(severity: str) -> str:
     sev = (severity or "").lower()
     if sev in {"high", "critical"}:
@@ -162,7 +156,11 @@ def write_workbook(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
         for c_idx, value in enumerate(values, start=1):
             cell = ws.cell(r_idx, c_idx, value)
             cell.border = border
-            cell.alignment = Alignment(horizontal="left" if c_idx in {2, 3, 4, 6, 10, 11} else "center", vertical="center", wrap_text=True)
+            cell.alignment = Alignment(
+                horizontal="left" if c_idx in {2, 3, 4, 6, 10, 11} else "center",
+                vertical="center",
+                wrap_text=True,
+            )
 
     widths = [14, 16, 24, 34, 12, 44, 12, 12, 18, 18, 30, 24]
     for idx, width in enumerate(widths, start=1):
@@ -183,7 +181,8 @@ def write_markdown(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
     ]
     for row in rows:
         lines.append(
-            f"| {row['poam_id']} | {row['category']} | {row['identifier']} | {row['severity']} | {row['recommended_due_date']} | {row['status']} |"
+            f"| {row['poam_id']} | {row['category']} | {row['identifier']} | {row['severity']} | "
+            f"{row['recommended_due_date']} | {row['status']} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
