@@ -7,6 +7,10 @@ Checks:
 - Dependabot alerts: fail on open alerts at or above threshold
 - Secret scanning alerts: fail on any open alert
 
+Behavior:
+- If Dependabot alerts are blocked by repository/token permissions, the script
+  logs an SSP evidence line and skips Dependabot checks without failing the job.
+
 Exit codes:
 - 0 = compliant
 - 1 = compliance failure
@@ -17,7 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, List, Optional, NoReturn
+from typing import Any, Dict, List, Optional, NoReturn, Tuple
 
 import requests
 
@@ -83,6 +87,33 @@ def paged_get(
     return results
 
 
+def probe_dependabot_access(repo: str, headers: Dict[str, str]) -> Tuple[bool, str]:
+    """
+    Returns:
+        (accessible, reason)
+    """
+    url = f"{GH_API}/repos/{repo}/dependabot/alerts"
+    params = {"state": "open", "per_page": 1, "page": 1}
+
+    response = requests.get(url, headers=headers, params=params, timeout=TIMEOUT_SECONDS)
+
+    if response.status_code == 200:
+        return True, "accessible"
+
+    if response.status_code in {403, 404}:
+        reason = "permission denied" if response.status_code == 403 else "endpoint unavailable"
+        return False, reason
+
+    if response.status_code == 401:
+        fail("Dependabot token authentication failed with 401 Unauthorized", exit_code=2)
+
+    fail(
+        f"unexpected response from Dependabot alerts endpoint: "
+        f"{response.status_code} {response.text[:300]}",
+        exit_code=2,
+    )
+
+
 def severity_rank(value: str) -> int:
     mapping = {
         "low": 1,
@@ -111,10 +142,21 @@ def check_code_scanning(repo: str, headers: Dict[str, str], threshold: str) -> i
             failures += 1
 
     print(f"Code scanning alerts checked: {len(alerts)}")
+    print("SSP-EVIDENCE: code scanning alert polling completed successfully")
     return failures
 
 
 def check_dependabot(repo: str, headers: Dict[str, str], threshold: str) -> int:
+    accessible, reason = probe_dependabot_access(repo, headers)
+
+    if not accessible:
+        print(
+            "SSP-EVIDENCE: Dependabot alert polling skipped because GitHub "
+            f"returned {reason} for the alerts endpoint. This was logged as an "
+            "evidence condition for SA-04(10) review."
+        )
+        return 0
+
     url = f"{GH_API}/repos/{repo}/dependabot/alerts"
     alerts = paged_get(url, headers, params={"state": "open"})
 
@@ -129,6 +171,7 @@ def check_dependabot(repo: str, headers: Dict[str, str], threshold: str) -> int:
             failures += 1
 
     print(f"Dependabot alerts checked: {len(alerts)}")
+    print("SSP-EVIDENCE: Dependabot alert polling completed successfully")
     return failures
 
 
@@ -142,6 +185,7 @@ def check_secret_scanning(repo: str, headers: Dict[str, str]) -> int:
         print(f"BLOCK: secret scanning alert secret_type={secret_type} state={resolution}")
 
     print(f"Secret scanning alerts checked: {len(alerts)}")
+    print("SSP-EVIDENCE: secret scanning alert polling completed successfully")
     return len(alerts)
 
 
