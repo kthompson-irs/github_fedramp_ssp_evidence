@@ -39,18 +39,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip requests
 
-      # ---------------------------------------
-      # Phase 1: Dependency Review (PR only)
-      # ---------------------------------------
       - name: Dependency Review
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: ${{ github.event.inputs.fail_on_severity || 'high' }}
 
-      # ---------------------------------------
-      # Phase 2: CodeQL Scan (SAST)
-      # ---------------------------------------
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -65,13 +59,9 @@ jobs:
           upload: always
           wait-for-processing: true
 
-      # ---------------------------------------
-      # Phase 3: SA-04(10) Compliance Gate
-      # ---------------------------------------
       - name: Poll GitHub security alerts (SA-04(10))
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_REPO: ${{ github.repository }}
           FAIL_ON_SEVERITY: ${{ github.event.inputs.fail_on_severity || 'high' }}
-        run: |
-          python scripts/gh_sa_04_10_poll_alerts.py
+        run: python scripts/gh_sa_04_10_poll_alerts.py
