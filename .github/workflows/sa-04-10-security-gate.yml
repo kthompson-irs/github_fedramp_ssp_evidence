@@ -1,36 +1,62 @@
 name: SA-04(10) Security Gate
 
 on:
-  pull_request:
   push:
-    branches: [ main ]
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_full_scan:
+        description: "Run full SA-04(10) scan (manual/audit trigger)"
+        required: false
+        default: "true"
+      fail_on_severity:
+        description: "Severity threshold (low, medium, high, critical)"
+        required: false
+        default: "high"
 
 permissions:
   contents: read
   security-events: read
   actions: read
+  pull-requests: read
 
 jobs:
   security-gate:
-    name: Run SA-04(10) Security Checks
+    name: SA-04(10) Security Gate (AWS + GitHub)
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      # ---------------------------------------
+      # Checkout
+      # ---------------------------------------
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # -------------------------------
-      # Dependency Review (PR Blocking)
-      # -------------------------------
+      # ---------------------------------------
+      # Python setup
+      # ---------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests
+
+      # ---------------------------------------
+      # Phase 1: Dependency Review (PR only)
+      # ---------------------------------------
       - name: Dependency Review
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
-          fail-on-severity: high
+          fail-on-severity: ${{ github.event.inputs.fail_on_severity || 'high' }}
 
-      # -------------------------------
-      # CodeQL Scan (SAST)
-      # -------------------------------
+      # ---------------------------------------
+      # Phase 2: CodeQL Scan (SAST)
+      # ---------------------------------------
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -39,15 +65,19 @@ jobs:
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
 
-      - name: Perform CodeQL Analysis
+      - name: Analyze and upload CodeQL results
         uses: github/codeql-action/analyze@v3
+        with:
+          upload: always
+          wait-for-processing: true
 
-      # -------------------------------
-      # Python Compliance Gate
-      # -------------------------------
-      - name: Run SA-04(10) Compliance Gate
+      # ---------------------------------------
+      # Phase 3: SA-04(10) Compliance Gate
+      # ---------------------------------------
+      - name: Poll GitHub security alerts (SA-04(10))
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          FAIL_ON_SEVERITY: ${{ github.event.inputs.fail_on_severity || 'high' }}
         run: |
-          python3 scripts/sa_04_10_gate.py
+          python scripts/gh_sa_04_10_poll_alerts.py
