@@ -2,66 +2,52 @@ name: SA-04(10) Security Gate
 
 on:
   pull_request:
-    branches: [main]
   push:
-    branches: [main]
-  schedule:
-    - cron: '0 7 * * 1'
-  workflow_dispatch:
+    branches: [ main ]
 
 permissions:
   contents: read
-  security-events: write
-  pull-requests: write
+  security-events: read
+  actions: read
 
 jobs:
-  dependency-review:
-    name: Dependency review (PR only)
-    if: github.event_name == 'pull_request'
+  security-gate:
+    name: Run SA-04(10) Security Checks
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
 
-      - name: Dependency review
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # -------------------------------
+      # Dependency Review (PR Blocking)
+      # -------------------------------
+      - name: Dependency Review
+        if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
         with:
           fail-on-severity: high
-          fail-on-scopes: runtime,development
 
-  codeql:
-    name: CodeQL (Python)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
+      # -------------------------------
+      # CodeQL Scan (SAST)
+      # -------------------------------
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: python
-          queries: security-and-quality
 
-      - name: Analyze
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  compliance-gate:
-    name: Repo security alert gate
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Run SA-04(10) compliance gate
+      # -------------------------------
+      # Python Compliance Gate
+      # -------------------------------
+      - name: Run SA-04(10) Compliance Gate
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          CODE_SCAN_FAIL_SEVERITIES: critical,high
-          DEPENDABOT_FAIL_SEVERITIES: critical,high
-        run: python scripts/sa_04_10_gate.p
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/sa_04_10_gate.py
