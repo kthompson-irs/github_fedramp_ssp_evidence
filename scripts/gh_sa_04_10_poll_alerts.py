@@ -2,16 +2,23 @@
 """
 SA-04(10) alert polling and evidence collection for GitHub.com.
 
-Checks:
-- Code scanning alerts (CodeQL): fail on open alerts at or above threshold
-- Dependabot alerts: fail on open alerts at or above threshold
-- Secret scanning alerts: fail on any open alert
+Scope support:
+- repository
+- organization
+- enterprise
+
+Auth support:
+- repository / organization:
+    * GH_DEPENDABOT_TOKEN (fine-grained PAT or classic PAT)
+    * GH_APP_TOKEN (GitHub App installation/user token, if already minted)
+- enterprise:
+    * GH_ENTERPRISE_TOKEN (classic PAT or OAuth app token)
 
 Behavior:
 - Collects JSON evidence files for each category.
-- Gracefully logs and records skipped Dependabot or Secret Scanning access when
-  GitHub denies access with 403/404 while SA04_SOFT_FAIL is enabled.
-- Writes summary.json, summary.md, evidence_lines.txt, blocking_findings.json,
+- Records structured SSP evidence lines.
+- Supports soft-fail collection so the evidence binder can still be built.
+- Produces summary.json, summary.md, evidence_lines.txt, blocking_findings.json,
   and category-specific evidence files under the output directory.
 
 Exit codes:
@@ -56,6 +63,27 @@ def get_env(name: str, default: Optional[str] = None) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Poll GitHub security alerts and collect SA-04(10) evidence.")
     parser.add_argument(
+        "--scope",
+        choices=["repository", "organization", "enterprise"],
+        default=os.getenv("GH_ALERT_SCOPE", "repository"),
+        help="Alert scope to inspect.",
+    )
+    parser.add_argument(
+        "--enterprise",
+        default=os.getenv("GH_ENTERPRISE_SLUG", ""),
+        help="Enterprise slug, required when scope=enterprise.",
+    )
+    parser.add_argument(
+        "--owner",
+        default=os.getenv("GH_ORG_NAME", ""),
+        help="Repository owner or organization name.",
+    )
+    parser.add_argument(
+        "--repo",
+        default="",
+        help="Repository name. If omitted, parsed from GH_REPOSITORY.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="artifacts/sa-04-10",
         help="Directory where evidence and summary files are written.",
@@ -78,13 +106,53 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def make_headers() -> Dict[str, str]:
-    token = get_env("GH_DEPENDABOT_TOKEN")
+def select_token(scope: str) -> Tuple[str, str]:
+    if scope == "enterprise":
+        token = os.getenv("GH_ENTERPRISE_TOKEN") or os.getenv("GH_AUTH_TOKEN")
+        if not token:
+            fail(
+                "enterprise scope requires GH_ENTERPRISE_TOKEN (classic PAT or OAuth app token). "
+                "GitHub does not support GitHub App user access tokens, GitHub App installation access tokens, "
+                "or fine-grained PATs for enterprise Dependabot alerts and enterprise secret scanning alerts.",
+                exit_code=2,
+            )
+        return token, "enterprise_token"
+
+    token = os.getenv("GH_DEPENDABOT_TOKEN") or os.getenv("GH_APP_TOKEN") or os.getenv("GH_AUTH_TOKEN")
+    if not token:
+        fail(
+            "repository/organization scope requires GH_DEPENDABOT_TOKEN or GH_APP_TOKEN. "
+            "For repository and organization alerts, GitHub supports GitHub App user access tokens, "
+            "GitHub App installation access tokens, and fine-grained PATs with the documented read permissions.",
+            exit_code=2,
+        )
+    return token, "repo_org_token"
+
+
+def make_headers(scope: str) -> Dict[str, str]:
+    token, auth_kind = select_token(scope)
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "X-SA04-AUTH-KIND": auth_kind,
     }
+
+
+def scope_base(scope: str, owner: str, repo: str, enterprise: str) -> str:
+    if scope == "repository":
+        if not owner or not repo:
+            fail("repository scope requires owner and repo values", exit_code=2)
+        return f"/repos/{owner}/{repo}"
+    if scope == "organization":
+        if not owner:
+            fail("organization scope requires GH_ORG_NAME or --owner", exit_code=2)
+        return f"/orgs/{owner}"
+    if scope == "enterprise":
+        if not enterprise:
+            fail("enterprise scope requires GH_ENTERPRISE_SLUG or --enterprise", exit_code=2)
+        return f"/enterprises/{enterprise}"
+    fail(f"unsupported scope: {scope}", exit_code=2)
 
 
 def paged_get(
@@ -182,11 +250,7 @@ def extract_secret_scanning_finding(alert: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def probe_optional_endpoint(
-    url: str,
-    headers: Dict[str, str],
-    label: str,
-) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+def probe_optional_endpoint(url: str, headers: Dict[str, str], label: str) -> Tuple[bool, Dict[str, Any]]:
     response = requests.get(
         url,
         headers=headers,
@@ -195,7 +259,7 @@ def probe_optional_endpoint(
     )
 
     if response.status_code == 200:
-        return True, {"status_code": 200, "message": "accessible"}, None
+        return True, {"status_code": 200, "message": "accessible"}
 
     if response.status_code in {403, 404}:
         try:
@@ -205,12 +269,10 @@ def probe_optional_endpoint(
             message = None
         if not message:
             message = response.text[:300]
-        return False, {"status_code": response.status_code, "message": message}, (
-            f"GitHub returned {response.status_code} for {label}; access is not available to the token or endpoint."
-        )
+        return False, {"status_code": response.status_code, "message": message}
 
     if response.status_code == 401:
-        fail(f"{label} endpoint returned 401 Unauthorized. Check GH_DEPENDABOT_TOKEN.", exit_code=2)
+        fail(f"{label} endpoint returned 401 Unauthorized. Check the token assigned to this scope.", exit_code=2)
 
     fail(
         f"unexpected response from {label} endpoint: {response.status_code} {response.text[:300]}",
@@ -218,8 +280,12 @@ def probe_optional_endpoint(
     )
 
 
-def collect_code_scanning(repo: str, headers: Dict[str, str], threshold: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    url = f"{GH_API}/repos/{repo}/code-scanning/alerts"
+def collect_code_scanning(
+    base_path: str,
+    headers: Dict[str, str],
+    threshold: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    url = f"{GH_API}{base_path}/code-scanning/alerts"
     alerts = paged_get(url, headers, params={"state": "open"})
 
     blocking_findings: List[Dict[str, Any]] = []
@@ -234,6 +300,7 @@ def collect_code_scanning(repo: str, headers: Dict[str, str], threshold: str) ->
     result = {
         "accessible": True,
         "skipped": False,
+        "skip_reason": None,
         "count": len(alerts),
         "blocking_count": len(blocking_findings),
         "alerts": alerts,
@@ -241,22 +308,32 @@ def collect_code_scanning(repo: str, headers: Dict[str, str], threshold: str) ->
     return result, blocking_findings, evidence_lines
 
 
-def collect_optional_alerts(
-    repo: str,
+def collect_alert_category(
+    base_path: str,
     headers: Dict[str, str],
     label: str,
-    endpoint: str,
-    soft_fail: bool,
     threshold: str,
+    soft_fail: bool,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str], List[str]]:
-    url = f"{GH_API}/repos/{repo}/{endpoint}"
-    accessible, access_info, skip_reason = probe_optional_endpoint(url, headers, label)
+    endpoint_map = {
+        "dependabot": f"{base_path}/dependabot/alerts",
+        "secret_scanning": f"{base_path}/secret-scanning/alerts",
+    }
+    if label not in endpoint_map:
+        fail(f"unsupported alert label: {label}", exit_code=2)
+
+    url = f"{GH_API}{endpoint_map[label]}"
+    accessible, access_info = probe_optional_endpoint(url, headers, label)
 
     if not accessible:
+        skip_reason = (
+            f"GitHub returned {access_info.get('status_code')} for {label}; "
+            "access is not available to the token or endpoint."
+        )
         result = {
             "accessible": False,
             "skipped": True,
-            "skip_reason": access_info.get("message"),
+            "skip_reason": skip_reason,
             "status_code": access_info.get("status_code"),
             "count": 0,
             "blocking_count": 0,
@@ -267,7 +344,7 @@ def collect_optional_alerts(
             f"{access_info.get('status_code')} for the alerts endpoint; documented for SA-04(10) review."
         )
         if soft_fail:
-            return result, [], [evidence_line], [skip_reason or evidence_line]
+            return result, [], [evidence_line], []
         fail(evidence_line, exit_code=2)
 
     alerts = paged_get(url, headers, params={"state": "open"})
@@ -283,12 +360,11 @@ def collect_optional_alerts(
         for alert in alerts:
             if alert.get("state") == "open" or not alert.get("state"):
                 blocking_findings.append(extract_secret_scanning_finding(alert))
-    else:
-        fail(f"unsupported optional alert label: {label}", exit_code=2)
 
     result = {
         "accessible": True,
         "skipped": False,
+        "skip_reason": None,
         "count": len(alerts),
         "blocking_count": len(blocking_findings),
         "alerts": alerts,
@@ -298,7 +374,11 @@ def collect_optional_alerts(
 
 
 def build_summary(
+    scope: str,
     repo: str,
+    owner: str,
+    org: str,
+    enterprise: str,
     threshold: str,
     soft_fail: bool,
     results: Dict[str, Any],
@@ -316,7 +396,11 @@ def build_summary(
 
     return {
         "generated_at": utc_now(),
+        "scope": scope,
         "repository": repo,
+        "owner": owner,
+        "organization": org,
+        "enterprise": enterprise,
         "threshold": threshold,
         "soft_fail": soft_fail,
         "results": results,
@@ -332,16 +416,17 @@ def build_summary(
 
 
 def render_summary_md(summary: Dict[str, Any]) -> str:
-    repo = summary["repository"]
-    threshold = summary["threshold"]
     overall = summary["overall"]
     results = summary["results"]
 
     lines = [
         "# SA-04(10) Evidence Collection Summary",
         "",
-        f"- Repository: `{repo}`",
-        f"- Threshold: `{threshold}`",
+        f"- Scope: `{summary['scope']}`",
+        f"- Repository: `{summary['repository']}`",
+        f"- Organization: `{summary['organization']}`",
+        f"- Enterprise: `{summary['enterprise']}`",
+        f"- Threshold: `{summary['threshold']}`",
         f"- Generated: `{summary['generated_at']}`",
         f"- Status: `{overall['status']}`",
         f"- Blocking findings: `{overall['blocking_count']}`",
@@ -361,14 +446,7 @@ def render_summary_md(summary: Dict[str, Any]) -> str:
             f"{item.get('blocking_count', 0)} |"
         )
 
-    lines.extend(
-        [
-            "",
-            "## Evidence Lines",
-            "",
-        ]
-    )
-
+    lines.extend(["", "## Evidence Lines", ""])
     for entry in summary.get("evidence_lines", []):
         lines.append(f"- {entry}")
 
@@ -385,31 +463,40 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    repo = get_env("GH_REPO")
+    repo_full = get_env("GH_REPOSITORY")
+    owner_default, repo_default = repo_full.split("/", 1)
+
+    owner = args.owner or owner_default
+    repo = args.repo or repo_default
+    org = owner
+    enterprise = args.enterprise or os.getenv("GH_ENTERPRISE_SLUG", "")
+    scope = args.scope.strip().lower()
+
     threshold = os.getenv("FAIL_ON_SEVERITY", "high").strip().lower()
     soft_fail = args.soft_fail or os.getenv("SA04_SOFT_FAIL", "") == "1"
 
     if threshold not in {"low", "medium", "high", "critical"}:
         fail(f"invalid FAIL_ON_SEVERITY value: {threshold}", exit_code=2)
 
-    headers = make_headers()
+    base_path = scope_base(scope, owner=owner, repo=repo, enterprise=enterprise)
+    headers = make_headers(scope)
 
     print("SA-04(10) security gate starting")
-    print(f"Repository: {repo}")
+    print(f"Scope: {scope}")
+    print(f"Repository: {repo_full}")
     print(f"Blocking threshold: {threshold}")
     print(f"Soft fail: {soft_fail}")
+    print(f"Auth kind: {headers.get('X-SA04-AUTH-KIND')}")
 
     results: Dict[str, Any] = {}
     evidence_lines: List[str] = []
     errors: List[str] = []
     blocking_findings: List[Dict[str, Any]] = []
 
-    # Code scanning is treated as required. If the endpoint is inaccessible in soft-fail mode,
-    # the condition is still captured for evidence and the workflow can finish building the binder.
     try:
         print("Phase 1: code scanning alert polling")
         code_scanning_result, code_scanning_blocking, code_scanning_evidence = collect_code_scanning(
-            repo, headers, threshold
+            base_path, headers, threshold
         )
         results["code_scanning"] = code_scanning_result
         blocking_findings.extend(code_scanning_blocking)
@@ -432,16 +519,14 @@ def main() -> int:
         else:
             fail(message, exit_code=2)
 
-    # Dependabot is optionally skipped when access is not available.
     try:
         print("Phase 2: Dependabot alert polling")
-        dependabot_result, dependabot_blocking, dependabot_evidence, dependabot_errors = collect_optional_alerts(
-            repo=repo,
+        dependabot_result, dependabot_blocking, dependabot_evidence, dependabot_errors = collect_alert_category(
+            base_path=base_path,
             headers=headers,
             label="dependabot",
-            endpoint="dependabot/alerts",
-            soft_fail=soft_fail,
             threshold=threshold,
+            soft_fail=soft_fail,
         )
         results["dependabot"] = dependabot_result
         blocking_findings.extend(dependabot_blocking)
@@ -468,16 +553,14 @@ def main() -> int:
         else:
             fail(message, exit_code=2)
 
-    # Secret scanning is also captured and can be skipped with evidence if the endpoint is unavailable.
     try:
         print("Phase 3: secret scanning alert polling")
-        secret_result, secret_blocking, secret_evidence, secret_errors = collect_optional_alerts(
-            repo=repo,
+        secret_result, secret_blocking, secret_evidence, secret_errors = collect_alert_category(
+            base_path=base_path,
             headers=headers,
             label="secret_scanning",
-            endpoint="secret-scanning/alerts",
-            soft_fail=soft_fail,
             threshold=threshold,
+            soft_fail=soft_fail,
         )
         results["secret_scanning"] = secret_result
         blocking_findings.extend(secret_blocking)
@@ -515,7 +598,11 @@ def main() -> int:
         overall["status"] = "fail"
 
     summary = build_summary(
-        repo=repo,
+        scope=scope,
+        repo=repo_full,
+        owner=owner,
+        org=org,
+        enterprise=enterprise,
         threshold=threshold,
         soft_fail=soft_fail,
         results=results,
