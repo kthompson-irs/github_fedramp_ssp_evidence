@@ -1,0 +1,67 @@
+name: SA-04(10) Enterprise FedRAMP Evidence Builder
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  build-evidence:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests openpyxl
+
+      - name: Run Enterprise Collector
+        env:
+          GH_ALERT_SCOPE: enterprise
+          GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_DEPENDABOT_TOKEN: ${{ secrets.GH_DEPENDABOT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
+          SA04_SOFT_FAIL: "1"
+        run: |
+          python scripts/gh_sa_04_10_enterprise_collector.py \
+            --scope enterprise \
+            --enterprise "${GH_ENTERPRISE_SLUG}" \
+            --output-dir artifacts/sa-04-10 \
+            --soft-fail
+
+      - name: Build 30-day Logs
+        run: |
+          python scripts/build_sa04_30_day_spreadsheets.py \
+            --input-dir artifacts/sa-04-10 \
+            --output-dir spreadsheets
+
+      - name: Build POA&M
+        run: |
+          python scripts/build_poam_from_findings.py \
+            --input-dir artifacts/sa-04-10 \
+            --output-dir poam
+
+      - name: Build FedRAMP Package
+        run: |
+          python scripts/build_fedramp_submission_package_enterprise.py \
+            --input-dir artifacts/sa-04-10 \
+            --spreadsheets-dir spreadsheets \
+            --poam-dir poam \
+            --controls-manifest controls_manifest.json \
+            --output-dir fedramp_ato_package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-enterprise-package
+          path: |
+            fedramp_ato_package
+            spreadsheets
+            poam
