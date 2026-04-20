@@ -39,7 +39,7 @@ def get_env(name: str) -> str:
 
 
 def make_headers() -> Dict[str, str]:
-    token = get_env("GH_TOKEN")
+    token = get_env("GH_DEPENDABOT_TOKEN")
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -47,7 +47,11 @@ def make_headers() -> Dict[str, str]:
     }
 
 
-def paged_get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def paged_get(
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     page = 1
 
