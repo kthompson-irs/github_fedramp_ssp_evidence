@@ -123,7 +123,7 @@ jobs:
               sys.exit(1)
 
           if error_count > 0:
-              print(f"SA-04(10) COMPLIANCE WARNING: {error_count} collection error(s) were recorded, but the package was still built.")
+              print(f"SA-04(10) COMPLIANCE WARNING: {error_count} collection issue(s) were recorded, but the package was still built.")
 
           print("SA-04(10) COMPLIANCE PASS: no blocking findings were detected.")
           PY
