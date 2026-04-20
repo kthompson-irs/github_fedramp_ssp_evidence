@@ -53,14 +53,23 @@ def due_date_for_severity(severity: str) -> str:
     return "120 days"
 
 
-def build_rows(findings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def build_rows(findings: List[Dict[str, Any]], default_org: str = "", default_repo: str = "") -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     for idx, finding in enumerate(findings, start=1):
         severity = str(finding.get("severity", "")).strip()
+        organization = str(finding.get("organization", "") or default_org)
+        repository = str(finding.get("repository", "") or default_repo)
+        repository_full = str(finding.get("repository_full", ""))
+        if not repository_full and organization and repository:
+            repository_full = f"{organization}/{repository}"
+
         rows.append(
             {
                 "poam_id": f"POAM-{idx:03d}",
                 "category": str(finding.get("category", "")),
+                "organization": organization,
+                "repository": repository,
+                "repository_full": repository_full,
                 "identifier": str(finding.get("identifier", "")),
                 "title": str(finding.get("title", "")),
                 "severity": severity,
@@ -81,6 +90,9 @@ def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
     fieldnames = [
         "poam_id",
         "category",
+        "organization",
+        "repository",
+        "repository_full",
         "identifier",
         "title",
         "severity",
@@ -106,13 +118,13 @@ def write_workbook(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A4"
 
-    ws.merge_cells("A1:L1")
+    ws.merge_cells("A1:O1")
     ws["A1"] = "SA-04(10) Auto-generated POA&M"
     ws["A1"].font = Font(color=WHITE, bold=True, size=14)
     ws["A1"].fill = PatternFill("solid", fgColor=DARK)
     ws["A1"].alignment = Alignment(horizontal="center")
 
-    ws.merge_cells("A2:L2")
+    ws.merge_cells("A2:O2")
     ws["A2"] = f"Generated {generated_at}"
     ws["A2"].fill = PatternFill("solid", fgColor=LIGHT)
     ws["A2"].alignment = Alignment(horizontal="left")
@@ -120,6 +132,9 @@ def write_workbook(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
     headers = [
         "POAM ID",
         "Category",
+        "Organization",
+        "Repository",
+        "Repository Full",
         "Identifier",
         "Title",
         "Severity",
@@ -142,6 +157,9 @@ def write_workbook(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
         values = [
             row["poam_id"],
             row["category"],
+            row["organization"],
+            row["repository"],
+            row["repository_full"],
             row["identifier"],
             row["title"],
             row["severity"],
@@ -157,12 +175,12 @@ def write_workbook(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
             cell = ws.cell(r_idx, c_idx, value)
             cell.border = border
             cell.alignment = Alignment(
-                horizontal="left" if c_idx in {2, 3, 4, 6, 10, 11} else "center",
+                horizontal="left" if c_idx in {2, 3, 4, 5, 6, 7, 9, 13, 14} else "center",
                 vertical="center",
                 wrap_text=True,
             )
 
-    widths = [14, 16, 24, 34, 12, 44, 12, 12, 18, 18, 30, 24]
+    widths = [14, 16, 18, 24, 30, 24, 34, 12, 44, 12, 12, 18, 18, 30, 24]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[chr(64 + idx)].width = width
 
@@ -176,13 +194,13 @@ def write_markdown(path: Path, rows: List[Dict[str, str]], generated_at: str) ->
         f"- Generated at: {generated_at}",
         f"- Finding count: {len(rows)}",
         "",
-        "| POAM ID | Category | Identifier | Severity | Due Date | Status |",
-        "|---|---|---|---|---|---|",
+        "| POAM ID | Organization | Repository | Category | Identifier | Severity | Due Date | Status |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['poam_id']} | {row['category']} | {row['identifier']} | {row['severity']} | "
-            f"{row['recommended_due_date']} | {row['status']} |"
+            f"| {row['poam_id']} | {row['organization']} | {row['repository']} | {row['category']} | "
+            f"{row['identifier']} | {row['severity']} | {row['recommended_due_date']} | {row['status']} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -198,7 +216,12 @@ def main() -> int:
     if not isinstance(findings, list):
         raise SystemExit("blocking_findings.json is malformed or not a list")
 
-    rows = build_rows(findings)
+    summary = read_json(input_dir / "summary.json", {}) or {}
+    default_org = str(summary.get("organization") or summary.get("owner") or "")
+    repo_full = str(summary.get("repository") or "")
+    default_repo = repo_full.split("/", 1)[1] if "/" in repo_full else repo_full
+
+    rows = build_rows(findings, default_org=default_org, default_repo=default_repo)
     generated_at = utc_now()
 
     write_csv(output_dir / "poam.csv", rows)
