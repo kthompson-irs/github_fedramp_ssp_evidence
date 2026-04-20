@@ -83,6 +83,7 @@ jobs:
           python scripts/gh_sa_04_10_poll_alerts.py \
             --scope "${GH_ALERT_SCOPE:-repository}" \
             --enterprise "${GH_ENTERPRISE_SLUG:-}" \
+            --owner "${GH_ORG_NAME:-}" \
             --output-dir artifacts/sa-04-10 \
             --soft-fail
 
