@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import uuid
 import zipfile
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def utc_now() -> str:
@@ -20,14 +20,12 @@ def utc_now() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the FedRAMP submission package.")
 
-    # New argument names
     parser.add_argument("--input-dir", dest="input_dir", default=None)
     parser.add_argument("--spreadsheets-dir", dest="spreadsheets_dir", default=None)
     parser.add_argument("--poam-dir", dest="poam_dir", default=None)
     parser.add_argument("--controls-manifest", dest="controls_manifest", default=None)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
 
-    # Legacy argument names
     parser.add_argument("--input", dest="input_legacy", default=None)
     parser.add_argument("--spreadsheets", dest="spreadsheets_legacy", default=None)
     parser.add_argument("--poam", dest="poam_legacy", default=None)
@@ -404,6 +402,36 @@ def copy_source_files(output_dir: Path, controls_manifest: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def copy_spreadsheets(spreadsheets_dir: Path, output_dir: Path) -> List[str]:
+    copied: List[str] = []
+    if not spreadsheets_dir.exists():
+        return copied
+
+    for name in [
+        "dependabot_30_day_log.xlsx",
+        "codeql_30_day_log.xlsx",
+        "security_30_day_log.xlsx",
+        "30-day-security-log-spreadsheets.zip",
+    ]:
+        src = spreadsheets_dir / name
+        if src.exists():
+            dst = output_dir / "Spreadsheets" / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append(name)
+
+    # Copy any other workbook/zip artifacts if present
+    for src in sorted(spreadsheets_dir.iterdir()):
+        if src.name in copied:
+            continue
+        if src.is_file() and src.suffix.lower() in {".xlsx", ".zip"}:
+            dst = output_dir / "Spreadsheets" / src.name
+            shutil.copy2(src, dst)
+            copied.append(src.name)
+
+    return copied
+
+
 def zip_directory(source_dir: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(source_dir.rglob("*")):
@@ -448,8 +476,8 @@ def main() -> int:
         folder.mkdir(parents=True, exist_ok=True)
 
     copy_tree(input_dir, output_dir / "Evidence" / "CI_CD")
-    copy_tree(spreadsheets_dir, output_dir / "Spreadsheets")
     copy_tree(poam_dir, output_dir / "POAM")
+    copied_spreadsheets = copy_spreadsheets(spreadsheets_dir, output_dir)
     copy_source_files(output_dir, controls_manifest)
 
     findings = read_json(input_dir / "blocking_findings.json", []) or []
@@ -457,6 +485,13 @@ def main() -> int:
 
     run_context = repo_from_env_or_summary(summary)
     has_sarif = (output_dir / "Evidence" / "CI_CD" / "codeql_results" / "python.sarif").exists()
+
+    # Add spreadsheet references to the evidence area if they were copied
+    if copied_spreadsheets:
+        write_text(
+            output_dir / "Evidence" / "CI_CD" / "spreadsheets_manifest.txt",
+            "\n".join(copied_spreadsheets) + "\n",
+        )
 
     write_text(output_dir / "SSP" / "sa-04-10-control-response.md", build_ssp_markdown(summary, controls, run_context))
     write_json(output_dir / "OSCAL" / "ssp.json", build_oscal_ssp(summary, controls, run_context, has_sarif))
@@ -467,6 +502,7 @@ def main() -> int:
 
     print(f"FedRAMP package built at {output_dir}")
     print(f"Archive created at {output_dir / 'fedramp_ato_package.zip'}")
+    print(f"Copied spreadsheets: {', '.join(copied_spreadsheets) if copied_spreadsheets else 'none'}")
     return 0
 
 
