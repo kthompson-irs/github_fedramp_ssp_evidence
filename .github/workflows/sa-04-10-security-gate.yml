@@ -18,7 +18,7 @@ on:
 
 permissions:
   contents: read
-  security-events: read
+  security-events: write
   actions: read
   pull-requests: read
 
@@ -28,15 +28,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ---------------------------------------
-      # Checkout
-      # ---------------------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------------------------------------
-      # Python setup
-      # ---------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
