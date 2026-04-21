@@ -5,7 +5,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -60,7 +60,7 @@ def utc_date_from_iso(value: Optional[str]) -> Optional[str]:
     return dt.date().isoformat() if dt else None
 
 
-def repo_parts(repository_full: str) -> tuple[str, str]:
+def repo_parts(repository_full: str) -> Tuple[str, str]:
     if "/" in repository_full:
         org, repo = repository_full.split("/", 1)
         return org, repo
@@ -135,6 +135,13 @@ def snapshot_meta(snapshot: Dict[str, Any]) -> Dict[str, str]:
         "repository": repository,
         "repository_full": repository_full,
     }
+
+
+def get_diagnostics(input_dir: Path) -> Dict[str, Any]:
+    diagnostics = read_json(input_dir / "diagnostics.json", {}) or {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    return diagnostics
 
 
 def findings_from_snapshot(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -290,7 +297,7 @@ def write_table_sheet(
             c = ws.cell(r_idx, c_idx, value)
             c.border = border
             c.alignment = Alignment(
-                horizontal="left" if c_idx in {3, 4, 5, 8, 9, 10, 11, 12, 13, 14} else "center",
+                horizontal="left" if c_idx in {3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15} else "center",
                 vertical="center",
                 wrap_text=True,
             )
@@ -341,6 +348,75 @@ def write_summary_sheet(ws, title: str, rows: List[List[Any]]) -> None:
     ws.column_dimensions["B"].width = 95
 
 
+def write_diagnostics_sheet(ws, diagnostics: Dict[str, Any]) -> None:
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:C1")
+    ws["A1"] = "Collector Diagnostics"
+    ws["A1"].font = Font(color=WHITE, bold=True, size=13)
+    ws["A1"].fill = PatternFill("solid", fgColor=DARK)
+    ws["A1"].alignment = Alignment(horizontal="center")
+
+    overview = [
+        ["Generated At", diagnostics.get("generated_at", "")],
+        ["Scope", diagnostics.get("scope", "")],
+        ["Enterprise", diagnostics.get("enterprise", "")],
+        ["Organization", diagnostics.get("organization", "")],
+        ["Repository", diagnostics.get("repository", "")],
+        ["Repository Full", diagnostics.get("repository_full", "")],
+        ["Selected Auth Kind", diagnostics.get("selected_auth_kind", "")],
+        ["Notes", "; ".join(diagnostics.get("notes", []) or [])],
+    ]
+    for i, (k, v) in enumerate(overview, 3):
+        ws.cell(i, 1, k).font = Font(bold=True)
+        ws.cell(i, 1).fill = PatternFill("solid", fgColor=LIGHT)
+        ws.cell(i, 1).border = border
+        ws.cell(i, 2, v).border = border
+        ws.cell(i, 2).alignment = Alignment(wrap_text=True)
+
+    token_row = 13
+    ws.merge_cells(start_row=token_row, start_column=1, end_row=token_row, end_column=3)
+    ws.cell(token_row, 1, "Token Attempts").font = Font(color=WHITE, bold=True)
+    ws.cell(token_row, 1).fill = PatternFill("solid", fgColor=DARK)
+    ws.cell(token_row, 1).alignment = Alignment(horizontal="center")
+
+    headers = ["Token Env", "Auth Kind", "Status", "Login", "Type", "Accepted Permissions", "SSO", "Message"]
+    header_row = token_row + 1
+    for idx, header in enumerate(headers, 1):
+        c = ws.cell(header_row, idx, header)
+        c.font = Font(color=WHITE, bold=True)
+        c.fill = PatternFill("solid", fgColor=DARK)
+        c.border = border
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    r = header_row + 1
+    for attempt in diagnostics.get("token_attempts", []) or []:
+        identity = attempt.get("identity") or {}
+        row = [
+            attempt.get("token_env", ""),
+            attempt.get("auth_kind", ""),
+            attempt.get("status", ""),
+            identity.get("login", ""),
+            identity.get("type", ""),
+            identity.get("accepted_permissions", ""),
+            identity.get("sso", ""),
+            identity.get("message", "") or "",
+        ]
+        for c_idx, val in enumerate(row, 1):
+            c = ws.cell(r, c_idx, val)
+            c.border = border
+            c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        r += 1
+
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+    ws.column_dimensions["E"].width = 14
+    ws.column_dimensions["F"].width = 24
+    ws.column_dimensions["G"].width = 20
+    ws.column_dimensions["H"].width = 80
+
+
 def build_workbook(
     path: Path,
     sheet_title: str,
@@ -350,6 +426,7 @@ def build_workbook(
     table_name: str,
     widths: List[int],
     headers: List[str],
+    diagnostics: Dict[str, Any],
 ) -> None:
     wb = Workbook()
     ws = wb.active
@@ -367,6 +444,9 @@ def build_workbook(
 
     summary = wb.create_sheet("Snapshot Summary")
     write_summary_sheet(summary, f"{sheet_title} Summary", summary_rows)
+
+    diag_sheet = wb.create_sheet("Diagnostics")
+    write_diagnostics_sheet(diag_sheet, diagnostics)
 
     readme = wb.create_sheet("Read Me")
     readme.sheet_view.showGridLines = False
@@ -464,6 +544,7 @@ def main() -> int:
     if not history:
         raise SystemExit("No historical snapshots found in artifacts/sa-04-10")
 
+    diagnostics = get_diagnostics(input_dir)
     entries = sort_entries(aggregate_entries(last_30_days(history)))
     rows = make_sheet_rows(entries)
 
@@ -506,11 +587,12 @@ def main() -> int:
         notes=[
             "This workbook lists real Dependabot alert entries from the last 30 days.",
             "Rows are sorted by severity first, then by date and repository.",
-            "No synthetic placeholder rows are inserted.",
+            "Diagnostics are captured on the Diagnostics sheet for token and probe review.",
         ],
         table_name="dependabot_30_day_log",
         widths=widths,
         headers=headers,
+        diagnostics=diagnostics,
     )
 
     build_workbook(
@@ -530,11 +612,12 @@ def main() -> int:
         notes=[
             "This workbook lists real CodeQL alert entries from the last 30 days.",
             "Rows are sorted by severity first, then by date and repository.",
-            "Evidence references point back to the originating snapshot.",
+            "Diagnostics are captured on the Diagnostics sheet for token and probe review.",
         ],
         table_name="codeql_30_day_log",
         widths=widths,
         headers=headers,
+        diagnostics=diagnostics,
     )
 
     build_workbook(
@@ -555,16 +638,16 @@ def main() -> int:
         notes=[
             "This workbook combines CodeQL, Dependabot, and Secret Scanning entries from the last 30 days.",
             "Entries are sorted by severity first, then by date and repository.",
-            "Use this workbook as the aggregate enterprise security evidence log.",
+            "Diagnostics are captured on the Diagnostics sheet for token and probe review.",
         ],
         table_name="security_30_day_log",
         widths=widths,
         headers=headers,
+        diagnostics=diagnostics,
     )
 
     if latest.get("scope") == "enterprise":
-        write_path = output_dir / "enterprise_coverage.txt"
-        write_path.write_text(enterprise_summary_text(latest) + "\n", encoding="utf-8")
+        (output_dir / "enterprise_coverage.txt").write_text(enterprise_summary_text(latest) + "\n", encoding="utf-8")
 
     print(f"Spreadsheets generated in {output_dir}")
     print(f"Dependabot rows: {len(rows['dependabot'])}")
