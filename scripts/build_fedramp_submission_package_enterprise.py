@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -11,7 +10,13 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+GH_API = "https://api.github.com"
+PAGE_SIZE = 100
+TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -20,30 +25,22 @@ def utc_now() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the FedRAMP submission package.")
-
     parser.add_argument("--input-dir", dest="input_dir", default=None)
     parser.add_argument("--spreadsheets-dir", dest="spreadsheets_dir", default=None)
     parser.add_argument("--poam-dir", dest="poam_dir", default=None)
     parser.add_argument("--controls-manifest", dest="controls_manifest", default=None)
-    parser.add_argument("--enterprise-orgs-file", dest="enterprise_orgs_file", default=None)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
-
     parser.add_argument("--input", dest="input_legacy", default=None)
     parser.add_argument("--spreadsheets", dest="spreadsheets_legacy", default=None)
     parser.add_argument("--poam", dest="poam_legacy", default=None)
     parser.add_argument("--manifest", dest="manifest_legacy", default=None)
-    parser.add_argument("--enterprise-orgs", dest="enterprise_orgs_legacy", default=None)
     parser.add_argument("--output", dest="output_legacy", default=None)
-
     args = parser.parse_args()
-
     args.input_dir = args.input_dir or args.input_legacy or "artifacts/sa-04-10"
     args.spreadsheets_dir = args.spreadsheets_dir or args.spreadsheets_legacy or "spreadsheets"
     args.poam_dir = args.poam_dir or args.poam_legacy or "poam"
     args.controls_manifest = args.controls_manifest or args.manifest_legacy or "controls_manifest.json"
-    args.enterprise_orgs_file = args.enterprise_orgs_file or args.enterprise_orgs_legacy or "enterprise_organizations.json"
     args.output_dir = args.output_dir or args.output_legacy or "fedramp_ato_package"
-
     return args
 
 
@@ -115,101 +112,8 @@ def load_controls_manifest(path: Path) -> Dict[str, Any]:
         controls = manifest.get("controls", [])
         if isinstance(controls, list) and controls:
             return manifest
-
-    print(
-        f"WARNING: {path} is missing or invalid. Using a default SA-04(10) controls manifest "
-        "so the package build can continue."
-    )
+    print(f"WARNING: {path} is missing or invalid. Using a default SA-04(10) controls manifest.")
     return default_controls_manifest()
-
-
-def default_enterprise_orgs() -> Dict[str, Any]:
-    return {
-        "enterprise": "internal-revenue-service",
-        "generated_at": utc_now(),
-        "organizations": [
-            {
-                "slug": "AD-DIRECTFILE",
-                "display_name": "AD-DIRECTFILE",
-                "role": "Owner",
-                "status": "archived_owner",
-                "single_sign_on": False,
-                "two_factor_required": False,
-            },
-            {
-                "slug": "IRS-Codespaces-testing",
-                "display_name": "IRS-Codespaces-testing",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": False,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "IRS-CoPilot-Testing",
-                "display_name": "IRS-CoPilot-Testing",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": False,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "IRS-Public",
-                "display_name": "IRS-Public",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": False,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "IRS-ShareIT",
-                "display_name": "IRS-ShareIT",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": False,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "IRSDigitalService",
-                "display_name": "IRSDigitalService",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": False,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "sds-sbx",
-                "display_name": "sds-sbx",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": True,
-                "two_factor_required": True,
-            },
-            {
-                "slug": "Taxpayer-Services-and-Online-Accounts",
-                "display_name": "Taxpayer-Services-and-Online-Accounts",
-                "role": "Owner",
-                "status": "active",
-                "single_sign_on": True,
-                "two_factor_required": True,
-            },
-        ],
-        "notes": [
-            "Captured from the enterprise organization inventory provided by the user.",
-        ],
-    }
-
-
-def load_enterprise_orgs(path: Path) -> Dict[str, Any]:
-    data = read_json(path, default=None)
-    if isinstance(data, dict):
-        orgs = data.get("organizations", [])
-        if isinstance(orgs, list) and orgs:
-            return data
-
-    print(
-        f"WARNING: {path} is missing or invalid. Using the provided enterprise organization inventory fallback."
-    )
-    return default_enterprise_orgs()
 
 
 def repo_from_env_or_summary(summary: Dict[str, Any]) -> Dict[str, str]:
@@ -223,6 +127,166 @@ def repo_from_env_or_summary(summary: Dict[str, Any]) -> Dict[str, str]:
         "run_attempt": os.getenv("GH_RUN_ATTEMPT", ""),
         "sha": os.getenv("GH_SHA", ""),
         "ref": os.getenv("GH_REF", ""),
+    }
+
+
+def default_enterprise_slug(summary: Dict[str, Any]) -> str:
+    return str(summary.get("enterprise") or os.getenv("GH_ENTERPRISE_SLUG") or "").strip()
+
+
+def gh_token_candidates() -> List[Tuple[str, str]]:
+    return [
+        ("GH_ENTERPRISE_TOKEN", "enterprise_token"),
+        ("GH_AUTH_TOKEN", "auth_fallback"),
+        ("GH_DEPENDABOT_TOKEN", "dependabot_token_fallback"),
+    ]
+
+
+def auth_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+    }
+
+
+def graphql_post(query: str, variables: Dict[str, Any], token: str) -> Dict[str, Any]:
+    resp = requests.post(
+        "https://api.github.com/graphql",
+        headers={**auth_headers(token), "Content-Type": "application/json"},
+        json={"query": query, "variables": variables},
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if "errors" in payload:
+        raise RuntimeError(json.dumps(payload["errors"], indent=2))
+    return payload["data"]
+
+
+def rest_get(url: str, token: str) -> Dict[str, Any]:
+    resp = requests.get(url, headers=auth_headers(token), timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_live_enterprise_org_inventory(enterprise_slug: str, token: str) -> Dict[str, Any]:
+    """
+    Uses GitHub's Enterprise Accounts GraphQL API to list organizations in the enterprise.
+    The docs show enterprise(slug:$slug) -> organizations(first:100) -> nodes { name ... }.
+    """
+    query = """
+    query($slug: String!, $after: String) {
+      enterprise(slug: $slug) {
+        name
+        organizations(first: 100, after: $after) {
+          nodes {
+            name
+            repositories(privacy: PUBLIC) {
+              totalCount
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+    """
+
+    orgs: List[Dict[str, Any]] = []
+    after: Optional[str] = None
+    enterprise_name = enterprise_slug
+
+    while True:
+        data = graphql_post(query, {"slug": enterprise_slug, "after": after}, token)
+        enterprise = data.get("enterprise") or {}
+        if not enterprise:
+            raise RuntimeError(f"enterprise slug not found or inaccessible: {enterprise_slug}")
+        enterprise_name = enterprise.get("name") or enterprise_name
+
+        org_conn = enterprise.get("organizations") or {}
+        nodes = org_conn.get("nodes") or []
+        for node in nodes:
+            name = str(node.get("name") or "").strip()
+            if not name:
+                continue
+            item: Dict[str, Any] = {
+                "slug": name,
+                "display_name": name,
+                "role": "Owner",
+                "status": "active",
+                "single_sign_on": None,
+                "two_factor_required": None,
+                "public_repo_count": (node.get("repositories") or {}).get("totalCount"),
+                "source": "graphql-enterprise",
+            }
+            orgs.append(item)
+
+        page_info = org_conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+
+    # Augment with org REST details where available.
+    for item in orgs:
+        try:
+            org_detail = rest_get(f"{GH_API}/orgs/{item['slug']}", token)
+            item["two_factor_required"] = org_detail.get("two_factor_requirement_enabled")
+            item["public_repos"] = org_detail.get("public_repos")
+            item["total_private_repos"] = org_detail.get("total_private_repos")
+            item["html_url"] = org_detail.get("html_url")
+        except Exception as exc:
+            item["detail_error"] = str(exc)
+
+    return {
+        "enterprise": enterprise_name,
+        "generated_at": utc_now(),
+        "organizations": orgs,
+        "notes": [
+            "Organizations were pulled live from the GitHub Enterprise Accounts GraphQL API.",
+            "Where possible, organization REST details were used to augment the inventory with 2FA and repository counts.",
+        ],
+    }
+
+
+def load_enterprise_org_inventory(summary: Dict[str, Any], input_dir: Path) -> Dict[str, Any]:
+    enterprise_slug = default_enterprise_slug(summary)
+    if enterprise_slug:
+        last_error = None
+        for env_name, _kind in gh_token_candidates():
+            token = os.getenv(env_name)
+            if not token:
+                continue
+            try:
+                return fetch_live_enterprise_org_inventory(enterprise_slug, token)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        # fallback to a previously generated inventory if live fetch failed
+        fallback = read_json(input_dir / "enterprise_organizations.json", default=None)
+        if isinstance(fallback, dict) and fallback.get("organizations"):
+            fallback["live_fetch_error"] = str(last_error) if last_error else "live fetch unavailable"
+            return fallback
+
+        raise SystemExit(f"Unable to fetch live enterprise org inventory: {last_error}")
+
+    # no enterprise slug: use any existing file or derive from findings later
+    fallback = read_json(input_dir / "enterprise_organizations.json", default=None)
+    if isinstance(fallback, dict) and fallback.get("organizations"):
+        return fallback
+
+    return default_enterprise_orgs()
+
+
+def default_enterprise_orgs() -> Dict[str, Any]:
+    return {
+        "enterprise": "unknown",
+        "generated_at": utc_now(),
+        "organizations": [],
+        "notes": ["No live enterprise slug was available; inventory was not fetched."],
     }
 
 
@@ -263,10 +327,18 @@ def build_poam_csv(findings: List[Dict[str, Any]]) -> str:
     return "\n".join(",".join(csv_quote(cell) for cell in row) for row in rows) + "\n"
 
 
-def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str]) -> str:
+def default_controls_manifest_rows(controls: List[Dict[str, Any]]) -> List[List[str]]:
+    rows = []
+    for c in controls:
+        rows.append([c.get("control_id", ""), c.get("origination", ""), c.get("implementation", "")])
+    return rows
+
+
+def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str], org_inventory: Dict[str, Any]) -> str:
     scope = summary.get("scope", "unknown")
-    repository = summary.get("repository", "unknown")
+    repo = summary.get("repository", "unknown")
     repo_count = summary.get("repository_count", 0)
+    org_count = len(org_inventory.get("organizations", []) or [])
 
     lines = [
         "# Treasury Cloud SSP",
@@ -274,15 +346,15 @@ def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], 
         f"- Generated: `{summary.get('generated_at', utc_now())}`",
         f"- Scope: `{scope}`",
         f"- Organization: `{summary.get('organization', '')}`",
-        f"- Repository: `{repository}`",
+        f"- Repository: `{repo}`",
         f"- Repository count: `{repo_count}`",
+        f"- Enterprise organizations captured: `{org_count}`",
         f"- Workflow: `{run_context.get('workflow', '')}`",
         f"- Run ID: `{run_context.get('run_id', '')}`",
         "",
         "## Control Coverage",
         "",
     ]
-
     for control in controls:
         lines.append(f"- {control.get('control_id', 'unknown')}: {control.get('origination', 'shared')}")
 
@@ -303,152 +375,28 @@ def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], 
                 "",
                 f"- Enterprise slug: `{summary.get('enterprise', '')}`",
                 f"- Covered repositories: `{repo_count}`",
+                f"- Organizations in inventory: `{org_count}`",
                 "",
             ]
         )
-
     return "\n".join(lines)
 
 
-def build_oscal_ssp(
-    summary: Dict[str, Any],
-    controls: List[Dict[str, Any]],
-    run_context: Dict[str, str],
-    has_sarif: bool,
-) -> Dict[str, Any]:
-    sys_uuid = str(uuid.uuid4())
-    aws_uuid = str(uuid.uuid4())
-    github_uuid = str(uuid.uuid4())
-    treasury_uuid = str(uuid.uuid4())
-
-    components = [
-        {
-            "uuid": aws_uuid,
-            "type": "service",
-            "title": "AWS GovCloud (US)",
-            "description": "FedRAMP-authorized infrastructure and platform services.",
-        },
-        {
-            "uuid": github_uuid,
-            "type": "service",
-            "title": "GitHub.com",
-            "description": "Development platform providing CodeQL, Dependabot, and secret scanning.",
-        },
-        {
-            "uuid": treasury_uuid,
-            "type": "software",
-            "title": "Treasury CI/CD and Evidence Automation",
-            "description": "Workflow and Python automation that collects evidence and builds the package.",
-        },
-    ]
-
-    implemented_requirements = []
-    for control in controls:
-        control_id = control.get("control_id", "unknown")
-        implemented_requirements.append(
-            {
-                "uuid": str(uuid.uuid4()),
-                "control-id": control_id,
-                "props": [
-                    {"name": "control-origination", "value": control.get("origination", "shared")},
-                ],
-                "statements": [
-                    {
-                        "uuid": str(uuid.uuid4()),
-                        "statement-id": f"{control_id}_smt",
-                        "description": control.get(
-                            "implementation",
-                            "Implementation defined in the control manifest.",
-                        ),
-                    }
-                ],
-            }
+def make_manifest(root: Path) -> Dict[str, Any]:
+    files: List[Dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        if path.name == "fedramp_ato_package.zip":
+            continue
+        files.append(
+            {"path": str(path.relative_to(root)), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
         )
-
-    back_matter_resources = [
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Workflow YAML",
-            "rlinks": [{"href": "../.github/workflows/sa-04-10-enterprise-fedramp-evidence.yml"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Alert Collector",
-            "rlinks": [{"href": "../scripts/gh_sa_04_10_enterprise_collector.py"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Spreadsheet Builder",
-            "rlinks": [{"href": "../scripts/build_sa04_30_day_spreadsheets_enterprise.py"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "POA&M Builder",
-            "rlinks": [{"href": "../scripts/build_poam_from_findings.py"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Package Builder",
-            "rlinks": [{"href": "../scripts/build_fedramp_submission_package_enterprise.py"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Controls Manifest",
-            "rlinks": [{"href": "../controls_manifest.json"}],
-        },
-        {
-            "uuid": str(uuid.uuid4()),
-            "title": "Enterprise Organization Inventory",
-            "rlinks": [{"href": "../Evidence/Enterprise/enterprise_organizations.json"}],
-        },
-    ]
-
-    if has_sarif:
-        back_matter_resources.append(
-            {
-                "uuid": str(uuid.uuid4()),
-                "title": "CodeQL SARIF",
-                "rlinks": [{"href": "../Evidence/CI_CD/codeql_results/python.sarif"}],
-            }
-        )
-
-    return {
-        "system-security-plan": {
-            "uuid": sys_uuid,
-            "metadata": {
-                "title": "Treasury Cloud SSP",
-                "version": "1.0",
-                "oscal-version": "1.0.4",
-                "last-modified": summary.get("generated_at", utc_now()),
-                "remarks": "Generated automatically from enterprise SA-04(10) evidence collection.",
-            },
-            "system-characteristics": {
-                "system-name": "Treasury Cloud",
-                "security-sensitivity-level": "low",
-                "authorization-boundary": "Treasury Cloud environment using AWS GovCloud and GitHub.com.",
-                "system-description": {
-                    "text": "Treasury Cloud uses AWS GovCloud (US) and GitHub.com with CI/CD security gates, historical logs, and evidence automation."
-                },
-            },
-            "system-implementation": {
-                "components": components,
-            },
-            "control-implementation": {
-                "implemented-requirements": implemented_requirements,
-            },
-            "back-matter": {
-                "resources": back_matter_resources,
-            },
-        }
-    }
+    return {"generated_at": utc_now(), "file_count": len(files), "files": files}
 
 
 def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str], org_inventory: Dict[str, Any]) -> str:
-    scope = summary.get("scope", "unknown")
-    repository = summary.get("repository", "unknown")
-    repo_count = summary.get("repository_count", 0)
     org_count = len(org_inventory.get("organizations", []) or [])
-
     return "\n".join(
         [
             "# FedRAMP Submission Package",
@@ -460,10 +408,10 @@ def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_co
             "SA-04(10) – Developer Security Testing and Evaluation",
             "",
             f"Generated: {summary.get('generated_at', utc_now())}",
-            f"Repository: {repository}",
+            f"Repository: {summary.get('repository', 'unknown')}",
             f"Organization: {summary.get('organization', '')}",
-            f"Scope: {scope}",
-            f"Repository count: {repo_count}",
+            f"Scope: {summary.get('scope', 'unknown')}",
+            f"Repository count: {summary.get('repository_count', 0)}",
             f"Enterprise organizations captured: {org_count}",
             f"Workflow: {run_context.get('workflow', '')}",
             f"Run ID: {run_context.get('run_id', '')}",
@@ -501,7 +449,7 @@ def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_co
     )
 
 
-def copy_source_files(output_dir: Path, controls_manifest: Path, enterprise_orgs_file: Path) -> None:
+def copy_source_files(output_dir: Path, controls_manifest: Path) -> None:
     source_files = [
         Path(".github/workflows/sa-04-10-enterprise-fedramp-evidence.yml"),
         Path("scripts/gh_sa_04_10_enterprise_collector.py"),
@@ -509,9 +457,8 @@ def copy_source_files(output_dir: Path, controls_manifest: Path, enterprise_orgs
         Path("scripts/build_poam_from_findings.py"),
         Path("scripts/build_fedramp_submission_package_enterprise.py"),
         controls_manifest,
-        enterprise_orgs_file,
+        Path("enterprise_organizations.json"),
     ]
-
     for src in source_files:
         if src.exists():
             dst = output_dir / "Evidence" / "CI_CD" / "source" / src.name
@@ -519,44 +466,14 @@ def copy_source_files(output_dir: Path, controls_manifest: Path, enterprise_orgs
             shutil.copy2(src, dst)
 
 
-def copy_spreadsheets(spreadsheets_dir: Path, output_dir: Path) -> List[str]:
-    copied: List[str] = []
-    if not spreadsheets_dir.exists():
-        return copied
-
-    wanted = [
-        "dependabot_30_day_log.xlsx",
-        "codeql_30_day_log.xlsx",
-        "security_30_day_log.xlsx",
-        "enterprise_coverage.txt",
-    ]
-    for name in wanted:
-        src = spreadsheets_dir / name
-        if src.exists():
-            dst = output_dir / "Spreadsheets" / name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            copied.append(name)
-
-    for src in sorted(spreadsheets_dir.iterdir()):
-        if src.is_file() and src.suffix.lower() in {".xlsx", ".zip", ".txt"} and src.name not in copied:
-            dst = output_dir / "Spreadsheets" / src.name
-            shutil.copy2(src, dst)
-            copied.append(src.name)
-
-    return copied
-
-
-def copy_enterprise_org_inventory(org_inventory: Dict[str, Any], output_dir: Path) -> None:
+def write_enterprise_inventory(org_inventory: Dict[str, Any], output_dir: Path) -> None:
     enterprise_dir = output_dir / "Evidence" / "Enterprise"
     enterprise_dir.mkdir(parents=True, exist_ok=True)
 
-    orgs = org_inventory.get("organizations", []) or []
     write_json(enterprise_dir / "enterprise_organizations.json", org_inventory)
 
-    csv_lines = [
-        "slug,display_name,role,status,single_sign_on,two_factor_required"
-    ]
+    orgs = org_inventory.get("organizations", []) or []
+    csv_lines = ["slug,display_name,role,status,single_sign_on,two_factor_required,public_repo_count,public_repos,total_private_repos,html_url"]
     for org in orgs:
         csv_lines.append(
             ",".join(
@@ -568,6 +485,10 @@ def copy_enterprise_org_inventory(org_inventory: Dict[str, Any], output_dir: Pat
                     "status",
                     "single_sign_on",
                     "two_factor_required",
+                    "public_repo_count",
+                    "public_repos",
+                    "total_private_repos",
+                    "html_url",
                 ]
             )
         )
@@ -578,16 +499,35 @@ def copy_enterprise_org_inventory(org_inventory: Dict[str, Any], output_dir: Pat
         "",
         f"- Inventory count: {len(orgs)}",
         "",
-        "| Slug | Display Name | Role | Status | SSO | 2FA |",
-        "|---|---|---|---|---:|---:|",
+        "| Slug | Display Name | Role | Status | 2FA | Public Repos | Private Repos |",
+        "|---|---|---|---|---:|---:|---:|",
     ]
     for org in orgs:
         md_lines.append(
             f"| {org.get('slug', '')} | {org.get('display_name', '')} | {org.get('role', '')} | "
-            f"{org.get('status', '')} | {str(bool(org.get('single_sign_on', False))).lower()} | "
-            f"{str(bool(org.get('two_factor_required', False))).lower()} |"
+            f"{org.get('status', '')} | {str(bool(org.get('two_factor_required', False))).lower()} | "
+            f"{org.get('public_repos', org.get('public_repo_count', ''))} | {org.get('total_private_repos', '')} |"
         )
     write_text(enterprise_dir / "enterprise_organizations.md", "\n".join(md_lines) + "\n")
+
+
+def copy_tree_if_exists(src: Path, dst: Path) -> None:
+    if src.exists():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def copy_spreadsheets(spreadsheets_dir: Path, output_dir: Path) -> List[str]:
+    copied: List[str] = []
+    if not spreadsheets_dir.exists():
+        return copied
+
+    for src in sorted(spreadsheets_dir.iterdir()):
+        if src.is_file() and src.suffix.lower() in {".xlsx", ".zip", ".txt"}:
+            dst = output_dir / "Spreadsheets" / src.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append(src.name)
+    return copied
 
 
 def zip_directory(source_dir: Path, zip_path: Path) -> None:
@@ -600,27 +540,6 @@ def zip_directory(source_dir: Path, zip_path: Path) -> None:
             zf.write(path, arcname=str(path.relative_to(source_dir)))
 
 
-def make_manifest(root: Path) -> Dict[str, Any]:
-    files: List[Dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_dir():
-            continue
-        if path.name == "fedramp_ato_package.zip":
-            continue
-        files.append(
-            {
-                "path": str(path.relative_to(root)),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-        )
-    return {
-        "generated_at": utc_now(),
-        "file_count": len(files),
-        "files": files,
-    }
-
-
 def main() -> int:
     args = parse_args()
 
@@ -628,7 +547,6 @@ def main() -> int:
     spreadsheets_dir = Path(args.spreadsheets_dir)
     poam_dir = Path(args.poam_dir)
     controls_manifest = Path(args.controls_manifest)
-    enterprise_orgs_file = Path(args.enterprise_orgs_file)
     output_dir = Path(args.output_dir)
 
     summary = read_json(input_dir / "summary.json")
@@ -640,7 +558,7 @@ def main() -> int:
     if not isinstance(controls, list) or not controls:
         controls = default_controls_manifest()["controls"]
 
-    org_inventory = load_enterprise_orgs(enterprise_orgs_file)
+    org_inventory = load_enterprise_org_inventory(summary, input_dir)
 
     clean_dir(output_dir)
 
@@ -658,11 +576,11 @@ def main() -> int:
     ]:
         folder.mkdir(parents=True, exist_ok=True)
 
-    copy_tree(input_dir, output_dir / "Evidence" / "CI_CD")
-    copy_tree(poam_dir, output_dir / "POAM")
+    copy_tree_if_exists(input_dir, output_dir / "Evidence" / "CI_CD")
+    copy_tree_if_exists(poam_dir, output_dir / "POAM")
     copied_spreadsheets = copy_spreadsheets(spreadsheets_dir, output_dir)
-    copy_source_files(output_dir, controls_manifest, enterprise_orgs_file)
-    copy_enterprise_org_inventory(org_inventory, output_dir)
+    copy_source_files(output_dir, controls_manifest)
+    write_enterprise_inventory(org_inventory, output_dir)
 
     findings = read_json(input_dir / "blocking_findings.json", []) or []
     write_text(output_dir / "POAM" / "poam.csv", build_poam_csv(findings))
@@ -677,12 +595,9 @@ def main() -> int:
         )
 
     if copied_spreadsheets:
-        write_text(
-            output_dir / "Evidence" / "CI_CD" / "spreadsheets_manifest.txt",
-            "\n".join(copied_spreadsheets) + "\n",
-        )
+        write_text(output_dir / "Evidence" / "CI_CD" / "spreadsheets_manifest.txt", "\n".join(copied_spreadsheets) + "\n")
 
-    write_text(output_dir / "SSP" / "sa-04-10-control-response.md", build_ssp_markdown(summary, controls, run_context))
+    write_text(output_dir / "SSP" / "sa-04-10-control-response.md", build_ssp_markdown(summary, controls, run_context, org_inventory))
     write_json(output_dir / "OSCAL" / "ssp.json", build_oscal_ssp(summary, controls, run_context, has_sarif))
     write_json(output_dir / "manifest.json", make_manifest(output_dir))
     write_text(output_dir / "README.md", build_readme(summary, controls, run_context, org_inventory))
