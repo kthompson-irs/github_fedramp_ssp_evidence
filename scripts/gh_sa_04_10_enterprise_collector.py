@@ -7,8 +7,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -207,34 +207,6 @@ def probe_identity(headers: Dict[str, str]) -> Dict[str, Any]:
         }
 
 
-def is_pagination_error(response: requests.Response) -> bool:
-    text = response_excerpt(response).lower()
-    return "pagination using the `page` parameter is not supported" in text or "page parameter is not supported" in text
-
-
-def is_access_error(response: requests.Response) -> bool:
-    return response.status_code in {401, 403, 404}
-
-
-def classify_error(response: requests.Response) -> str:
-    if response.status_code == 401:
-        return "token_invalid_or_expired"
-    if response.status_code == 403:
-        if sso_header(response):
-            return "sso_required"
-        perm = accepted_permissions(response)
-        if perm:
-            return f"insufficient_permissions:{perm}"
-        return "forbidden"
-    if response.status_code == 404:
-        return "not_found_or_not_authorized"
-    if response.status_code == 400 and is_pagination_error(response):
-        return "request_shape_invalid_pagination"
-    if response.status_code == 400:
-        return "bad_request"
-    return f"http_{response.status_code}"
-
-
 def parse_next_link(link_header: Optional[str]) -> Optional[str]:
     if not link_header:
         return None
@@ -250,7 +222,31 @@ def parse_next_link(link_header: Optional[str]) -> Optional[str]:
     return None
 
 
-def list_alerts_paginated(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_error(response: requests.Response) -> str:
+    msg = response_excerpt(response).lower()
+    if response.status_code == 401:
+        return "token_invalid_or_expired"
+    if response.status_code == 403:
+        if sso_header(response):
+            return "sso_required"
+        perm = accepted_permissions(response)
+        if perm:
+            return f"insufficient_permissions:{perm}"
+        return "forbidden"
+    if response.status_code == 404:
+        return "not_found_or_not_authorized"
+    if response.status_code == 400 and "pagination using the `page` parameter is not supported" in msg:
+        return "request_shape_invalid_pagination"
+    if response.status_code == 400:
+        return "bad_request"
+    return f"http_{response.status_code}"
+
+
+def list_alerts_paginated(
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Fetch a GitHub REST collection using cursor-style pagination via Link headers.
     This avoids sending `page`, which enterprise Dependabot alerts rejects.
@@ -289,9 +285,66 @@ def list_alerts_paginated(url: str, headers: Dict[str, str], params: Optional[Di
         items.extend(payload)
 
         next_url = parse_next_link(response.headers.get("Link"))
-        query = {}  # only send the query parameters on the first request
+        query = {}
 
     return items, diagnostics
+
+
+def rank(severity: str) -> int:
+    return {"low": 1, "medium": 2, "moderate": 2, "high": 3, "critical": 4}.get((severity or "").lower(), 0)
+
+
+def blocking(severity: str, threshold: str) -> bool:
+    return rank(severity) >= rank(threshold) > 0
+
+
+def parse_repo_context(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, str]:
+    repository = alert.get("repository") or {}
+    repo_full = ""
+    organization = ""
+    repo_name = ""
+
+    if isinstance(repository, dict) and repository:
+        repo_full = str(repository.get("full_name") or "").strip()
+        repo_name = str(repository.get("name") or "").strip()
+        owner = repository.get("owner") or {}
+        if isinstance(owner, dict):
+            organization = str(owner.get("login") or "").strip()
+
+    if not repo_full:
+        repo_url = str(alert.get("repository_url") or "").strip()
+        if repo_url:
+            parsed = urlparse(repo_url)
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 3 and parts[0] == "repos":
+                organization = organization or parts[1]
+                repo_name = repo_name or parts[2]
+                repo_full = f"{organization}/{repo_name}"
+
+    if not repo_full and fallback_repository_full:
+        repo_full = fallback_repository_full
+        if "/" in fallback_repository_full:
+            organization, repo_name = fallback_repository_full.split("/", 1)
+
+    if not organization and repo_full and "/" in repo_full:
+        organization = repo_full.split("/", 1)[0]
+    if not repo_name and repo_full and "/" in repo_full:
+        repo_name = repo_full.split("/", 1)[1]
+
+    return {
+        "organization": organization,
+        "repository": repo_name,
+        "repository_full": repo_full,
+    }
+
+
+def normalize_alert(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, Any]:
+    normalized = dict(alert)
+    repo_ctx = parse_repo_context(normalized, fallback_repository_full=fallback_repository_full)
+    normalized["organization"] = repo_ctx["organization"]
+    normalized["repository"] = repo_ctx["repository"]
+    normalized["repository_full"] = repo_ctx["repository_full"]
+    return normalized
 
 
 def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[str, Any]]:
@@ -367,53 +420,39 @@ def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return findings
 
 
-def normalize_alert(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, Any]:
-    normalized = dict(alert)
-    repo_ctx = parse_repo_context(normalized, fallback_repository_full=fallback_repository_full)
-    normalized["organization"] = repo_ctx["organization"]
-    normalized["repository"] = repo_ctx["repository"]
-    normalized["repository_full"] = repo_ctx["repository_full"]
-    return normalized
+def probe(scope: str, base_path: str, headers: Dict[str, str]) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Self-diagnosing probe for candidate tokens.
+    Uses per_page only and no page parameter.
+    """
+    diagnostics: List[Dict[str, Any]] = []
 
+    identity = probe_identity(headers)
+    diagnostics.append(identity)
 
-def parse_repo_context(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, str]:
-    repository = alert.get("repository") or {}
-    repo_full = ""
-    organization = ""
-    repo_name = ""
+    endpoints = [
+        ("code_scanning", f"{GH_API}{base_path}/code-scanning/alerts"),
+        ("dependabot", f"{GH_API}{base_path}/dependabot/alerts"),
+        ("secret_scanning", f"{GH_API}{base_path}/secret-scanning/alerts"),
+    ]
 
-    if isinstance(repository, dict) and repository:
-        repo_full = str(repository.get("full_name") or "").strip()
-        repo_name = str(repository.get("name") or "").strip()
-        owner = repository.get("owner") or {}
-        if isinstance(owner, dict):
-            organization = str(owner.get("login") or "").strip()
+    for category, url in endpoints:
+        response = request_one(url, headers, params={"state": "open", "per_page": 1})
+        diagnostics.append(
+            {
+                "kind": "probe",
+                "category": category,
+                "url": url,
+                "status_code": response.status_code,
+                "accepted_permissions": accepted_permissions(response),
+                "sso": sso_header(response),
+                "message": response_excerpt(response),
+            }
+        )
+        if response.status_code != 200:
+            return False, diagnostics
 
-    if not repo_full:
-        repo_url = str(alert.get("repository_url") or "").strip()
-        if repo_url:
-            parsed = urlparse(repo_url)
-            parts = [p for p in parsed.path.split("/") if p]
-            if len(parts) >= 3 and parts[0] == "repos":
-                organization = organization or parts[1]
-                repo_name = repo_name or parts[2]
-                repo_full = f"{organization}/{repo_name}"
-
-    if not repo_full and fallback_repository_full:
-        repo_full = fallback_repository_full
-        if "/" in fallback_repository_full:
-            organization, repo_name = fallback_repository_full.split("/", 1)
-
-    if not organization and repo_full and "/" in repo_full:
-        organization = repo_full.split("/", 1)[0]
-    if not repo_name and repo_full and "/" in repo_full:
-        repo_name = repo_full.split("/", 1)[1]
-
-    return {
-        "organization": organization,
-        "repository": repo_name,
-        "repository_full": repo_full,
-    }
+    return True, diagnostics
 
 
 def collect_category(
@@ -432,7 +471,11 @@ def collect_category(
         fail(f"unsupported category: {category}", exit_code=2)
 
     url = f"{GH_API}{base_path}/{endpoint_lookup[category]}"
-    alerts, page_diagnostics = list_alerts_paginated(url, headers, params={"state": "open", "per_page": PAGE_SIZE})
+    alerts, page_diagnostics = list_alerts_paginated(
+        url,
+        headers,
+        params={"state": "open", "per_page": PAGE_SIZE},
+    )
 
     normalized_alerts = [normalize_alert(alert, fallback_repository_full=fallback_repository_full) for alert in alerts]
 
@@ -517,7 +560,10 @@ def write_summary_files(output_dir: Path, snapshot: Dict[str, Any], auth_attempt
     write_json(output_dir / "blocking_findings.json", snapshot.get("blocking_findings", []))
     write_json(output_dir / "auth_attempts.json", auth_attempts)
     write_text(output_dir / "evidence_lines.txt", "\n".join(snapshot.get("evidence_lines", [])) + "\n")
-    write_text(output_dir / "repositories.txt", "\n".join(snapshot.get("repositories", [])) + ("\n" if snapshot.get("repositories") else ""))
+    write_text(
+        output_dir / "repositories.txt",
+        "\n".join(snapshot.get("repositories", [])) + ("\n" if snapshot.get("repositories") else ""),
+    )
 
 
 def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, Any]]) -> str:
@@ -617,16 +663,17 @@ def render_diagnostics_md(diagnostics: Dict[str, Any]) -> str:
                 lines.append(f"- Identity SSO: `{identity.get('sso', '')}`")
             if identity.get("message"):
                 lines.append(f"- Identity message: `{identity.get('message', '')}`")
+
         probes = attempt.get("probe", []) or []
         if probes:
             lines.append("")
             lines.append("| Kind | Category | Status | Accepted Permissions | SSO | Message |")
             lines.append("|---|---|---:|---|---|---|")
-            for probe in probes:
+            for probe_item in probes:
                 lines.append(
-                    f"| {probe.get('kind', '')} | {probe.get('category', '')} | "
-                    f"{probe.get('status_code', '')} | {probe.get('accepted_permissions', '') or ''} | "
-                    f"{probe.get('sso', '') or ''} | {probe.get('message', '')} |"
+                    f"| {probe_item.get('kind', '')} | {probe_item.get('category', '')} | "
+                    f"{probe_item.get('status_code', '')} | {probe_item.get('accepted_permissions', '') or ''} | "
+                    f"{probe_item.get('sso', '') or ''} | {probe_item.get('message', '')} |"
                 )
         lines.append("")
 
@@ -660,9 +707,30 @@ def collect_soft_failure_snapshot(
         "repositories": [],
         "auth_kind": "none",
         "results": {
-            "code_scanning": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
-            "dependabot": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
-            "secret_scanning": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
+            "code_scanning": {
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": "no usable token",
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
+            },
+            "dependabot": {
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": "no usable token",
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
+            },
+            "secret_scanning": {
+                "accessible": False,
+                "skipped": True,
+                "skip_reason": "no usable token",
+                "count": 0,
+                "blocking_count": 0,
+                "alerts": [],
+            },
         },
         "blocking_findings": [],
         "errors": ["no usable token found for the selected scope"],
