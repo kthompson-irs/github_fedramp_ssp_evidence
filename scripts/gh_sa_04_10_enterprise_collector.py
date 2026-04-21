@@ -9,7 +9,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlpars:contentReference[oaicite:0]{index=0}SECONDS = 30
+from urllib.parse import urlparse
+
+import requests
+
+GH_API = "https://api.github.com"
+PAGE_SIZE = 100
+TIMEOUT_SECONDS = 30
 DEFAULT_AUDIT_LOOKBACK_DAYS = 30
 
 
@@ -34,7 +40,7 @@ def get_env(name: str, default: Optional[str] = None) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Enterprise SA-04(10) alert collector.")
+    parser = argparse.ArgumentParser(description="Enterprise SA-04(10) collector.")
     parser.add_argument(
         "--scope",
         choices=["repository", "organization", "enterprise"],
@@ -999,13 +1005,7 @@ def render_summary_md(snapshot: Dict[str, Any], auth_attempts: Dict[str, Any]) -
                 f"| {channel} | {attempt.get('token_env', '')} | {attempt.get('auth_kind', '')} | {attempt.get('status', '')} |"
             )
 
-    lines.extend(
-        [
-            "",
-            "## Covered Repositories",
-            "",
-        ]
-    )
+    lines.extend(["", "## Covered Repositories", ""])
     for repo in snapshot.get("repositories", []) or []:
         lines.append(f"- {repo}")
 
@@ -1273,7 +1273,10 @@ def main() -> int:
                 snapshot,
                 {"alerts": alert_token_attempts, "admin": admin_token_attempts},
             )
-            write_text(output_dir / "summary.md", render_summary_md(snapshot, {"alerts": alert_token_attempts, "admin": admin_token_attempts}))
+            write_text(
+                output_dir / "summary.md",
+                render_summary_md(snapshot, {"alerts": alert_token_attempts, "admin": admin_token_attempts}),
+            )
             print("SA-04(10) collection soft-failed; diagnostics were written for review.")
             return 0
 
@@ -1286,21 +1289,47 @@ def main() -> int:
     print(f"Selected alert auth kind: {selected_alert_auth_kind}")
     print(f"Selected admin auth kind: {selected_admin_auth_kind}")
 
-    # Live enterprise org inventory
+    # Enterprise organization inventory
     org_inventory: Dict[str, Any] = {
         "enterprise": enterprise,
         "generated_at": utc_now(),
         "organizations": [],
         "notes": [],
     }
-    inventory_headers = selected_admin_headers or selected_alert_headers
 
     try:
-        if inventory_headers is None:
+        if selected_admin_headers is None and selected_alert_headers is None:
             raise RuntimeError("no usable token for enterprise organization inventory")
+        inventory_headers = selected_admin_headers or selected_alert_headers
         org_inventory = collect_enterprise_org_inventory(enterprise, inventory_headers)
-        evidence_lines.append("SSP-EVIDENCE: enterprise organization inventory captured successfully")
         write_json(output_dir / "enterprise_organizations.json", org_inventory)
+        write_text(
+            output_dir / "enterprise_organizations.csv",
+            "slug,display_name,role,status,single_sign_on,two_factor_required,public_repo_count,public_repos,total_private_repos,html_url\n",
+        )
+        # rewrite csv using helper content
+        csv_lines = [
+            "slug,display_name,role,status,single_sign_on,two_factor_required,public_repo_count,public_repos,total_private_repos,html_url"
+        ]
+        for org in org_inventory.get("organizations", []) or []:
+            csv_lines.append(
+                ",".join(
+                    [
+                        str(org.get("slug", "")),
+                        str(org.get("display_name", "")),
+                        str(org.get("role", "")),
+                        str(org.get("status", "")),
+                        str(org.get("single_sign_on", "")),
+                        str(org.get("two_factor_required", "")),
+                        str(org.get("public_repo_count", "")),
+                        str(org.get("public_repos", "")),
+                        str(org.get("total_private_repos", "")),
+                        str(org.get("html_url", "")),
+                    ]
+                )
+            )
+        write_text(output_dir / "enterprise_organizations.csv", "\n".join(csv_lines) + "\n")
+        evidence_lines.append("SSP-EVIDENCE: enterprise organization inventory captured successfully")
     except Exception as exc:
         if soft_fail:
             errors.append(f"enterprise organization inventory collection error: {exc}")
@@ -1309,7 +1338,7 @@ def main() -> int:
         else:
             fail(str(exc), exit_code=2)
 
-    # Live enterprise audit log
+    # Enterprise audit log
     audit_events: List[Dict[str, Any]] = []
     try:
         if selected_admin_headers is None:
@@ -1351,12 +1380,13 @@ def main() -> int:
         else:
             fail(str(exc), exit_code=2)
 
-    # Live org membership evidence
+    # Organization membership evidence
     org_member_records: List[Dict[str, Any]] = []
     try:
         member_headers = selected_admin_headers or selected_alert_headers
         if member_headers is None:
             raise RuntimeError("no usable token for organization membership evidence")
+
         for org in org_inventory.get("organizations", []) or []:
             org_name = str(org.get("slug") or org.get("display_name") or "").strip()
             if not org_name:
@@ -1416,7 +1446,7 @@ def main() -> int:
         else:
             fail(str(exc), exit_code=2)
 
-    # Alerts
+    # Security alert streams
     try:
         print("Phase 1: code scanning alert polling")
         code_result, code_blocking, code_pages, code_evidence = collect_category(
@@ -1540,7 +1570,10 @@ def main() -> int:
         snapshot,
         {"alerts": alert_token_attempts, "admin": admin_token_attempts},
     )
-    write_text(output_dir / "summary.md", render_summary_md(snapshot, {"alerts": alert_token_attempts, "admin": admin_token_attempts}))
+    write_text(
+        output_dir / "summary.md",
+        render_summary_md(snapshot, {"alerts": alert_token_attempts, "admin": admin_token_attempts}),
+    )
 
     diagnostics = {
         "generated_at": utc_now(),
