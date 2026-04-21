@@ -112,21 +112,37 @@ def scope_base(scope: str, owner: str, repo: str, enterprise: str) -> str:
     return ""
 
 
+def display_context(scope: str, owner: str, repo: str, enterprise: str) -> Dict[str, str]:
+    if scope == "enterprise":
+        return {
+            "organization": "enterprise-wide",
+            "repository": "enterprise-wide",
+            "repository_full": f"enterprise/{enterprise}" if enterprise else "enterprise-wide",
+        }
+    return {
+        "organization": owner,
+        "repository": repo,
+        "repository_full": f"{owner}/{repo}",
+    }
+
+
 def token_candidates(scope: str) -> List[Tuple[str, str]]:
     """
     Returns (env_var_name, auth_kind).
-    The collector tries these in order.
+    Enterprise mode prefers enterprise token first, then any fallback secret that
+    may happen to be a classic PAT.
     """
     if scope == "enterprise":
         return [
-            ("GH_ENTERPRISE_TOKEN", "enterprise_classic_pat_or_oauth"),
-            ("GH_AUTH_TOKEN", "enterprise_fallback"),
+            ("GH_ENTERPRISE_TOKEN", "enterprise_token"),
+            ("GH_DEPENDABOT_TOKEN", "dependabot_token_fallback"),
+            ("GH_AUTH_TOKEN", "auth_fallback"),
         ]
 
     return [
         ("GH_APP_TOKEN", "github_app_token"),
-        ("GH_DEPENDABOT_TOKEN", "fine_grained_pat_or_classic_pat"),
-        ("GH_AUTH_TOKEN", "fallback_token"),
+        ("GH_DEPENDABOT_TOKEN", "dependabot_token_fallback"),
+        ("GH_AUTH_TOKEN", "auth_fallback"),
     ]
 
 
@@ -143,6 +159,23 @@ def accepted_permissions(response: requests.Response) -> Optional[str]:
     return response.headers.get("X-Accepted-GitHub-Permissions")
 
 
+def sso_header(response: requests.Response) -> Optional[str]:
+    return response.headers.get("X-GitHub-SSO")
+
+
+def response_excerpt(response: requests.Response, limit: int = 400) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("message")
+            if message:
+                return str(message)[:limit]
+            return json.dumps(payload)[:limit]
+        return response.text[:limit]
+    except Exception:
+        return response.text[:limit]
+
+
 def request_one(url: str, headers: Dict[str, str]) -> requests.Response:
     return requests.get(
         url,
@@ -150,6 +183,40 @@ def request_one(url: str, headers: Dict[str, str]) -> requests.Response:
         params={"state": "open", "per_page": 1, "page": 1},
         timeout=TIMEOUT_SECONDS,
     )
+
+
+def probe_identity(headers: Dict[str, str]) -> Dict[str, Any]:
+    url = f"{GH_API}/user"
+    try:
+        response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+        info: Dict[str, Any] = {
+            "endpoint": "/user",
+            "status_code": response.status_code,
+            "accepted_permissions": accepted_permissions(response),
+            "sso": sso_header(response),
+            "message": response_excerpt(response),
+        }
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    info["login"] = payload.get("login")
+                    info["id"] = payload.get("id")
+                    info["type"] = payload.get("type")
+                    info["name"] = payload.get("name")
+                else:
+                    info["login"] = None
+            except Exception:
+                pass
+        return info
+    except Exception as exc:
+        return {
+            "endpoint": "/user",
+            "status_code": None,
+            "accepted_permissions": None,
+            "sso": None,
+            "message": str(exc),
+        }
 
 
 def probe(scope: str, base_path: str, headers: Dict[str, str]) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -172,26 +239,21 @@ def probe(scope: str, base_path: str, headers: Dict[str, str]) -> Tuple[bool, Li
             ("secret_scanning", f"{GH_API}{base_path}/secret-scanning/alerts"),
         ]
 
+    identity = probe_identity(headers)
+    diagnostics.append({"kind": "identity", **identity})
+
     for category, url in endpoints:
         response = request_one(url, headers)
         diag = {
+            "kind": "probe",
             "category": category,
+            "url": url,
             "status_code": response.status_code,
             "accepted_permissions": accepted_permissions(response),
-            "message": "",
+            "sso": sso_header(response),
+            "message": response_excerpt(response),
         }
-
-        try:
-            payload = response.json()
-            if isinstance(payload, dict):
-                diag["message"] = payload.get("message") or response.text[:300]
-            else:
-                diag["message"] = response.text[:300]
-        except Exception:
-            diag["message"] = response.text[:300]
-
         diagnostics.append(diag)
-
         if response.status_code != 200:
             return False, diagnostics
 
@@ -201,6 +263,7 @@ def probe(scope: str, base_path: str, headers: Dict[str, str]) -> Tuple[bool, Li
 def choose_token(scope: str, base_path: str) -> Tuple[Dict[str, str], List[Dict[str, Any]], str]:
     """
     Returns (headers, attempts, auth_kind).
+    Each attempt is self-diagnosing and includes the probe data.
     """
     attempts: List[Dict[str, Any]] = []
 
@@ -232,7 +295,7 @@ def choose_token(scope: str, base_path: str) -> Tuple[Dict[str, str], List[Dict[
 
     fail(
         "no usable token found for the selected scope. "
-        "Check token scope, org approval, repository selection, or enterprise PAT policy.",
+        "Check token scope, SSO authorization, enterprise membership, org role, or enterprise PAT policy.",
         exit_code=2,
     )
     raise SystemExit(2)
@@ -252,9 +315,10 @@ def paged_get(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]
             response.raise_for_status()
         except requests.HTTPError as exc:
             perm = accepted_permissions(response)
+            sso = sso_header(response)
             raise RuntimeError(
                 f"GitHub API request failed for {url}: {exc} | "
-                f"accepted_permissions={perm!r} | body={response.text[:300]}"
+                f"accepted_permissions={perm!r} | sso={sso!r} | body={response_excerpt(response)}"
             ) from exc
 
         payload = response.json()
@@ -322,6 +386,15 @@ def parse_repo_context(alert: Dict[str, Any], fallback_repository_full: str = ""
     }
 
 
+def normalize_alert(alert: Dict[str, Any], fallback_repository_full: str = "") -> Dict[str, Any]:
+    repo_ctx = parse_repo_context(alert, fallback_repository_full=fallback_repository_full)
+    normalized = dict(alert)
+    normalized["organization"] = repo_ctx["organization"]
+    normalized["repository"] = repo_ctx["repository"]
+    normalized["repository_full"] = repo_ctx["repository_full"]
+    return normalized
+
+
 def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     for alert in alerts:
@@ -329,7 +402,6 @@ def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[s
         severity = str(rule.get("severity") or "").lower()
         if blocking(severity, threshold):
             loc = (alert.get("most_recent_instance") or {}).get("location") or {}
-            repo_ctx = parse_repo_context(alert)
             findings.append(
                 {
                     "category": "code_scanning",
@@ -338,9 +410,9 @@ def codeql_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Dict[s
                     "severity": severity,
                     "state": alert.get("state") or "open",
                     "html_url": alert.get("html_url"),
-                    "organization": repo_ctx["organization"],
-                    "repository": repo_ctx["repository"],
-                    "repository_full": repo_ctx["repository_full"],
+                    "organization": alert.get("organization") or "",
+                    "repository": alert.get("repository") or "",
+                    "repository_full": alert.get("repository_full") or "",
                     "path": loc.get("path"),
                     "start_line": loc.get("start_line"),
                     "end_line": loc.get("end_line"),
@@ -356,7 +428,6 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
         severity = str(advisory.get("severity") or "").lower()
         if blocking(severity, threshold):
             dependency = (((alert.get("dependency") or {}).get("package") or {}).get("name")) or "unknown-package"
-            repo_ctx = parse_repo_context(alert)
             findings.append(
                 {
                     "category": "dependabot",
@@ -365,9 +436,9 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
                     "severity": severity,
                     "state": alert.get("state") or "open",
                     "html_url": alert.get("html_url"),
-                    "organization": repo_ctx["organization"],
-                    "repository": repo_ctx["repository"],
-                    "repository_full": repo_ctx["repository_full"],
+                    "organization": alert.get("organization") or "",
+                    "repository": alert.get("repository") or "",
+                    "repository_full": alert.get("repository_full") or "",
                     "dependency": dependency,
                     "manifest_path": ((alert.get("dependency") or {}).get("manifest_path")),
                 }
@@ -378,7 +449,6 @@ def dependabot_findings(alerts: List[Dict[str, Any]], threshold: str) -> List[Di
 def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     for alert in alerts:
-        repo_ctx = parse_repo_context(alert)
         findings.append(
             {
                 "category": "secret_scanning",
@@ -387,9 +457,9 @@ def secret_findings(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "severity": "open",
                 "state": alert.get("state") or "open",
                 "html_url": alert.get("html_url"),
-                "organization": repo_ctx["organization"],
-                "repository": repo_ctx["repository"],
-                "repository_full": repo_ctx["repository_full"],
+                "organization": alert.get("organization") or "",
+                "repository": alert.get("repository") or "",
+                "repository_full": alert.get("repository_full") or "",
                 "secret_type": alert.get("secret_type"),
             }
         )
@@ -400,89 +470,53 @@ def list_alerts(base_path: str, headers: Dict[str, str], endpoint: str) -> List[
     return paged_get(f"{GH_API}{base_path}/{endpoint}", headers, params={"state": "open"})
 
 
-def normalize_category_alerts(
-    alerts: List[Dict[str, Any]],
+def endpoint_map(scope: str) -> Dict[str, str]:
+    if scope == "enterprise":
+        return {
+            "code_scanning": "code-scanning/alerts",
+            "dependabot": "dependabot/alerts",
+            "secret_scanning": "secret-scanning/alerts",
+        }
+    return {
+        "code_scanning": "code-scanning/alerts",
+        "dependabot": "dependabot/alerts",
+        "secret_scanning": "secret-scanning/alerts",
+    }
+
+
+def collect_category(
+    base_path: str,
+    headers: Dict[str, str],
     category: str,
     threshold: str,
-    fallback_repository_full: str = "",
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns (normalized_alerts, blocking_findings).
-    """
-    normalized: List[Dict[str, Any]] = []
+    fallback_repository_full: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    endpoints = endpoint_map("enterprise")  # same endpoint names; base_path determines repo/org/enterprise
+    if category not in endpoints:
+        fail(f"unsupported category: {category}", exit_code=2)
+
+    alerts = list_alerts(base_path, headers, endpoints[category])
+    normalized_alerts = [normalize_alert(alert, fallback_repository_full=fallback_repository_full) for alert in alerts]
+
     blocking_items: List[Dict[str, Any]] = []
+    if category == "code_scanning":
+        blocking_items = codeql_findings(normalized_alerts, threshold)
+    elif category == "dependabot":
+        blocking_items = dependabot_findings(normalized_alerts, threshold)
+    elif category == "secret_scanning":
+        blocking_items = secret_findings(normalized_alerts)
 
-    for alert in alerts:
-        repo_ctx = parse_repo_context(alert, fallback_repository_full=fallback_repository_full)
-        normalized_alert = dict(alert)
-        normalized_alert["organization"] = repo_ctx["organization"]
-        normalized_alert["repository"] = repo_ctx["repository"]
-        normalized_alert["repository_full"] = repo_ctx["repository_full"]
-        normalized_alert["enterprise_scope"] = True
-
-        if category == "code_scanning":
-            rule = alert.get("rule") or {}
-            severity = str(rule.get("severity") or "").lower()
-            normalized.append(normalized_alert)
-            if blocking(severity, threshold):
-                blocking_items.extend(codeql_findings([normalized_alert], threshold))
-        elif category == "dependabot":
-            advisory = alert.get("security_advisory") or {}
-            severity = str(advisory.get("severity") or "").lower()
-            normalized.append(normalized_alert)
-            if blocking(severity, threshold):
-                blocking_items.extend(dependabot_findings([normalized_alert], threshold))
-        elif category == "secret_scanning":
-            normalized.append(normalized_alert)
-            blocking_items.extend(secret_findings([normalized_alert]))
-        else:
-            normalized.append(normalized_alert)
-
-    return normalized, blocking_items
-
-
-def build_snapshot(
-    scope: str,
-    organization: str,
-    repository: str,
-    repository_full: str,
-    enterprise: str,
-    auth_kind: str,
-    results: Dict[str, Any],
-    blocking_findings: List[Dict[str, Any]],
-    errors: List[str],
-    repositories: List[str],
-) -> Dict[str, Any]:
-    generated_at = utc_now()
-    date = generated_at[:10]
-
-    overall_status = "pass"
-    if errors:
-        overall_status = "error"
-    elif blocking_findings:
-        overall_status = "fail"
-
-    snapshot = {
-        "generated_at": generated_at,
-        "date": date,
-        "scope": scope,
-        "organization": organization,
-        "repository": repository,
-        "repository_full": repository_full,
-        "enterprise": enterprise,
-        "repository_count": len(repositories),
-        "repositories": repositories,
-        "auth_kind": auth_kind,
-        "results": results,
-        "blocking_findings": blocking_findings,
-        "errors": errors,
-        "overall": {
-            "blocking_count": len(blocking_findings),
-            "error_count": len(errors),
-            "status": overall_status,
-        },
+    result = {
+        "accessible": True,
+        "skipped": False,
+        "skip_reason": None,
+        "count": len(normalized_alerts),
+        "blocking_count": len(blocking_items),
+        "alerts": normalized_alerts,
     }
-    return snapshot
+
+    evidence_lines = [f"SSP-EVIDENCE: {category} alert polling completed successfully"]
+    return result, blocking_items, evidence_lines
 
 
 def append_history(output_dir: Path, snapshot: Dict[str, Any]) -> None:
@@ -496,12 +530,58 @@ def append_history(output_dir: Path, snapshot: Dict[str, Any]) -> None:
     write_json(hist_dir / f"{snapshot['date']}.json", snapshot)
 
 
-def write_summary_files(output_dir: Path, snapshot: Dict[str, Any], auth_attempts: List[Dict[str, Any]], evidence_lines: List[str]) -> None:
+def build_snapshot(
+    scope: str,
+    organization: str,
+    repository: str,
+    repository_full: str,
+    enterprise: str,
+    auth_kind: str,
+    results: Dict[str, Any],
+    blocking_findings: List[Dict[str, Any]],
+    errors: List[str],
+    repositories: List[str],
+    evidence_lines: List[str],
+) -> Dict[str, Any]:
+    generated_at = utc_now()
+    date = generated_at[:10]
+
+    overall_status = "pass"
+    if errors:
+        overall_status = "error"
+    elif blocking_findings:
+        overall_status = "fail"
+
+    return {
+        "generated_at": generated_at,
+        "date": date,
+        "scope": scope,
+        "organization": organization,
+        "repository": repository,
+        "repository_full": repository_full,
+        "enterprise": enterprise,
+        "repository_count": len(repositories),
+        "repositories": repositories,
+        "auth_kind": auth_kind,
+        "results": results,
+        "blocking_findings": blocking_findings,
+        "errors": errors,
+        "evidence_lines": evidence_lines,
+        "overall": {
+            "blocking_count": len(blocking_findings),
+            "error_count": len(errors),
+            "status": overall_status,
+        },
+    }
+
+
+def write_summary_files(output_dir: Path, snapshot: Dict[str, Any], auth_attempts: List[Dict[str, Any]]) -> None:
     write_json(output_dir / "summary.json", snapshot)
     write_json(output_dir / "current_snapshot.json", snapshot)
     write_json(output_dir / "blocking_findings.json", snapshot.get("blocking_findings", []))
     write_json(output_dir / "auth_attempts.json", auth_attempts)
-    write_text(output_dir / "evidence_lines.txt", "\n".join(evidence_lines) + "\n")
+    write_text(output_dir / "evidence_lines.txt", "\n".join(snapshot.get("evidence_lines", [])) + "\n")
+    write_text(output_dir / "repositories.txt", "\n".join(snapshot.get("repositories", [])) + ("\n" if snapshot.get("repositories") else ""))
 
 
 def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, Any]]) -> str:
@@ -575,42 +655,93 @@ def render_summary_md(snapshot: Dict[str, Any], auth_attempts: List[Dict[str, An
     return "\n".join(lines) + "\n"
 
 
-def collect_category(
+def render_diagnostics_md(diagnostics: Dict[str, Any]) -> str:
+    lines = [
+        "# SA-04(10) Collector Diagnostics",
+        "",
+        f"- Generated at: `{diagnostics.get('generated_at', '')}`",
+        f"- Scope: `{diagnostics.get('scope', '')}`",
+        f"- Enterprise: `{diagnostics.get('enterprise', '')}`",
+        f"- Organization: `{diagnostics.get('organization', '')}`",
+        f"- Repository: `{diagnostics.get('repository', '')}`",
+        f"- Repository full: `{diagnostics.get('repository_full', '')}`",
+        f"- Selected auth kind: `{diagnostics.get('selected_auth_kind', '')}`",
+        "",
+        "## Token Attempts",
+        "",
+    ]
+
+    for attempt in diagnostics.get("token_attempts", []) or []:
+        lines.extend(
+            [
+                f"### {attempt.get('token_env', '')}",
+                f"- Auth kind: `{attempt.get('auth_kind', '')}`",
+                f"- Status: `{attempt.get('status', '')}`",
+            ]
+        )
+
+        identity = attempt.get("identity") or {}
+        if identity:
+            lines.append(f"- Token login: `{identity.get('login', '')}`")
+            lines.append(f"- Token type: `{identity.get('type', '')}`")
+            lines.append(f"- Identity status: `{identity.get('status_code', '')}`")
+            if identity.get("message"):
+                lines.append(f"- Identity message: `{identity.get('message', '')}`")
+
+        probes = attempt.get("probe", []) or []
+        if probes:
+            lines.append("")
+            lines.append("| Kind | Category | Status | Accepted Permissions | SSO | Message |")
+            lines.append("|---|---|---:|---|---|---|")
+            for probe in probes:
+                lines.append(
+                    f"| {probe.get('kind', '')} | {probe.get('category', '')} | "
+                    f"{probe.get('status_code', '')} | {probe.get('accepted_permissions', '') or ''} | "
+                    f"{probe.get('sso', '') or ''} | {probe.get('message', '')} |"
+                )
+        lines.append("")
+
+    if diagnostics.get("notes"):
+        lines.extend(["## Notes", ""])
+        for note in diagnostics["notes"]:
+            lines.append(f"- {note}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def collect_soft_failure_snapshot(
     scope: str,
-    base_path: str,
-    headers: Dict[str, str],
-    category: str,
-    threshold: str,
-    fallback_repository_full: str,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
-    endpoint_map = {
-        "code_scanning": "code-scanning/alerts",
-        "dependabot": "dependabot/alerts",
-        "secret_scanning": "secret-scanning/alerts",
+    organization: str,
+    repository: str,
+    repository_full: str,
+    enterprise: str,
+    token_attempts: List[Dict[str, Any]],
+    diagnostics_notes: List[str],
+) -> Dict[str, Any]:
+    return {
+        "generated_at": utc_now(),
+        "date": utc_now()[:10],
+        "scope": scope,
+        "organization": organization,
+        "repository": repository,
+        "repository_full": repository_full,
+        "enterprise": enterprise,
+        "repository_count": 0,
+        "repositories": [],
+        "auth_kind": "none",
+        "results": {
+            "code_scanning": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
+            "dependabot": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
+            "secret_scanning": {"accessible": False, "skipped": True, "skip_reason": "no usable token", "count": 0, "blocking_count": 0, "alerts": []},
+        },
+        "blocking_findings": [],
+        "errors": ["no usable token found for the selected scope"],
+        "evidence_lines": ["SSP-EVIDENCE: no usable token found; collection was not performed."],
+        "overall": {"blocking_count": 0, "error_count": 1, "status": "error"},
+        "token_attempts": token_attempts,
+        "notes": diagnostics_notes,
     }
-
-    if category not in endpoint_map:
-        fail(f"unsupported category: {category}", exit_code=2)
-
-    alerts = list_alerts(base_path, headers, endpoint_map[category])
-    normalized_alerts, blocking_items = normalize_category_alerts(
-        alerts=alerts,
-        category=category,
-        threshold=threshold,
-        fallback_repository_full=fallback_repository_full,
-    )
-
-    result = {
-        "accessible": True,
-        "skipped": False,
-        "skip_reason": None,
-        "count": len(normalized_alerts),
-        "blocking_count": len(blocking_items),
-        "alerts": normalized_alerts,
-    }
-
-    evidence_lines = [f"SSP-EVIDENCE: {category} alert polling completed successfully"]
-    return result, blocking_items, evidence_lines
 
 
 def main() -> int:
@@ -624,49 +755,116 @@ def main() -> int:
     repository = args.repo or repo_default
     enterprise = args.enterprise or os.getenv("GH_ENTERPRISE_SLUG", "")
     scope = normalize_scope(args.scope)
-
     threshold = os.getenv("FAIL_ON_SEVERITY", "high").strip().lower()
     soft_fail = args.soft_fail or os.getenv("SA04_SOFT_FAIL", "") == "1"
 
     if threshold not in {"low", "medium", "moderate", "high", "critical"}:
         fail(f"invalid FAIL_ON_SEVERITY value: {threshold}", exit_code=2)
 
+    ctx = display_context(scope, organization, repository, enterprise)
     base_path = scope_base(scope, organization, repository, enterprise)
-    headers, auth_attempts, auth_kind = choose_token(scope, base_path)
 
     print("SA-04(10) enterprise collector starting")
     print(f"Scope: {scope}")
-    print(f"Organization: {organization}")
-    print(f"Repository: {repository}")
+    print(f"Organization: {ctx['organization']}")
+    print(f"Repository: {ctx['repository']}")
+    print(f"Repository full: {ctx['repository_full']}")
     print(f"Enterprise: {enterprise}")
     print(f"Blocking threshold: {threshold}")
     print(f"Soft fail: {soft_fail}")
-    print(f"Auth kind: {auth_kind}")
 
     results: Dict[str, Any] = {}
     evidence_lines: List[str] = []
     errors: List[str] = []
     blocking_findings: List[Dict[str, Any]] = []
     repositories_seen: set[str] = set()
+    token_attempts_diag: List[Dict[str, Any]] = []
+    diagnostics_notes: List[str] = []
 
-    if scope == "enterprise":
-        display_organization = "enterprise-wide"
-        display_repository = "enterprise-wide"
-        display_repository_full = f"enterprise/{enterprise}" if enterprise else "enterprise-wide"
-    else:
-        display_organization = organization
-        display_repository = repository
-        display_repository_full = f"{organization}/{repository}"
+    # Token selection, with self-diagnosis.
+    selected_headers: Optional[Dict[str, str]] = None
+    selected_auth_kind: str = "none"
 
+    for env_name, auth_kind in token_candidates(scope):
+        token = os.getenv(env_name)
+        attempt: Dict[str, Any] = {
+            "token_env": env_name,
+            "auth_kind": auth_kind,
+            "status": "missing",
+            "identity": None,
+            "probe": [],
+        }
+
+        if not token:
+            token_attempts_diag.append(attempt)
+            continue
+
+        headers = make_headers(token, auth_kind)
+        identity = probe_identity(headers)
+        attempt["identity"] = identity
+
+        ok, probe_diag = probe(scope, base_path, headers)
+        attempt["probe"] = probe_diag
+        attempt["status"] = "ok" if ok else "rejected"
+        token_attempts_diag.append(attempt)
+
+        if ok:
+            selected_headers = headers
+            selected_auth_kind = auth_kind
+            diagnostics_notes.append(f"Selected token from {env_name} with auth kind {auth_kind}.")
+            break
+
+    if selected_headers is None:
+        diagnostics = {
+            "generated_at": utc_now(),
+            "scope": scope,
+            "enterprise": enterprise,
+            "organization": ctx["organization"],
+            "repository": ctx["repository"],
+            "repository_full": ctx["repository_full"],
+            "selected_auth_kind": "none",
+            "token_attempts": token_attempts_diag,
+            "notes": diagnostics_notes + [
+                "No candidate token could access the required endpoints.",
+                "Review the probe status, accepted permissions, SSO header, and token owner access.",
+            ],
+        }
+        write_json(output_dir / "diagnostics.json", diagnostics)
+        write_text(output_dir / "diagnostics.md", render_diagnostics_md(diagnostics))
+
+        if soft_fail:
+            snapshot = collect_soft_failure_snapshot(
+                scope=scope,
+                organization=ctx["organization"],
+                repository=ctx["repository"],
+                repository_full=ctx["repository_full"],
+                enterprise=enterprise,
+                token_attempts=token_attempts_diag,
+                diagnostics_notes=diagnostics_notes,
+            )
+            append_history(output_dir, snapshot)
+            write_summary_files(output_dir, snapshot, token_attempts_diag)
+            write_text(output_dir / "summary.md", render_summary_md(snapshot, token_attempts_diag))
+            print("SA-04(10) collection soft-failed; diagnostics were written for review.")
+            return 0
+
+        fail(
+            "no usable token found for the selected scope. "
+            "Check token scope, SSO authorization, enterprise membership, org role, or enterprise PAT policy.",
+            exit_code=2,
+        )
+
+    print(f"Selected auth kind: {selected_auth_kind}")
+
+    # Collect all streams.
     try:
         print("Phase 1: code scanning alert polling")
         code_result, code_blocking, code_evidence = collect_category(
-            scope=scope,
             base_path=base_path,
-            headers=headers,
+            headers=selected_headers,
             category="code_scanning",
             threshold=threshold,
-            fallback_repository_full=display_repository_full,
+            fallback_repository_full=ctx["repository_full"],
         )
         results["code_scanning"] = code_result
         blocking_findings.extend(code_blocking)
@@ -683,7 +881,7 @@ def main() -> int:
                 "alerts": [],
             }
             errors.append(str(exc))
-            evidence_lines.append(f"SSP-EVIDENCE: code scanning collection error recorded for review: {exc}")
+            diagnostics_notes.append(f"code scanning collection error: {exc}")
             write_json(output_dir / "code_scanning_error.json", {"error": str(exc)})
         else:
             fail(str(exc), exit_code=2)
@@ -691,12 +889,11 @@ def main() -> int:
     try:
         print("Phase 2: Dependabot alert polling")
         dep_result, dep_blocking, dep_evidence = collect_category(
-            scope=scope,
             base_path=base_path,
-            headers=headers,
+            headers=selected_headers,
             category="dependabot",
             threshold=threshold,
-            fallback_repository_full=display_repository_full,
+            fallback_repository_full=ctx["repository_full"],
         )
         results["dependabot"] = dep_result
         blocking_findings.extend(dep_blocking)
@@ -713,7 +910,7 @@ def main() -> int:
                 "alerts": [],
             }
             errors.append(str(exc))
-            evidence_lines.append(f"SSP-EVIDENCE: Dependabot collection error recorded for review: {exc}")
+            diagnostics_notes.append(f"dependabot collection error: {exc}")
             write_json(output_dir / "dependabot_error.json", {"error": str(exc)})
         else:
             fail(str(exc), exit_code=2)
@@ -721,12 +918,11 @@ def main() -> int:
     try:
         print("Phase 3: secret scanning alert polling")
         sec_result, sec_blocking, sec_evidence = collect_category(
-            scope=scope,
             base_path=base_path,
-            headers=headers,
+            headers=selected_headers,
             category="secret_scanning",
             threshold=threshold,
-            fallback_repository_full=display_repository_full,
+            fallback_repository_full=ctx["repository_full"],
         )
         results["secret_scanning"] = sec_result
         blocking_findings.extend(sec_blocking)
@@ -743,12 +939,12 @@ def main() -> int:
                 "alerts": [],
             }
             errors.append(str(exc))
-            evidence_lines.append(f"SSP-EVIDENCE: secret scanning collection error recorded for review: {exc}")
+            diagnostics_notes.append(f"secret scanning collection error: {exc}")
             write_json(output_dir / "secret_scanning_error.json", {"error": str(exc)})
         else:
             fail(str(exc), exit_code=2)
 
-    # Build repository list from normalized alert rows across all categories.
+    # Build repository list from normalized alert rows.
     for category_name in ("code_scanning", "dependabot", "secret_scanning"):
         for alert in (results.get(category_name, {}) or {}).get("alerts", []) or []:
             repo_full = str(alert.get("repository_full") or "").strip()
@@ -759,23 +955,35 @@ def main() -> int:
 
     snapshot = build_snapshot(
         scope=scope,
-        organization=display_organization,
-        repository=display_repository,
-        repository_full=display_repository_full,
+        organization=ctx["organization"],
+        repository=ctx["repository"],
+        repository_full=ctx["repository_full"],
         enterprise=enterprise,
-        auth_kind=auth_kind,
+        auth_kind=selected_auth_kind,
         results=results,
         blocking_findings=blocking_findings,
         errors=errors,
         repositories=repositories,
+        evidence_lines=evidence_lines,
     )
 
-    # keep the evidence lines and summary files aligned with the enterprise header
-    snapshot["evidence_lines"] = evidence_lines
     append_history(output_dir, snapshot)
-    write_summary_files(output_dir, snapshot, auth_attempts, evidence_lines)
-    write_text(output_dir / "summary.md", render_summary_md(snapshot, auth_attempts))
-    write_text(output_dir / "repositories.txt", "\n".join(repositories) + ("\n" if repositories else ""))
+    write_summary_files(output_dir, snapshot, token_attempts_diag)
+    write_text(output_dir / "summary.md", render_summary_md(snapshot, token_attempts_diag))
+
+    diagnostics = {
+        "generated_at": utc_now(),
+        "scope": scope,
+        "enterprise": enterprise,
+        "organization": ctx["organization"],
+        "repository": ctx["repository"],
+        "repository_full": ctx["repository_full"],
+        "selected_auth_kind": selected_auth_kind,
+        "token_attempts": token_attempts_diag,
+        "notes": diagnostics_notes,
+    }
+    write_json(output_dir / "diagnostics.json", diagnostics)
+    write_text(output_dir / "diagnostics.md", render_diagnostics_md(diagnostics))
 
     print("")
     print("SA-04(10) collection complete")
