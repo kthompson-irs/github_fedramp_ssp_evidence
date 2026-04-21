@@ -30,12 +30,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spreadsheets-dir", dest="spreadsheets_dir", default=None)
     parser.add_argument("--poam-dir", dest="poam_dir", default=None)
     parser.add_argument("--controls-manifest", dest="controls_manifest", default=None)
+    parser.add_argument("--enterprise-orgs-file", dest="enterprise_orgs_file", default=None)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
 
     parser.add_argument("--input", dest="input_legacy", default=None)
     parser.add_argument("--spreadsheets", dest="spreadsheets_legacy", default=None)
     parser.add_argument("--poam", dest="poam_legacy", default=None)
     parser.add_argument("--manifest", dest="manifest_legacy", default=None)
+    parser.add_argument("--enterprise-orgs", dest="enterprise_orgs_legacy", default=None)
     parser.add_argument("--output", dest="output_legacy", default=None)
 
     args = parser.parse_args()
@@ -44,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     args.spreadsheets_dir = args.spreadsheets_dir or args.spreadsheets_legacy or "spreadsheets"
     args.poam_dir = args.poam_dir or args.poam_legacy or "poam"
     args.controls_manifest = args.controls_manifest or args.manifest_legacy or "controls_manifest.json"
+    args.enterprise_orgs_file = args.enterprise_orgs_file or args.enterprise_orgs_legacy or "enterprise_organizations.json"
     args.output_dir = args.output_dir or args.output_legacy or "fedramp_ato_package"
     return args
 
@@ -548,6 +551,7 @@ def main() -> int:
     spreadsheets_dir = Path(args.spreadsheets_dir)
     poam_dir = Path(args.poam_dir)
     controls_manifest = Path(args.controls_manifest)
+    enterprise_orgs_file = Path(args.enterprise_orgs_file)
     output_dir = Path(args.output_dir)
 
     summary = read_json(input_dir / "summary.json")
@@ -559,7 +563,9 @@ def main() -> int:
     if not isinstance(controls, list) or not controls:
         controls = default_controls_manifest()["controls"]
 
-    org_inventory = load_enterprise_org_inventory(summary, input_dir)
+    org_inventory = read_json(enterprise_orgs_file, default=None)
+    if not isinstance(org_inventory, dict) or not org_inventory:
+        org_inventory = load_enterprise_org_inventory(summary, input_dir)
 
     clean_dir(output_dir)
 
