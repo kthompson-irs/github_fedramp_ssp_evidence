@@ -348,7 +348,12 @@ def build_poam_csv(findings: List[Dict[str, Any]]) -> str:
     return "\n".join(",".join(csv_quote(cell) for cell in row) for row in rows) + "\n"
 
 
-def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str], org_inventory: Dict[str, Any]) -> str:
+def build_ssp_markdown(
+    summary: Dict[str, Any],
+    controls: List[Dict[str, Any]],
+    run_context: Dict[str, str],
+    org_inventory: Dict[str, Any],
+) -> str:
     scope = summary.get("scope", "unknown")
     repo = summary.get("repository", "unknown")
     repo_count = summary.get("repository_count", 0)
@@ -393,27 +398,149 @@ def build_ssp_markdown(summary: Dict[str, Any], controls: List[Dict[str, Any]], 
                 "",
             ]
         )
+
     return "\n".join(lines)
 
 
-def make_manifest(root: Path) -> Dict[str, Any]:
-    files: List[Dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_dir():
-            continue
-        if path.name in {"fedramp_ato_package.zip", "sa04-10-fedramp-enterprise-package.zip"}:
-            continue
-        files.append(
+def build_oscal_ssp(
+    summary: Dict[str, Any],
+    controls: List[Dict[str, Any]],
+    run_context: Dict[str, str],
+    has_sarif: bool,
+) -> Dict[str, Any]:
+    sys_uuid = str(uuid.uuid4())
+    aws_uuid = str(uuid.uuid4())
+    github_uuid = str(uuid.uuid4())
+    treasury_uuid = str(uuid.uuid4())
+
+    components = [
+        {
+            "uuid": aws_uuid,
+            "type": "service",
+            "title": "AWS GovCloud (US)",
+            "description": "FedRAMP-authorized infrastructure and platform services.",
+        },
+        {
+            "uuid": github_uuid,
+            "type": "service",
+            "title": "GitHub.com",
+            "description": "Development platform providing CodeQL, Dependabot, and secret scanning.",
+        },
+        {
+            "uuid": treasury_uuid,
+            "type": "software",
+            "title": "Treasury CI/CD and Evidence Automation",
+            "description": "Workflow and Python automation that collects evidence and builds the package.",
+        },
+    ]
+
+    implemented_requirements = []
+    for control in controls:
+        control_id = control.get("control_id", "unknown")
+        implemented_requirements.append(
             {
-                "path": str(path.relative_to(root)),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "uuid": str(uuid.uuid4()),
+                "control-id": control_id,
+                "props": [
+                    {"name": "control-origination", "value": control.get("origination", "shared")},
+                ],
+                "statements": [
+                    {
+                        "uuid": str(uuid.uuid4()),
+                        "statement-id": f"{control_id}_smt",
+                        "description": control.get(
+                            "implementation",
+                            "Implementation defined in the control manifest.",
+                        ),
+                    }
+                ],
             }
         )
-    return {"generated_at": utc_now(), "file_count": len(files), "files": files}
+
+    back_matter_resources = [
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Workflow YAML",
+            "rlinks": [{"href": "../.github/workflows/sa-04-10-enterprise-fedramp-evidence.yml"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Alert Collector",
+            "rlinks": [{"href": "../scripts/gh_sa_04_10_enterprise_collector.py"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Spreadsheet Builder",
+            "rlinks": [{"href": "../scripts/build_sa04_30_day_spreadsheets_enterprise.py"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "POA&M Builder",
+            "rlinks": [{"href": "../scripts/build_poam_from_findings.py"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Package Builder",
+            "rlinks": [{"href": "../scripts/build_fedramp_submission_package_enterprise.py"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Controls Manifest",
+            "rlinks": [{"href": "../controls_manifest.json"}],
+        },
+        {
+            "uuid": str(uuid.uuid4()),
+            "title": "Enterprise Organization Inventory",
+            "rlinks": [{"href": "../enterprise_organizations.json"}],
+        },
+    ]
+
+    if has_sarif:
+        back_matter_resources.append(
+            {
+                "uuid": str(uuid.uuid4()),
+                "title": "CodeQL SARIF",
+                "rlinks": [{"href": "../Evidence/CI_CD/codeql_results/python.sarif"}],
+            }
+        )
+
+    return {
+        "system-security-plan": {
+            "uuid": sys_uuid,
+            "metadata": {
+                "title": "Treasury Cloud SSP",
+                "version": "1.0",
+                "oscal-version": "1.0.4",
+                "last-modified": summary.get("generated_at", utc_now()),
+                "remarks": "Generated automatically from enterprise SA-04(10) evidence collection.",
+            },
+            "system-characteristics": {
+                "system-name": "Treasury Cloud",
+                "security-sensitivity-level": "low",
+                "authorization-boundary": "Treasury Cloud environment using AWS GovCloud and GitHub.com.",
+                "system-description": {
+                    "text": "Treasury Cloud uses AWS GovCloud (US) and GitHub.com with CI/CD security gates, historical logs, and evidence automation."
+                },
+            },
+            "system-implementation": {
+                "components": components,
+            },
+            "control-implementation": {
+                "implemented-requirements": implemented_requirements,
+            },
+            "back-matter": {
+                "resources": back_matter_resources,
+            },
+        }
+    }
 
 
-def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_context: Dict[str, str], org_inventory: Dict[str, Any]) -> str:
+def build_readme(
+    summary: Dict[str, Any],
+    controls: List[Dict[str, Any]],
+    run_context: Dict[str, str],
+    org_inventory: Dict[str, Any],
+) -> str:
     org_count = len(org_inventory.get("organizations", []) or [])
     return "\n".join(
         [
@@ -465,6 +592,23 @@ def build_readme(summary: Dict[str, Any], controls: List[Dict[str, Any]], run_co
             "",
         ]
     )
+
+
+def make_manifest(root: Path) -> Dict[str, Any]:
+    files: List[Dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        if path.name in {"fedramp_ato_package.zip", "sa04-10-fedramp-enterprise-package.zip"}:
+            continue
+        files.append(
+            {
+                "path": str(path.relative_to(root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return {"generated_at": utc_now(), "file_count": len(files), "files": files}
 
 
 def copy_source_files(output_dir: Path, controls_manifest: Path) -> None:
