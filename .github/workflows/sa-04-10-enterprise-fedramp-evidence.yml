@@ -1,53 +1,35 @@
-name: SA-04(10) Enterprise FedRAMP Evidence
+name: SA-04(10) Enterprise FedRAMP Evidence Builder
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "scripts/**"
-      - ".github/workflows/sa-04-10-enterprise-fedramp-evidence.yml"
-      - "controls_manifest.json"
-      - "enterprise_organizations.json"
   schedule:
-    - cron: "0 6 * * 1"
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
   security-events: write
 
-concurrency:
-  group: sa-04-10-enterprise-fedramp-evidence
-  cancel-in-progress: false
-
 jobs:
   build-evidence:
     runs-on: ubuntu-latest
 
-    env:
-      GH_ALERT_SCOPE: enterprise
-      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
-      GH_REPOSITORY: ${{ github.repository }}
-      GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
-      FAIL_ON_SEVERITY: high
-      SA04_SOFT_FAIL: "1"
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests openpyxl
+      - run: pip install requests openpyxl
 
-      - name: Run enterprise collector
+      - name: Run Enterprise Collector
+        env:
+          GH_ALERT_SCOPE: enterprise
+          GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_DEPENDABOT_TOKEN: ${{ secrets.GH_DEPENDABOT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
+          SA04_SOFT_FAIL: "1"
         run: |
           python scripts/gh_sa_04_10_enterprise_collector.py \
             --scope enterprise \
@@ -55,40 +37,31 @@ jobs:
             --output-dir artifacts/sa-04-10 \
             --soft-fail
 
-      - name: Build enterprise 30-day spreadsheets
+      - name: Build 30-day Logs
         run: |
-          python scripts/build_sa04_30_day_spreadsheets_enterprise.py \
+          python scripts/build_sa04_30_day_spreadsheets.py \
             --input-dir artifacts/sa-04-10 \
             --output-dir spreadsheets
 
-      - name: Build POA&M workbook and per-org tabs
+      - name: Build POA&M
         run: |
           python scripts/build_poam_from_findings.py \
             --input-dir artifacts/sa-04-10 \
             --output-dir poam
 
-      - name: Build FedRAMP submission package
+      - name: Build FedRAMP Package
         run: |
           python scripts/build_fedramp_submission_package_enterprise.py \
             --input-dir artifacts/sa-04-10 \
             --spreadsheets-dir spreadsheets \
             --poam-dir poam \
             --controls-manifest controls_manifest.json \
-            --enterprise-orgs-file enterprise_organizations.json \
             --output-dir fedramp_ato_package
 
-      - name: Show package contents
-        run: |
-          find fedramp_ato_package -maxdepth 3 -type f | sort
-
-      - name: Upload final FedRAMP package
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: sa04-10-fedramp-enterprise-package
+          name: fedramp-enterprise-package
           path: |
-            fedramp_ato_package/sa04-10-fedramp-enterprise-package.zip
-            fedramp_ato_package/enterprise_organizations.json
-            fedramp_ato_package/enterprise_organizations.csv
-            fedramp_ato_package/enterprise_organizations.md
-          if-no-files-found: error
-          retention-days: 30
+            fedramp_ato_package
+            spreadsheets
+            poam
