@@ -7,9 +7,16 @@ import json
 import os
 import shutil
 import uuid
-import zipfi:contentReference[oaicite:0]{index=0}one
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+import requests
+
+
+GH_API = "https://api.github.com"
+TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -23,14 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spreadsheets-dir", dest="spreadsheets_dir", default=None)
     parser.add_argument("--poam-dir", dest="poam_dir", default=None)
     parser.add_argument("--controls-manifest", dest="controls_manifest", default=None)
-    parser.add_argument("--enterprise-orgs-file", dest="enterprise_orgs_file", default=None)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
 
     parser.add_argument("--input", dest="input_legacy", default=None)
     parser.add_argument("--spreadsheets", dest="spreadsheets_legacy", default=None)
     parser.add_argument("--poam", dest="poam_legacy", default=None)
     parser.add_argument("--manifest", dest="manifest_legacy", default=None)
-    parser.add_argument("--enterprise-orgs", dest="enterprise_orgs_legacy", default=None)
     parser.add_argument("--output", dest="output_legacy", default=None)
 
     args = parser.parse_args()
@@ -39,9 +44,7 @@ def parse_args() -> argparse.Namespace:
     args.spreadsheets_dir = args.spreadsheets_dir or args.spreadsheets_legacy or "spreadsheets"
     args.poam_dir = args.poam_dir or args.poam_legacy or "poam"
     args.controls_manifest = args.controls_manifest or args.manifest_legacy or "controls_manifest.json"
-    args.enterprise_orgs_file = args.enterprise_orgs_file or args.enterprise_orgs_legacy or "enterprise_organizations.json"
     args.output_dir = args.output_dir or args.output_legacy or "fedramp_ato_package"
-
     return args
 
 
@@ -113,6 +116,7 @@ def load_controls_manifest(path: Path) -> Dict[str, Any]:
         controls = manifest.get("controls", [])
         if isinstance(controls, list) and controls:
             return manifest
+
     print(f"WARNING: {path} is missing or invalid. Using a default SA-04(10) controls manifest.")
     return default_controls_manifest()
 
@@ -131,8 +135,177 @@ def repo_from_env_or_summary(summary: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def csv_rows_from_org_inventory(org_inventory: Dict[str, Any]) -> str:
+    orgs = org_inventory.get("organizations", []) or []
+    lines = [
+        "slug,display_name,role,status,single_sign_on,two_factor_required,public_repo_count,public_repos,total_private_repos,html_url"
+    ]
+    for org in orgs:
+        lines.append(
+            ",".join(
+                csv_quote(str(org.get(field, "")))
+                for field in [
+                    "slug",
+                    "display_name",
+                    "role",
+                    "status",
+                    "single_sign_on",
+                    "two_factor_required",
+                    "public_repo_count",
+                    "public_repos",
+                    "total_private_repos",
+                    "html_url",
+                ]
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
 def default_enterprise_slug(summary: Dict[str, Any]) -> str:
     return str(summary.get("enterprise") or os.getenv("GH_ENTERPRISE_SLUG") or "").strip()
+
+
+def gh_token_candidates() -> List[Tuple[str, str]]:
+    return [
+        ("GH_ENTERPRISE_TOKEN", "enterprise_token"),
+        ("GH_AUTH_TOKEN", "auth_fallback"),
+        ("GH_DEPENDABOT_TOKEN", "dependabot_token_fallback"),
+    ]
+
+
+def auth_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10",
+    }
+
+
+def graphql_post(query: str, variables: Dict[str, Any], token: str) -> Dict[str, Any]:
+    resp = requests.post(
+        "https://api.github.com/graphql",
+        headers={**auth_headers(token), "Content-Type": "application/json"},
+        json={"query": query, "variables": variables},
+        timeout=TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if "errors" in payload:
+        raise RuntimeError(json.dumps(payload["errors"], indent=2))
+    return payload["data"]
+
+
+def rest_get(url: str, token: str) -> Dict[str, Any]:
+    resp = requests.get(url, headers=auth_headers(token), timeout=TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_live_enterprise_org_inventory(enterprise_slug: str, token: str) -> Dict[str, Any]:
+    query = """
+    query($slug: String!, $after: String) {
+      enterprise(slug: $slug) {
+        name
+        organizations(first: 100, after: $after) {
+          nodes {
+            name
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }
+    """
+
+    orgs: List[Dict[str, Any]] = []
+    after: str | None = None
+    enterprise_name = enterprise_slug
+
+    while True:
+        data = graphql_post(query, {"slug": enterprise_slug, "after": after}, token)
+        enterprise = data.get("enterprise") or {}
+        if not enterprise:
+            raise RuntimeError(f"enterprise slug not found or inaccessible: {enterprise_slug}")
+        enterprise_name = enterprise.get("name") or enterprise_name
+
+        org_conn = enterprise.get("organizations") or {}
+        nodes = org_conn.get("nodes") or []
+        for node in nodes:
+            name = str(node.get("name") or "").strip()
+            if not name:
+                continue
+
+            item: Dict[str, Any] = {
+                "slug": name,
+                "display_name": name,
+                "role": "Owner",
+                "status": "active",
+                "single_sign_on": None,
+                "two_factor_required": None,
+                "source": "graphql-enterprise",
+            }
+
+            try:
+                org_detail = rest_get(f"{GH_API}/orgs/{name}", token)
+                item["two_factor_required"] = org_detail.get("two_factor_requirement_enabled")
+                item["public_repos"] = org_detail.get("public_repos")
+                item["total_private_repos"] = org_detail.get("total_private_repos")
+                item["public_repo_count"] = org_detail.get("public_repos")
+                item["html_url"] = org_detail.get("html_url")
+            except Exception as exc:
+                item["detail_error"] = str(exc)
+
+            orgs.append(item)
+
+        page_info = org_conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        after = page_info.get("endCursor")
+
+    return {
+        "enterprise": enterprise_name,
+        "generated_at": utc_now(),
+        "organizations": orgs,
+        "notes": [
+            "Organizations were pulled live from the GitHub Enterprise Accounts GraphQL API.",
+            "Where possible, organization REST details were used to augment the inventory with 2FA and repository counts.",
+        ],
+    }
+
+
+def load_enterprise_org_inventory(summary: Dict[str, Any], input_dir: Path) -> Dict[str, Any]:
+    enterprise_slug = default_enterprise_slug(summary)
+    if enterprise_slug:
+        last_error: Exception | None = None
+        for env_name, _kind in gh_token_candidates():
+            token = os.getenv(env_name)
+            if not token:
+                continue
+            try:
+                return fetch_live_enterprise_org_inventory(enterprise_slug, token)
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        fallback = read_json(input_dir / "enterprise_organizations.json", default=None)
+        if isinstance(fallback, dict) and fallback.get("organizations"):
+            fallback["live_fetch_error"] = str(last_error) if last_error else "live fetch unavailable"
+            return fallback
+
+        raise SystemExit(f"Unable to fetch live enterprise org inventory: {last_error}")
+
+    fallback = read_json(input_dir / "enterprise_organizations.json", default=None)
+    if isinstance(fallback, dict) and fallback.get("organizations"):
+        return fallback
+
+    return {
+        "enterprise": "unknown",
+        "generated_at": utc_now(),
+        "organizations": [],
+        "notes": ["No live enterprise slug was available; inventory was not fetched."],
+    }
 
 
 def build_poam_csv(findings: List[Dict[str, Any]]) -> str:
@@ -225,10 +398,14 @@ def make_manifest(root: Path) -> Dict[str, Any]:
     for path in sorted(root.rglob("*")):
         if path.is_dir():
             continue
-        if path.name == "fedramp_ato_package.zip" or path.name == "sa04-10-fedramp-enterprise-package.zip":
+        if path.name in {"fedramp_ato_package.zip", "sa04-10-fedramp-enterprise-package.zip"}:
             continue
         files.append(
-            {"path": str(path.relative_to(root)), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
+            {
+                "path": str(path.relative_to(root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
         )
     return {"generated_at": utc_now(), "file_count": len(files), "files": files}
 
@@ -311,28 +488,8 @@ def write_enterprise_inventory(org_inventory: Dict[str, Any], output_dir: Path) 
     write_json(enterprise_dir / "enterprise_organizations.json", org_inventory)
 
     orgs = org_inventory.get("organizations", []) or []
-    csv_lines = [
-        "slug,display_name,role,status,single_sign_on,two_factor_required,public_repo_count,public_repos,total_private_repos,html_url"
-    ]
-    for org in orgs:
-        csv_lines.append(
-            ",".join(
-                csv_quote(str(org.get(field, "")))
-                for field in [
-                    "slug",
-                    "display_name",
-                    "role",
-                    "status",
-                    "single_sign_on",
-                    "two_factor_required",
-                    "public_repo_count",
-                    "public_repos",
-                    "total_private_repos",
-                    "html_url",
-                ]
-            )
-        )
-    write_text(enterprise_dir / "enterprise_organizations.csv", "\n".join(csv_lines) + "\n")
+    csv_text = csv_rows_from_org_inventory(org_inventory)
+    write_text(enterprise_dir / "enterprise_organizations.csv", csv_text)
 
     md_lines = [
         "# Enterprise Organization Inventory",
@@ -351,7 +508,7 @@ def write_enterprise_inventory(org_inventory: Dict[str, Any], output_dir: Path) 
     write_text(enterprise_dir / "enterprise_organizations.md", "\n".join(md_lines) + "\n")
 
     write_json(output_dir / "enterprise_organizations.json", org_inventory)
-    write_text(output_dir / "enterprise_organizations.csv", "\n".join(csv_lines) + "\n")
+    write_text(output_dir / "enterprise_organizations.csv", csv_text)
     write_text(output_dir / "enterprise_organizations.md", "\n".join(md_lines) + "\n")
 
 
@@ -402,14 +559,7 @@ def main() -> int:
     if not isinstance(controls, list) or not controls:
         controls = default_controls_manifest()["controls"]
 
-    org_inventory = read_json(input_dir / "enterprise_organizations.json", default=None)
-    if not isinstance(org_inventory, dict) or not org_inventory:
-        org_inventory = {
-            "enterprise": summary.get("enterprise", ""),
-            "generated_at": utc_now(),
-            "organizations": [],
-            "notes": ["No enterprise organization inventory found in input; package built without org list."],
-        }
+    org_inventory = load_enterprise_org_inventory(summary, input_dir)
 
     clean_dir(output_dir)
 
