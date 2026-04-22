@@ -2,10 +2,8 @@
 """
 Fetch GitHub enterprise audit log evidence.
 
-GitHub requires:
-- an enterprise admin account
-- classic PAT / OAuth token with read:audit_log
-- or a fine-grained token with Enterprise administration (read)
+GitHub says the authenticated user must be an enterprise admin to use this
+endpoint, and classic PATs need read:audit_log.
 """
 
 from __future__ import annotations
@@ -17,29 +15,28 @@ from typing import Any, Dict, List
 
 import requests
 
+DEFAULT_API_BASE = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
 
-def fetch_page(enterprise: str, token: str, page: int, per_page: int) -> List[Dict[str, Any]]:
-    url = f"https://api.github.com/enterprises/{enterprise}/audit-log"
+
+def fetch_page(api_base: str, enterprise: str, token: str, page: int, per_page: int) -> List[Dict[str, Any]]:
+    url = f"{api_base.rstrip('/')}/enterprises/{enterprise}/audit-log"
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
     }
-
     resp = requests.get(url, headers=headers, params={"page": page, "per_page": per_page}, timeout=60)
 
     if resp.status_code == 401:
         raise SystemExit(
             "GitHub audit-log authentication failed (401). "
-            "Use an enterprise-admin token with read:audit_log (classic PAT) "
-            "or Enterprise administration (read) for fine-grained tokens."
+            "Use an enterprise-admin token with read:audit_log."
         )
-
     if resp.status_code == 403:
         raise SystemExit(
             "GitHub audit-log authorization failed (403). "
-            "The token is valid but not allowed for this enterprise audit log. "
-            "Confirm the user is an enterprise admin and the token has the required permission."
+            "The token is valid but not allowed for this enterprise audit log."
         )
 
     resp.raise_for_status()
@@ -52,6 +49,7 @@ def fetch_page(enterprise: str, token: str, page: int, per_page: int) -> List[Di
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--enterprise", required=True)
+    parser.add_argument("--api-base", default=DEFAULT_API_BASE)
     parser.add_argument("--token", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--per-page", type=int, default=100)
@@ -60,7 +58,7 @@ def main() -> int:
 
     events: List[Dict[str, Any]] = []
     for page in range(1, args.max_pages + 1):
-        batch = fetch_page(args.enterprise, args.token, page=page, per_page=args.per_page)
+        batch = fetch_page(args.api_base, args.enterprise, args.token, page=page, per_page=args.per_page)
         if not batch:
             break
         events.extend(batch)
