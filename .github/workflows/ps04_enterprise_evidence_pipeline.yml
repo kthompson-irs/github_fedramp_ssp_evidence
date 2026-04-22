@@ -105,6 +105,31 @@ jobs:
             --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
             --scim-log "$SCIM_LOG_FILE"
 
+      - name: Validate live SCIM configuration
+        shell: bash
+        if: env.MODE == 'live'
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import csv
+          import os
+          import sys
+          from pathlib import Path
+
+          rows = list(csv.DictReader(Path("data/terminations.csv").open(newline="", encoding="utf-8")))
+          needs_scim = any(r.get("evidence_source") == "scim_log" for r in rows)
+
+          if needs_scim and (not os.getenv("SCIM_BASE_URL") or not os.getenv("SCIM_BEARER_TOKEN")):
+              print(
+                  "SCIM_BASE_URL and SCIM_BEARER_TOKEN are required for scim_log rows in live mode.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(f"Live mode SCIM check: needs_scim={needs_scim}")
+          PY
+
       - name: Fetch live GitHub audit logs
         shell: bash
         if: env.MODE == 'live'
