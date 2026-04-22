@@ -1,47 +1,98 @@
 #!/usr/bin/env python3
-import requests, os, json
+"""
+Fetch SCIM-derived evidence for terminated identities.
 
-OKTA_DOMAIN = os.getenv("OKTA_DOMAIN")
-OKTA_TOKEN = os.getenv("OKTA_TOKEN")
+This treats deprovisioned SCIM state as evidence: for each termination row that
+targets scim_log, it queries a SCIM Users endpoint and emits a deprovision event
+when the user is inactive.
 
-def main():
-    os.makedirs("data", exist_ok=True)
+This is a state-to-evidence conversion for the pipeline; it is not a claim that
+SCIM is itself a historical event log.
+"""
 
-    if not OKTA_DOMAIN or not OKTA_TOKEN:
-        print("OKTA not configured — writing empty SCIM log")
-        with open("data/scim_log.json", "w") as f:
-            json.dump([], f)
-        return
+from __future__ import annotations
 
-    url = f"https://{OKTA_DOMAIN}/api/v1/logs"
+import argparse
+import csv
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List
 
+import requests
+
+
+def format_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_scim_targets(terminations: Path) -> List[str]:
+    with terminations.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    return [row["github_identity"] for row in rows if row.get("evidence_source") == "scim_log"]
+
+
+def extract_resources(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        resources = payload.get("Resources")
+        if isinstance(resources, list):
+            return [x for x in resources if isinstance(x, dict)]
+    return []
+
+
+def fetch_user(base_url: str, token: str, user_name: str) -> List[Dict[str, Any]]:
+    url = f"{base_url.rstrip('/')}/scim/v2/Users"
     headers = {
-        "Authorization": f"SSWS {OKTA_TOKEN}"
+        "Accept": "application/scim+json",
+        "Authorization": f"Bearer {token}",
     }
+    resp = requests.get(url, headers=headers, params={"filter": f'userName eq "{user_name}"'}, timeout=60)
+    resp.raise_for_status()
+    return extract_resources(resp.json())
 
-    params = {
-        "limit": 100,
-        "filter": 'eventType eq "user.lifecycle.deactivate"'
-    }
 
-    r = requests.get(url, headers=headers, params=params)
-    r.raise_for_status()
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--terminations", required=True, type=Path)
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--token", default=None)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
 
-    events = r.json()
+    if not args.base_url:
+        raise SystemExit("Missing --base-url")
+    if not args.token:
+        raise SystemExit("Missing --token")
 
-    normalized = []
-    for e in events:
-        normalized.append({
-            "action": "external_identity.deprovision",
-            "actor": e.get("actor", {}).get("alternateId"),
-            "user": e.get("target", [{}])[0].get("alternateId"),
-            "created_at": e.get("published")
-        })
+    targets = load_scim_targets(args.terminations)
+    now = format_utc(datetime.now(timezone.utc))
 
-    with open("data/scim_log.json", "w") as f:
-        json.dump(normalized, f, indent=2)
+    events: List[Dict[str, Any]] = []
+    for user_name in targets:
+        resources = fetch_user(args.base_url, args.token, user_name)
+        for resource in resources:
+            active = resource.get("active", True)
+            if active is False:
+                events.append(
+                    {
+                        "action": "external_identity.deprovision",
+                        "user": resource.get("userName", user_name),
+                        "actor": "scim-service",
+                        "created_at": resource.get("meta", {}).get("lastModified", now)
+                        if isinstance(resource.get("meta"), dict)
+                        else now,
+                        "active": False,
+                        "synthetic": False,
+                    }
+                )
 
-    print(f"Fetched {len(normalized)} SCIM events")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(events, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {len(events)} SCIM-derived event(s) to {args.output}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
