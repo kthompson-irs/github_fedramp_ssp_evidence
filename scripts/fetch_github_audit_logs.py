@@ -2,17 +2,16 @@
 """
 Fetch GitHub enterprise audit log evidence.
 
-Requirements from GitHub:
-- The authenticated user must be an enterprise admin.
-- Classic PATs / OAuth app tokens need read:audit_log.
-- Fine-grained tokens need Enterprise administration (read).
+GitHub requires:
+- an enterprise admin account
+- classic PAT / OAuth token with read:audit_log
+- or a fine-grained token with Enterprise administration (read)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,21 +25,21 @@ def fetch_page(enterprise: str, token: str, page: int, per_page: int) -> List[Di
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
     resp = requests.get(url, headers=headers, params={"page": page, "per_page": per_page}, timeout=60)
 
     if resp.status_code == 401:
         raise SystemExit(
-            "GitHub audit log authentication failed (401).\n"
-            "Check that GH_AUDIT_TOKEN belongs to an enterprise admin and has the right permission:\n"
-            "- classic PAT / OAuth token: read:audit_log\n"
-            "- fine-grained token: Enterprise administration (read)\n"
-            "Also confirm GH_ENTERPRISE_SLUG is the correct enterprise."
+            "GitHub audit-log authentication failed (401). "
+            "Use an enterprise-admin token with read:audit_log (classic PAT) "
+            "or Enterprise administration (read) for fine-grained tokens."
         )
 
     if resp.status_code == 403:
         raise SystemExit(
-            "GitHub audit log authorization failed (403).\n"
-            "The token may be valid but not allowed for this enterprise or missing required permissions."
+            "GitHub audit-log authorization failed (403). "
+            "The token is valid but not allowed for this enterprise audit log. "
+            "Confirm the user is an enterprise admin and the token has the required permission."
         )
 
     resp.raise_for_status()
