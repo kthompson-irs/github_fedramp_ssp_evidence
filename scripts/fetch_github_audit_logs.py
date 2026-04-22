@@ -2,8 +2,10 @@
 """
 Fetch GitHub enterprise audit log evidence.
 
-GitHub documents that this endpoint requires an enterprise admin and that
-classic PATs/OAuth app tokens need read:audit_log.
+Requirements from GitHub:
+- The authenticated user must be an enterprise admin.
+- Classic PATs / OAuth app tokens need read:audit_log.
+- Fine-grained tokens need Enterprise administration (read).
 """
 
 from __future__ import annotations
@@ -25,6 +27,22 @@ def fetch_page(enterprise: str, token: str, page: int, per_page: int) -> List[Di
         "X-GitHub-Api-Version": "2022-11-28",
     }
     resp = requests.get(url, headers=headers, params={"page": page, "per_page": per_page}, timeout=60)
+
+    if resp.status_code == 401:
+        raise SystemExit(
+            "GitHub audit log authentication failed (401).\n"
+            "Check that GH_AUDIT_TOKEN belongs to an enterprise admin and has the right permission:\n"
+            "- classic PAT / OAuth token: read:audit_log\n"
+            "- fine-grained token: Enterprise administration (read)\n"
+            "Also confirm GH_ENTERPRISE_SLUG is the correct enterprise."
+        )
+
+    if resp.status_code == 403:
+        raise SystemExit(
+            "GitHub audit log authorization failed (403).\n"
+            "The token may be valid but not allowed for this enterprise or missing required permissions."
+        )
+
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list):
@@ -34,24 +52,16 @@ def fetch_page(enterprise: str, token: str, page: int, per_page: int) -> List[Di
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--enterprise", default=None)
-    parser.add_argument("--token", default=None)
+    parser.add_argument("--enterprise", required=True)
+    parser.add_argument("--token", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--per-page", type=int, default=100)
     parser.add_argument("--max-pages", type=int, default=10)
     args = parser.parse_args()
 
-    enterprise = args.enterprise
-    token = args.token
-
-    if not enterprise:
-        raise SystemExit("Missing --enterprise")
-    if not token:
-        raise SystemExit("Missing --token")
-
     events: List[Dict[str, Any]] = []
     for page in range(1, args.max_pages + 1):
-        batch = fetch_page(enterprise, token, page=page, per_page=args.per_page)
+        batch = fetch_page(args.enterprise, args.token, page=page, per_page=args.per_page)
         if not batch:
             break
         events.extend(batch)
