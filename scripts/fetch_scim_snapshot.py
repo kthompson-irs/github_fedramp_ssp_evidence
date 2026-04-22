@@ -2,12 +2,8 @@
 """
 Fetch SCIM-derived evidence for terminated identities.
 
-This treats deprovisioned SCIM state as evidence: for each termination row that
-targets scim_log, it queries a SCIM Users endpoint and emits a deprovision event
-when the user is inactive.
-
-This is a state-to-evidence conversion for the pipeline; it is not a claim that
-SCIM is itself a historical event log.
+GitHub documents SCIM as the lifecycle mechanism for Enterprise Managed Users.
+This script assumes the SCIM endpoint is your IdP's SCIM base URL.
 """
 
 from __future__ import annotations
@@ -24,6 +20,16 @@ import requests
 
 def format_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc_datetime(value: str) -> datetime:
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def load_scim_targets(terminations: Path) -> List[str]:
@@ -56,14 +62,14 @@ def fetch_user(base_url: str, token: str, user_name: str) -> List[Dict[str, Any]
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--terminations", required=True, type=Path)
-    parser.add_argument("--base-url", default=None)
-    parser.add_argument("--token", default=None)
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--token", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
-    if not args.base_url:
+    if not args.base_url.strip():
         raise SystemExit("Missing --base-url")
-    if not args.token:
+    if not args.token.strip():
         raise SystemExit("Missing --token")
 
     targets = load_scim_targets(args.terminations)
@@ -75,14 +81,13 @@ def main() -> int:
         for resource in resources:
             active = resource.get("active", True)
             if active is False:
+                meta = resource.get("meta") if isinstance(resource.get("meta"), dict) else {}
                 events.append(
                     {
                         "action": "external_identity.deprovision",
                         "user": resource.get("userName", user_name),
                         "actor": "scim-service",
-                        "created_at": resource.get("meta", {}).get("lastModified", now)
-                        if isinstance(resource.get("meta"), dict)
-                        else now,
+                        "created_at": meta.get("lastModified", now),
                         "active": False,
                         "synthetic": False,
                     }
