@@ -1,26 +1,9 @@
-name: PS-04 Enterprise Evidence Pipeline
+name: PS-04 Enterprise Evidence Pipeline (Streaming)
 
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Evidence mode"
-        type: choice
-        required: false
-        default: live
-        options:
-          - live
-          - test
-      sla_minutes:
-        description: "PS-04 SLA in minutes"
-        required: false
-        default: "60"
-      terminations_source:
-        description: "Path to termination source CSV"
-        required: false
-        default: "data/terminations_source.csv"
 
 permissions:
   contents: read
@@ -30,154 +13,69 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      MODE: ${{ github.event.inputs.mode || 'live' }}
-      SLA_MINUTES: ${{ github.event.inputs.sla_minutes || '60' }}
-      TERMINATIONS_SOURCE: ${{ github.event.inputs.terminations_source || 'data/terminations_source.csv' }}
+      SLA_MINUTES: 60
+
+      TERMINATIONS_SOURCE: data/terminations_source.csv
       TERMINATIONS_FILE: data/terminations.csv
-      ENTERPRISE_AUDIT_LOG_FILE: data/enterprise_audit_log.json
-      SCIM_LOG_FILE: data/scim_log.json
+
+      S3_BUCKET: ${{ secrets.PS04_S3_BUCKET }}
+
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
       OUTPUT_FILE: ps04_report.json
 
-      GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
-      GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
-
-      SCIM_BEARER_TOKEN: ${{ secrets.SCIM_BEARER_TOKEN }}
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11.8"
 
       - name: Install dependencies
-        shell: bash
+        run: pip install boto3
+
+      # 🔹 Build dataset
+      - name: Build termination dataset
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install requests==2.31.0
+          python scripts/build_terminations_csv.py \
+            --source "$TERMINATIONS_SOURCE" \
+            --output "$TERMINATIONS_FILE"
 
-      - name: Precheck
-        shell: bash
+      # 🔹 Pull latest audit evidence from S3
+      - name: Fetch latest audit log from S3
         run: |
           set -euo pipefail
-
-          test -f scripts/build_terminations_csv.py || { echo "Missing scripts/build_terminations_csv.py"; exit 1; }
-          test -f scripts/github_ps04_checker.py || { echo "Missing scripts/github_ps04_checker.py"; exit 1; }
-          test -f scripts/fetch_github_audit_logs.py || { echo "Missing scripts/fetch_github_audit_logs.py"; exit 1; }
-          test -f scripts/fetch_scim_snapshot.py || { echo "Missing scripts/fetch_scim_snapshot.py"; exit 1; }
-          test -f scripts/ps04_seed_test_evidence.py || { echo "Missing scripts/ps04_seed_test_evidence.py"; exit 1; }
 
           mkdir -p data
 
-          if [ ! -f "$TERMINATIONS_SOURCE" ] && [ -z "${TERMINATIONS_JSON:-}" ]; then
-            echo "Missing termination source file at $TERMINATIONS_SOURCE"
-            echo "Commit data/terminations_source.csv or pass terminations JSON."
+          LATEST=$(aws s3 ls s3://$S3_BUCKET/ps04/ | sort | tail -n 1 | awk '{print $4}')
+
+          if [ -z "$LATEST" ]; then
+            echo "No audit logs found in S3"
             exit 1
           fi
 
-      - name: Build termination dataset
-        shell: bash
-        run: |
-          set -euo pipefail
+          aws s3 cp s3://$S3_BUCKET/ps04/$LATEST data/enterprise_audit_log.json
 
-          if [ -n "${TERMINATIONS_JSON:-}" ]; then
-            python scripts/build_terminations_csv.py \
-              --output "$TERMINATIONS_FILE" \
-              --default-deadline-minutes "$SLA_MINUTES"
-          else
-            python scripts/build_terminations_csv.py \
-              --source "$TERMINATIONS_SOURCE" \
-              --output "$TERMINATIONS_FILE" \
-              --default-deadline-minutes "$SLA_MINUTES"
-          fi
-
-      - name: Seed test evidence
-        shell: bash
-        if: env.MODE == 'test'
-        run: |
-          set -euo pipefail
-          python scripts/ps04_seed_test_evidence.py \
-            --terminations "$TERMINATIONS_FILE" \
-            --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
-            --scim-log "$SCIM_LOG_FILE"
-
-      - name: Fetch live GitHub audit logs
-        shell: bash
-        if: env.MODE == 'live'
-        run: |
-          set -euo pipefail
-          python scripts/fetch_github_audit_logs.py \
-            --enterprise "$GH_ENTERPRISE_SLUG" \
-            --token "$GH_AUDIT_TOKEN" \
-            --output "$ENTERPRISE_AUDIT_LOG_FILE"
-
-      - name: Validate live SCIM configuration
-        shell: bash
-        if: env.MODE == 'live'
-        run: |
-          set -euo pipefail
-
-          python - <<'PY'
-          import csv
-          import os
-          import sys
-          from pathlib import Path
-
-          rows = list(csv.DictReader(Path("data/terminations.csv").open(newline="", encoding="utf-8")))
-          needs_scim = any(r.get("evidence_source") == "scim_log" for r in rows)
-
-          if needs_scim and not os.getenv("SCIM_BEARER_TOKEN"):
-              print("SCIM_BEARER_TOKEN is required for scim_log rows in live mode.", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"Live mode SCIM check: needs_scim={needs_scim}")
-          PY
-
-      - name: Fetch live SCIM evidence
-        shell: bash
-        if: env.MODE == 'live'
-        run: |
-          set -euo pipefail
-          python scripts/fetch_scim_snapshot.py \
-            --terminations "$TERMINATIONS_FILE" \
-            --enterprise "$GH_ENTERPRISE_SLUG" \
-            --token "$SCIM_BEARER_TOKEN" \
-            --output "$SCIM_LOG_FILE"
-
-      - name: Show evidence files
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== enterprise_audit_log.json ==="
-          [ -f "$ENTERPRISE_AUDIT_LOG_FILE" ] && cat "$ENTERPRISE_AUDIT_LOG_FILE" || true
-          echo
-          echo "=== scim_log.json ==="
-          [ -f "$SCIM_LOG_FILE" ] && cat "$SCIM_LOG_FILE" || true
-
+      # 🔹 Run checker
       - name: Run PS-04 checker
-        shell: bash
         run: |
           set -euo pipefail
+
           python scripts/github_ps04_checker.py \
             --terminations "$TERMINATIONS_FILE" \
-            --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
-            --scim-log "$SCIM_LOG_FILE" \
+            --enterprise-audit-log data/enterprise_audit_log.json \
             --sla-minutes "$SLA_MINUTES" \
             --fail-on-gaps \
             --output "$OUTPUT_FILE"
 
-      - name: Hash evidence
-        shell: bash
-        run: |
-          set -euo pipefail
-          sha256sum "$TERMINATIONS_FILE" "$ENTERPRISE_AUDIT_LOG_FILE" "$SCIM_LOG_FILE" "$OUTPUT_FILE"
+      - name: Show report
+        run: cat ps04_report.json
 
-      - name: Upload report
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ps04-report
           path: ps04_report.json
-          retention-days: 90
