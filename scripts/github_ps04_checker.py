@@ -108,15 +108,7 @@ def parse_actions(value: str) -> List[str]:
 
 
 def event_time(event: Dict[str, Any]) -> Optional[datetime]:
-    for key in ("created_at", "@timestamp", "published", "meta.lastModified"):
-        if key == "meta.lastModified":
-            meta = event.get("meta")
-            if isinstance(meta, dict) and meta.get("lastModified"):
-                try:
-                    return parse_utc_datetime(str(meta["lastModified"]))
-                except Exception:
-                    pass
-            continue
+    for key in ("created_at", "@timestamp", "published"):
         value = event.get(key)
         if not value:
             continue
@@ -127,6 +119,12 @@ def event_time(event: Dict[str, Any]) -> Optional[datetime]:
             return parse_utc_datetime(str(value))
         except Exception:
             continue
+    meta = event.get("meta")
+    if isinstance(meta, dict) and meta.get("lastModified"):
+        try:
+            return parse_utc_datetime(str(meta["lastModified"]))
+        except Exception:
+            return None
     return None
 
 
