@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Fetch GitHub SCIM-derived deprovision evidence for Enterprise Managed Users.
+Fetch GitHub SCIM-derived evidence for Enterprise Managed Users.
 
-This collector talks directly to GitHub's Enterprise Managed Users SCIM REST API.
+This collector talks directly to GitHub's enterprise-scoped SCIM REST API:
+    /scim/v2/enterprises/{enterprise}/Users
 
-GitHub SCIM API facts:
-- Base URL: https://api.github.com/scim/v2/enterprises/{enterprise}/
-- Users endpoint: .../Users
-- Authentication: classic PAT for the enterprise setup user with scim:enterprise
-- User-Agent header is required
-- For GHE.com, use api.SUBDOMAIN.ghe.com instead of api.github.com
+Authentication:
+- classic PAT for the enterprise setup user with scim:enterprise
+- User-Agent header required
+- For GHE.com, set --api-base appropriately (default is https://api.github.com)
+
+GitHub SCIM is the EMU lifecycle path; the enterprise audit log is a separate feed.
 """
 
 from __future__ import annotations
@@ -17,13 +18,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import requests
-
 
 DEFAULT_API_BASE = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
@@ -33,27 +32,10 @@ def format_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def parse_utc_datetime(value: str) -> datetime:
-    raw = value.strip()
-    if not raw:
-        raise ValueError("empty datetime value")
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 def load_scim_targets(terminations: Path) -> List[Dict[str, str]]:
     with terminations.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     return [row for row in rows if (row.get("evidence_source") or "").strip() == "scim_log"]
-
-
-def build_users_url(api_base: str, enterprise: str) -> str:
-    base = api_base.rstrip("/")
-    return f"{base}/scim/v2/enterprises/{enterprise}/Users"
 
 
 def extract_resources(payload: Any) -> List[Dict[str, Any]]:
@@ -66,13 +48,12 @@ def extract_resources(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def fetch_scim_users(
-    api_base: str,
-    enterprise: str,
-    token: str,
-    user_name: str,
-    timeout_seconds: int = 60,
-) -> List[Dict[str, Any]]:
+def build_users_url(api_base: str, enterprise: str) -> str:
+    base = api_base.rstrip("/")
+    return f"{base}/scim/v2/enterprises/{enterprise}/Users"
+
+
+def fetch_scim_users(api_base: str, enterprise: str, token: str, user_name: str) -> List[Dict[str, Any]]:
     url = build_users_url(api_base, enterprise)
     headers = {
         "Accept": "application/scim+json",
@@ -86,7 +67,7 @@ def fetch_scim_users(
         "count": 100,
     }
 
-    resp = requests.get(url, headers=headers, params=params, timeout=timeout_seconds)
+    resp = requests.get(url, headers=headers, params=params, timeout=60)
 
     if resp.status_code == 401:
         raise SystemExit(
@@ -101,7 +82,7 @@ def fetch_scim_users(
     if resp.status_code == 404:
         raise SystemExit(
             "GitHub SCIM endpoint not found (404). "
-            "Check that --enterprise is the enterprise slug and that --api-base is correct. "
+            "Check the enterprise slug and the API base. "
             "For Enterprise Managed Users, the URL must be /scim/v2/enterprises/{enterprise}/Users."
         )
 
