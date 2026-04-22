@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Build data/terminations.csv from a source CSV/JSON/JSONL file or from
-TERMINATIONS_JSON.
+Build data/terminations.csv from source data or TERMINATIONS_JSON.
 
 Expected source fields:
 - employee_id
@@ -11,10 +10,6 @@ Expected source fields:
 - evidence_source
 - expected_actions
 - deadline_minutes
-
-Valid evidence_source values:
-- enterprise_audit_log
-- scim_log
 """
 
 from __future__ import annotations
