@@ -41,7 +41,6 @@ jobs:
       GH_ENTERPRISE_SLUG: ${{ secrets.GH_ENTERPRISE_SLUG }}
       GH_AUDIT_TOKEN: ${{ secrets.GH_AUDIT_TOKEN }}
 
-      SCIM_BASE_URL: ${{ secrets.SCIM_BASE_URL }}
       SCIM_BEARER_TOKEN: ${{ secrets.SCIM_BEARER_TOKEN }}
 
     steps:
@@ -105,6 +104,16 @@ jobs:
             --enterprise-audit-log "$ENTERPRISE_AUDIT_LOG_FILE" \
             --scim-log "$SCIM_LOG_FILE"
 
+      - name: Fetch live GitHub audit logs
+        shell: bash
+        if: env.MODE == 'live'
+        run: |
+          set -euo pipefail
+          python scripts/fetch_github_audit_logs.py \
+            --enterprise "$GH_ENTERPRISE_SLUG" \
+            --token "$GH_AUDIT_TOKEN" \
+            --output "$ENTERPRISE_AUDIT_LOG_FILE"
+
       - name: Validate live SCIM configuration
         shell: bash
         if: env.MODE == 'live'
@@ -120,25 +129,12 @@ jobs:
           rows = list(csv.DictReader(Path("data/terminations.csv").open(newline="", encoding="utf-8")))
           needs_scim = any(r.get("evidence_source") == "scim_log" for r in rows)
 
-          if needs_scim and (not os.getenv("SCIM_BASE_URL") or not os.getenv("SCIM_BEARER_TOKEN")):
-              print(
-                  "SCIM_BASE_URL and SCIM_BEARER_TOKEN are required for scim_log rows in live mode.",
-                  file=sys.stderr,
-              )
+          if needs_scim and not os.getenv("SCIM_BEARER_TOKEN"):
+              print("SCIM_BEARER_TOKEN is required for scim_log rows in live mode.", file=sys.stderr)
               sys.exit(1)
 
           print(f"Live mode SCIM check: needs_scim={needs_scim}")
           PY
-
-      - name: Fetch live GitHub audit logs
-        shell: bash
-        if: env.MODE == 'live'
-        run: |
-          set -euo pipefail
-          python scripts/fetch_github_audit_logs.py \
-            --enterprise "$GH_ENTERPRISE_SLUG" \
-            --token "$GH_AUDIT_TOKEN" \
-            --output "$ENTERPRISE_AUDIT_LOG_FILE"
 
       - name: Fetch live SCIM evidence
         shell: bash
@@ -147,7 +143,7 @@ jobs:
           set -euo pipefail
           python scripts/fetch_scim_snapshot.py \
             --terminations "$TERMINATIONS_FILE" \
-            --base-url "$SCIM_BASE_URL" \
+            --enterprise "$GH_ENTERPRISE_SLUG" \
             --token "$SCIM_BEARER_TOKEN" \
             --output "$SCIM_LOG_FILE"
 
