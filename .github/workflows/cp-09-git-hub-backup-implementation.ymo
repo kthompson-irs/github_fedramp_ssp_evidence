@@ -1,0 +1,127 @@
+# =========================
+# GitHub Actions Workflow: cp09-backup.yml
+# =========================
+name: CP-09 Repository Backup
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install boto3
+
+      - name: Run Backup Script
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          KMS_KEY_ID: ${{ secrets.KMS_KEY_ID }}
+        run: |
+          python backup.py
+
+# =========================
+# Python Script: backup.py
+# =========================
+
+import os
+import subprocess
+import hashlib
+import tarfile
+import boto3
+from datetime import datetime
+
+REPO = os.getenv("GITHUB_REPOSITORY")
+BUCKET = os.getenv("S3_BUCKET")
+REGION = os.getenv("AWS_REGION")
+KMS_KEY = os.getenv("KMS_KEY_ID")
+
+TIMESTAMP = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+BACKUP_NAME = f"backup-{REPO.replace('/', '-')}-{TIMESTAMP}"
+ARCHIVE = f"{BACKUP_NAME}.tar.gz"
+HASH_FILE = f"{ARCHIVE}.sha256"
+
+
+def run_command(cmd):
+    result = subprocess.run(cmd, shell=True, check=True, capture_output=True)
+    return result.stdout.decode()
+
+
+def create_backup():
+    print("[+] Creating mirror clone...")
+    run_command(f"git clone --mirror https://github.com/{REPO}.git {BACKUP_NAME}.git")
+
+    print("[+] Compressing backup...")
+    with tarfile.open(ARCHIVE, "w:gz") as tar:
+        tar.add(f"{BACKUP_NAME}.git")
+
+
+def generate_hash():
+    print("[+] Generating SHA-256 hash...")
+    sha256 = hashlib.sha256()
+    with open(ARCHIVE, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256.update(chunk)
+
+    digest = sha256.hexdigest()
+    with open(HASH_FILE, "w") as f:
+        f.write(f"{digest}  {ARCHIVE}\n")
+
+    return digest
+
+
+def upload_to_s3():
+    print("[+] Uploading to S3...")
+    s3 = boto3.client("s3", region_name=REGION)
+
+    key_prefix = f"github-backups/{REPO}/{TIMESTAMP}/"
+
+    s3.upload_file(
+        ARCHIVE,
+        BUCKET,
+        key_prefix + ARCHIVE,
+        ExtraArgs={
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": KMS_KEY
+        }
+    )
+
+    s3.upload_file(
+        HASH_FILE,
+        BUCKET,
+        key_prefix + HASH_FILE,
+        ExtraArgs={
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": KMS_KEY
+        }
+    )
+
+    print(f"[+] Backup uploaded to s3://{BUCKET}/{key_prefix}")
+
+
+def main():
+    create_backup()
+    generate_hash()
+    upload_to_s3()
+    print("[+] CP-09 backup completed successfully")
+
+
+if __name__ == "__main__":
+    main()
