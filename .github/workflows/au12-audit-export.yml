@@ -54,7 +54,7 @@ jobs:
           sudo apt-get install -y jq
 
       ######################################################################
-      # VALIDATE TOKEN
+      # VALIDATE TOKEN AND HOST
       ######################################################################
 
       - name: Validate GitHub authentication
@@ -75,7 +75,7 @@ jobs:
 
           echo "Validating GitHub authentication against ${GH_HOST}..."
 
-          if ! gh auth status; then
+          if ! gh auth status --hostname "${GH_HOST}"; then
             echo "ERROR: GitHub authentication failed."
             echo "Possible causes:"
             echo " - invalid PAT"
@@ -90,10 +90,17 @@ jobs:
 
           echo "Authentication validated."
 
+          echo "Testing authenticated user endpoint..."
+          if ! gh api --hostname "${GH_HOST}" /user >/dev/null; then
+            echo "ERROR: Token authenticated, but /user request failed."
+            exit 1
+          fi
+
           echo "Testing enterprise access..."
-          if ! gh api "/enterprises/${ENTERPRISE_SLUG}" >/dev/null; then
+          if ! gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}" >/dev/null; then
             echo "ERROR: Token authenticated, but enterprise access failed."
             echo "Verify that the token owner is an Enterprise Owner or has audit-log admin access."
+            echo "Also verify the token is SSO-authorized for the enterprise."
             exit 1
           fi
 
@@ -150,6 +157,7 @@ jobs:
           echo "Window: ${SINCE} -> ${UNTIL}"
 
           gh api \
+            --hostname "${GH_HOST}" \
             -H "Accept: application/vnd.github+json" \
             "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
             > "${OUTFILE}"
@@ -180,6 +188,7 @@ jobs:
             OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
 
             gh api \
+              --hostname "${GH_HOST}" \
               -H "Accept: application/vnd.github+json" \
               "/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
               > "${OUTFILE}"
