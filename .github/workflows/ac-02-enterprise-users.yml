@@ -28,7 +28,7 @@ permissions:
 jobs:
   inventory-users:
     name: Inventory enterprise organization users
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 120
 
     env:
@@ -36,7 +36,6 @@ jobs:
       ENTERPRISE_SLUG: ${{ github.event.inputs.enterprise_slug || 'internal-revenue-service' }}
       OUTPUT_DIR: ${{ github.event.inputs.output_dir || 'artifacts/enterprise-users' }}
       MAX_ORGS: ${{ github.event.inputs.max_orgs || '0' }}
-      GITHUB_API_VERSION: "2026-03-10"
 
     steps:
       - name: Checkout repository
@@ -60,6 +59,16 @@ jobs:
             echo "Missing required secret: GH_ENTERPRISE_TOKEN"
             exit 1
           fi
+
+      - name: Show run context
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Enterprise slug: ${ENTERPRISE_SLUG}"
+          echo "Repository: ${GITHUB_REPOSITORY}"
+          echo "Actor: ${GITHUB_ACTOR}"
+          echo "Triggered by: ${GITHUB_TRIGGERING_ACTOR}"
+          echo "Runner: ${RUNNER_NAME} (${RUNNER_OS}/${RUNNER_ARCH})"
 
       - name: Run enterprise user inventory
         shell: bash
