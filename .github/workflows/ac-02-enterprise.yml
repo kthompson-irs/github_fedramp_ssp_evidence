@@ -15,6 +15,14 @@ on:
         description: "Optional extra vars in JSON format"
         required: false
         default: "{}"
+      enterprise_slug:
+        description: "GitHub.com enterprise slug"
+        required: false
+        default: "internal-revenue-service"
+      show_user_data:
+        description: "Capture GitHub user/context data in the evidence artifact"
+        required: false
+        default: "true"
   schedule:
     - cron: "0 3 * * 1"
 
@@ -35,6 +43,7 @@ jobs:
       ANSIBLE_FORCE_COLOR: "true"
       ANSIBLE_HOST_KEY_CHECKING: "false"
       PYTHONUNBUFFERED: "1"
+      GITHUB_ENTERPRISE_SLUG: ${{ github.event.inputs.enterprise_slug || 'internal-revenue-service' }}
 
     steps:
       - name: Checkout repository
@@ -75,6 +84,47 @@ jobs:
             printf '%s' "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
             chmod 600 .vault_pass
           fi
+
+      - name: Capture GitHub user context for evidence
+        if: ${{ github.event.inputs.show_user_data == 'true' || github.event.inputs.show_user_data == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifacts/ac-02
+
+          cat > artifacts/ac-02/github-user-context.json <<EOF
+          {
+            "enterprise_slug": "${GITHUB_ENTERPRISE_SLUG}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "repository_owner": "${GITHUB_REPOSITORY_OWNER}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "event_name": "${GITHUB_EVENT_NAME}",
+            "actor": "${GITHUB_ACTOR}",
+            "actor_id": "${GITHUB_ACTOR_ID}",
+            "triggering_actor": "${GITHUB_TRIGGERING_ACTOR}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_number": "${GITHUB_RUN_NUMBER}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "server_url": "${GITHUB_SERVER_URL}",
+            "ref": "${GITHUB_REF}",
+            "sha": "${GITHUB_SHA}",
+            "runner_name": "${RUNNER_NAME}",
+            "runner_os": "${RUNNER_OS}",
+            "runner_arch": "${RUNNER_ARCH}"
+          }
+          EOF
+
+          {
+            echo "### GitHub user context"
+            echo ""
+            echo "- Enterprise slug: \`${GITHUB_ENTERPRISE_SLUG}\`"
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Actor: \`${GITHUB_ACTOR}\`"
+            echo "- Triggering actor: \`${GITHUB_TRIGGERING_ACTOR}\`"
+            echo "- Event: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Run: \`${GITHUB_RUN_ID}\` / \`${GITHUB_RUN_NUMBER}\` / attempt \`${GITHUB_RUN_ATTEMPT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run AC-02 enterprise playbook
         shell: bash
