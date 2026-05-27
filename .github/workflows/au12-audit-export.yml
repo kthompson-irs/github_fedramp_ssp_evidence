@@ -28,12 +28,15 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GH_HOST: github.com
+      # Use github.com for GitHub Enterprise Cloud on the commercial cloud.
+      # Use ghe.com if your deployment is GitHub Government Cloud.
+      GH_HOST: ${{ secrets.GH_HOST || 'github.com' }}
+
       ENTERPRISE_SLUG: internal-revenue-service
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
 
-      # REQUIRED SECRET
+      # REQUIRED SECRET: PAT Classic with audit-log access and the right enterprise permissions
       GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
 
       # OPTIONAL
@@ -44,7 +47,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq
 
@@ -52,7 +57,7 @@ jobs:
       # VALIDATE TOKEN
       ######################################################################
 
-      - name: Validate GitHub token
+      - name: Validate GitHub authentication
         shell: bash
         run: |
           set -euo pipefail
@@ -63,16 +68,45 @@ jobs:
             exit 1
           fi
 
-          echo "Validating GitHub authentication..."
+          if [ -z "${GH_HOST:-}" ]; then
+            echo "ERROR: GH_HOST is empty."
+            exit 1
+          fi
 
-          gh auth status
+          echo "Validating GitHub authentication against ${GH_HOST}..."
+
+          if ! gh auth status; then
+            echo "ERROR: GitHub authentication failed."
+            echo "Possible causes:"
+            echo " - invalid PAT"
+            echo " - expired PAT"
+            echo " - PAT Classic required"
+            echo " - missing read:audit_log scope"
+            echo " - SSO authorization missing"
+            echo " - insufficient enterprise permissions"
+            echo " - incorrect GH_HOST value for your cloud"
+            exit 1
+          fi
+
+          echo "Authentication validated."
+
+          echo "Testing enterprise access..."
+          if ! gh api "/enterprises/${ENTERPRISE_SLUG}" >/dev/null; then
+            echo "ERROR: Token authenticated, but enterprise access failed."
+            echo "Verify that the token owner is an Enterprise Owner or has audit-log admin access."
+            exit 1
+          fi
+
+          echo "Enterprise access verified."
 
       ######################################################################
       # PREPARE OUTPUT
       ######################################################################
 
       - name: Prepare output directories
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out/raw
           mkdir -p out/normalized
           mkdir -p out/summaries
@@ -88,15 +122,13 @@ jobs:
           set -euo pipefail
 
           if [ "${ORG_SCOPE}" = "ALL" ]; then
-            # Replace with actual organizations
+            # Replace with the actual authoritative enterprise organization inventory.
             ORG_LIST="platform,applications,security,data,operations,sandbox"
           else
             ORG_LIST="${ORG_SCOPE}"
           fi
 
-          echo "Organizations:"
-          echo "${ORG_LIST}"
-
+          echo "Organizations to export: ${ORG_LIST}"
           echo "org_list=${ORG_LIST}" >> "$GITHUB_OUTPUT"
 
       ######################################################################
@@ -122,7 +154,7 @@ jobs:
             "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
             > "${OUTFILE}"
 
-          echo "Enterprise audit export completed."
+          echo "Enterprise audit export completed: ${OUTFILE}"
 
       ######################################################################
       # EXPORT ORGANIZATION AUDIT LOGS
@@ -139,7 +171,6 @@ jobs:
           IFS=',' read -ra ORGS <<< "${{ steps.orgs.outputs.org_list }}"
 
           for ORG in "${ORGS[@]}"; do
-
             ORG_TRIMMED=$(echo "$ORG" | xargs)
 
             [ -z "$ORG_TRIMMED" ] && continue
@@ -153,6 +184,7 @@ jobs:
               "/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
               > "${OUTFILE}"
 
+            echo "Org audit export completed: ${OUTFILE}"
           done
 
       ######################################################################
@@ -178,9 +210,7 @@ jobs:
           rows = []
 
           with detail_path.open('w', encoding='utf-8') as detail:
-
               for file in raw_files:
-
                   source = Path(file).stem
 
                   try:
@@ -192,12 +222,8 @@ jobs:
                       data = [data]
 
                   for item in data:
-
                       item['_source_file'] = source
-
-                      detail.write(
-                          json.dumps(item, sort_keys=True) + '\n'
-                      )
+                      detail.write(json.dumps(item, sort_keys=True) + '\n')
 
                       rows.append({
                           'source_file': source,
@@ -208,17 +234,9 @@ jobs:
                           'created_at': item.get('created_at', '')
                       })
 
-          summary_path.parent.mkdir(
-              parents=True,
-              exist_ok=True
-          )
+          summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-          with summary_path.open(
-              'w',
-              newline='',
-              encoding='utf-8'
-          ) as f:
-
+          with summary_path.open('w', newline='', encoding='utf-8') as f:
               writer = csv.DictWriter(
                   f,
                   fieldnames=[
@@ -230,7 +248,6 @@ jobs:
                       'created_at'
                   ]
               )
-
               writer.writeheader()
               writer.writerows(rows)
 
@@ -272,5 +289,4 @@ jobs:
         run: |
           echo "Archive repository configured:"
           echo "${AUDIT_ARCHIVE_REPO}"
-
           echo "Integrate SIEM or evidence archive here."
