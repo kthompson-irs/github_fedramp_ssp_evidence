@@ -1,0 +1,170 @@
+---
+- name: Validate AC-02 variables
+  ansible.builtin.assert:
+    that:
+      - ac02_control_id is defined
+      - ac02_review_id is defined
+      - ac02_reviewed_by is defined
+      - ac02_review_scope is defined
+      - ac02_remote_evidence_dir is defined
+      - ac02_remote_evidence_file is defined
+      - ac02_controller_host_dir is defined
+      - ac02_managed_accounts is defined
+      - ac02_managed_accounts is iterable
+    quiet: true
+    fail_msg: "AC-02 variables are missing or invalid."
+
+- name: Ensure remote evidence directory exists
+  ansible.builtin.file:
+    path: "{{ ac02_remote_evidence_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Capture pre-change passwd database
+  ansible.builtin.getent:
+    database: passwd
+  register: ac02_pre_passwd_getent
+
+- name: Capture pre-change group database
+  ansible.builtin.getent:
+    database: group
+  register: ac02_pre_group_getent
+
+- name: Capture account-related file metadata
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /etc/passwd
+    - /etc/shadow
+    - /etc/group
+    - /etc/sudoers
+  register: ac02_critical_stats
+
+- name: Check whether sudoers.d exists
+  ansible.builtin.stat:
+    path: /etc/sudoers.d
+  register: ac02_sudoers_dir
+
+- name: Find sudoers fragments
+  ansible.builtin.find:
+    paths: /etc/sudoers.d
+    file_type: file
+    recurse: false
+  register: ac02_sudoers_d
+  when: ac02_sudoers_dir.stat.exists | default(false)
+
+- name: Build approved account name list
+  ansible.builtin.set_fact:
+    ac02_approved_account_names: "{{ ac02_managed_accounts | map(attribute='name') | list }}"
+
+- name: Assert service accounts use non-interactive shells
+  ansible.builtin.assert:
+    that:
+      - not (item.system | default(false) | bool) or (item.shell | default('/usr/sbin/nologin')) in ac02_noninteractive_shells
+    quiet: true
+    fail_msg: "Service account {{ item.name }} must use a non-interactive shell."
+  loop: "{{ ac02_managed_accounts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.state | default('present') == 'present'
+    - item.system | default(false) | bool
+
+- name: Apply approved account states
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    state: "{{ item.state | default('present') }}"
+    groups: "{{ item.groups | default(omit) }}"
+    append: "{{ item.append | default(omit) }}"
+    shell: "{{ item.shell | default(omit) }}"
+    create_home: "{{ item.create_home | default(omit) }}"
+    system: "{{ item.system | default(omit) }}"
+    comment: "{{ item.comment | default(omit) }}"
+    password_lock: "{{ item.password_lock | default(omit) }}"
+    expires: "{{ item.expires | default(omit) }}"
+  loop: "{{ ac02_managed_accounts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: ac02_user_results
+
+- name: Capture post-change passwd database
+  ansible.builtin.getent:
+    database: passwd
+  register: ac02_post_passwd_getent
+
+- name: Capture post-change group database
+  ansible.builtin.getent:
+    database: group
+  register: ac02_post_group_getent
+
+- name: Identify local accounts on the host
+  ansible.builtin.set_fact:
+    ac02_passwd_entries: "{{ ac02_post_passwd_getent.ansible_facts.getent_passwd | default({}) }}"
+    ac02_local_account_names: "{{ ac02_post_passwd_getent.ansible_facts.getent_passwd | default({}) | list }}"
+    ac02_managed_present_accounts: "{{ ac02_managed_accounts | selectattr('state', 'equalto', 'present') | map(attribute='name') | list }}"
+    ac02_managed_absent_accounts: "{{ ac02_managed_accounts | selectattr('state', 'equalto', 'absent') | map(attribute='name') | list }}"
+
+- name: Identify unmanaged local human/service accounts
+  ansible.builtin.set_fact:
+    ac02_unmanaged_local_accounts: >-
+      {{
+        ac02_passwd_entries
+        | dict2items
+        | selectattr('value.2', 'defined')
+        | selectattr('value.2', 'ge', ac02_review_uid_floor | int)
+        | map(attribute='key')
+        | reject('in', ac02_approved_account_names)
+        | list
+      }}
+
+- name: Build AC-02 evidence payload
+  ansible.builtin.set_fact:
+    ac02_evidence:
+      control_id: "{{ ac02_control_id }}"
+      control_name: "{{ ac02_control_name }}"
+      collected_at: "{{ ansible_date_time.iso8601 }}"
+      host: "{{ inventory_hostname }}"
+      fqdn: "{{ ansible_facts.fqdn | default(inventory_hostname) }}"
+      os: "{{ ansible_facts.distribution | default('unknown') }} {{ ansible_facts.distribution_version | default('unknown') }}"
+      review_id: "{{ ac02_review_id }}"
+      reviewed_by: "{{ ac02_reviewed_by }}"
+      review_scope: "{{ ac02_review_scope }}"
+      approved_accounts: "{{ ac02_managed_accounts }}"
+      approved_account_names: "{{ ac02_approved_account_names }}"
+      noninteractive_shells: "{{ ac02_noninteractive_shells }}"
+      passwd_before: "{{ ac02_pre_passwd_getent.ansible_facts.getent_passwd | default({}) }}"
+      group_before: "{{ ac02_pre_group_getent.ansible_facts.getent_group | default({}) }}"
+      passwd_after: "{{ ac02_post_passwd_getent.ansible_facts.getent_passwd | default({}) }}"
+      group_after: "{{ ac02_post_group_getent.ansible_facts.getent_group | default({}) }}"
+      critical_file_stats: "{{ ac02_critical_stats.results | default([]) }}"
+      sudoers_directory_exists: "{{ ac02_sudoers_dir.stat.exists | default(false) }}"
+      sudoers_fragment_paths: "{{ ac02_sudoers_d.files | default([]) | map(attribute='path') | list }}"
+      account_change_results: "{{ ac02_user_results.results | default([]) }}"
+      unmanaged_local_accounts: "{{ ac02_unmanaged_local_accounts | default([]) }}"
+      managed_present_accounts: "{{ ac02_managed_present_accounts | default([]) }}"
+      managed_absent_accounts: "{{ ac02_managed_absent_accounts | default([]) }}"
+      summary:
+        total_approved_accounts: "{{ ac02_managed_accounts | length }}"
+        total_account_changes: "{{ ac02_user_results.results | default([]) | length }}"
+        unmanaged_local_account_count: "{{ ac02_unmanaged_local_accounts | default([]) | length }}"
+
+- name: Write AC-02 evidence file on the target
+  ansible.builtin.copy:
+    dest: "{{ ac02_remote_evidence_file }}"
+    content: "{{ ac02_evidence | to_nice_json }}"
+    mode: "0600"
+
+- name: Create controller host evidence folder for this host
+  ansible.builtin.file:
+    path: "{{ ac02_controller_host_dir }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+  run_once: false
+
+- name: Fetch AC-02 evidence back to the controller
+  ansible.builtin.fetch:
+    src: "{{ ac02_remote_evidence_file }}"
+    dest: "{{ ac02_controller_host_dir }}/{{ inventory_hostname }}/"
+    flat: true
