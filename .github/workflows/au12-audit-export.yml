@@ -3,12 +3,14 @@ name: AU-12 Enterprise Audit Export
 on:
   schedule:
     - cron: '15 2 * * *'
+
   workflow_dispatch:
     inputs:
       org_scope:
         description: 'Comma-separated organization list or ALL'
         required: false
         default: 'ALL'
+
       lookback_days:
         description: 'Number of days to export'
         required: false
@@ -24,131 +26,251 @@ concurrency:
 jobs:
   export-audit-logs:
     runs-on: ubuntu-latest
+
     env:
       GH_HOST: github.com
       ENTERPRISE_SLUG: internal-revenue-service
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
+
+      # REQUIRED SECRET
       GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+
+      # OPTIONAL
       AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install GitHub CLI and tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
-          gh --version
-          jq --version
+
+      ######################################################################
+      # VALIDATE TOKEN
+      ######################################################################
+
+      - name: Validate GitHub token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "ERROR: GH_TOKEN is empty."
+            echo "Configure repository secret: AU12_AUDIT_TOKEN"
+            exit 1
+          fi
+
+          echo "Validating GitHub authentication..."
+
+          gh auth status
+
+      ######################################################################
+      # PREPARE OUTPUT
+      ######################################################################
 
       - name: Prepare output directories
         run: |
-          mkdir -p out/raw out/normalized out/summaries
+          mkdir -p out/raw
+          mkdir -p out/normalized
+          mkdir -p out/summaries
+
+      ######################################################################
+      # RESOLVE ORGANIZATION LIST
+      ######################################################################
 
       - name: Resolve organization list
         id: orgs
         shell: bash
         run: |
           set -euo pipefail
+
           if [ "${ORG_SCOPE}" = "ALL" ]; then
-            # Replace this list with the authoritative enterprise org inventory.
+            # Replace with actual organizations
             ORG_LIST="platform,applications,security,data,operations,sandbox"
           else
             ORG_LIST="${ORG_SCOPE}"
           fi
+
+          echo "Organizations:"
+          echo "${ORG_LIST}"
+
           echo "org_list=${ORG_LIST}" >> "$GITHUB_OUTPUT"
+
+      ######################################################################
+      # EXPORT ENTERPRISE AUDIT LOG
+      ######################################################################
 
       - name: Export enterprise audit log
         shell: bash
         run: |
           set -euo pipefail
+
           SINCE=$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)
           UNTIL=$(date -u +%F)
+
           OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
+
+          echo "Exporting enterprise audit logs..."
+          echo "Enterprise: ${ENTERPRISE_SLUG}"
+          echo "Window: ${SINCE} -> ${UNTIL}"
 
           gh api \
             -H "Accept: application/vnd.github+json" \
             "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-            > "$OUTFILE"
+            > "${OUTFILE}"
+
+          echo "Enterprise audit export completed."
+
+      ######################################################################
+      # EXPORT ORGANIZATION AUDIT LOGS
+      ######################################################################
 
       - name: Export organization audit logs
         shell: bash
         run: |
           set -euo pipefail
+
           SINCE=$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)
           UNTIL=$(date -u +%F)
 
           IFS=',' read -ra ORGS <<< "${{ steps.orgs.outputs.org_list }}"
+
           for ORG in "${ORGS[@]}"; do
+
             ORG_TRIMMED=$(echo "$ORG" | xargs)
+
             [ -z "$ORG_TRIMMED" ] && continue
+
+            echo "Exporting org audit log: ${ORG_TRIMMED}"
+
             OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
 
             gh api \
               -H "Accept: application/vnd.github+json" \
               "/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-              > "$OUTFILE"
+              > "${OUTFILE}"
+
           done
+
+      ######################################################################
+      # NORMALIZE DATA
+      ######################################################################
 
       - name: Normalize audit data
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import json, os, glob, csv
+          import json
+          import glob
+          import csv
           from pathlib import Path
 
           raw_files = sorted(glob.glob('out/raw/*.json'))
+
           summary_path = Path('out/summaries/au12-summary.csv')
           detail_path = Path('out/normalized/au12-normalized.jsonl')
 
           rows = []
+
           with detail_path.open('w', encoding='utf-8') as detail:
+
               for file in raw_files:
+
                   source = Path(file).stem
+
                   try:
                       data = json.loads(Path(file).read_text(encoding='utf-8'))
                   except Exception:
                       data = []
+
                   if isinstance(data, dict):
                       data = [data]
+
                   for item in data:
+
                       item['_source_file'] = source
-                      detail.write(json.dumps(item, sort_keys=True) + '\n')
+
+                      detail.write(
+                          json.dumps(item, sort_keys=True) + '\n'
+                      )
+
                       rows.append({
                           'source_file': source,
                           'action': item.get('action', ''),
                           'actor': item.get('actor', ''),
                           'org': item.get('org', ''),
                           'repo': item.get('repo', ''),
-                          'created_at': item.get('created_at', ''),
-                          'country_code': item.get('actor_location.country_code', ''),
+                          'created_at': item.get('created_at', '')
                       })
 
-          summary_path.parent.mkdir(parents=True, exist_ok=True)
-          with summary_path.open('w', newline='', encoding='utf-8') as f:
-              writer = csv.DictWriter(f, fieldnames=['source_file','action','actor','org','repo','created_at','country_code'])
+          summary_path.parent.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          with summary_path.open(
+              'w',
+              newline='',
+              encoding='utf-8'
+          ) as f:
+
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      'source_file',
+                      'action',
+                      'actor',
+                      'org',
+                      'repo',
+                      'created_at'
+                  ]
+              )
+
               writer.writeheader()
               writer.writerows(rows)
+
+          print("Normalization complete.")
           PY
+
+      ######################################################################
+      # CHECKSUMS
+      ######################################################################
 
       - name: Compute checksums
         shell: bash
         run: |
           set -euo pipefail
-          (cd out && find . -type f | sort | xargs sha256sum) > out/summaries/sha256sums.txt
 
-      - name: Upload workflow artifacts
+          (
+            cd out
+            find . -type f | sort | xargs sha256sum
+          ) > out/summaries/sha256sums.txt
+
+      ######################################################################
+      # UPLOAD ARTIFACTS
+      ######################################################################
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: au12-audit-exports
           path: out/
           retention-days: 90
 
-      - name: Optional archive handoff
+      ######################################################################
+      # OPTIONAL ARCHIVE INTEGRATION
+      ######################################################################
+
+      - name: Archive integration placeholder
         if: env.AUDIT_ARCHIVE_REPO != ''
         shell: bash
         run: |
-          echo "Archive repository target configured: ${AUDIT_ARCHIVE_REPO}"
-          echo "Integrate your approved storage or SIEM handoff here."
+          echo "Archive repository configured:"
+          echo "${AUDIT_ARCHIVE_REPO}"
+
+          echo "Integrate SIEM or evidence archive here."
