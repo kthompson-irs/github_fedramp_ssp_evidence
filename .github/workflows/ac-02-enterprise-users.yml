@@ -1,0 +1,90 @@
+name: Enterprise Organization Users Inventory
+
+on:
+  workflow_dispatch:
+    inputs:
+      enterprise_slug:
+        description: "GitHub.com enterprise slug"
+        required: false
+        default: "internal-revenue-service"
+      output_dir:
+        description: "Directory for generated artifacts"
+        required: false
+        default: "artifacts/enterprise-users"
+      max_orgs:
+        description: "Optional cap on organizations to process"
+        required: false
+        default: "0"
+  schedule:
+    - cron: "0 4 * * 1"
+
+concurrency:
+  group: enterprise-organization-users
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  inventory-users:
+    name: Inventory enterprise organization users
+    runs-on: self-hosted
+    timeout-minutes: 120
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      ENTERPRISE_SLUG: ${{ github.event.inputs.enterprise_slug || 'internal-revenue-service' }}
+      OUTPUT_DIR: ${{ github.event.inputs.output_dir || 'artifacts/enterprise-users' }}
+      MAX_ORGS: ${{ github.event.inputs.max_orgs || '0' }}
+      GITHUB_API_VERSION: "2026-03-10"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Verify token is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.GH_ENTERPRISE_TOKEN }}" ]; then
+            echo "Missing required secret: GH_ENTERPRISE_TOKEN"
+            exit 1
+          fi
+
+      - name: Run enterprise user inventory
+        shell: bash
+        env:
+          GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python scripts/list_enterprise_org_users.py \
+            --enterprise-slug "${ENTERPRISE_SLUG}" \
+            --output-dir "${OUTPUT_DIR}" \
+            --max-orgs "${MAX_ORGS}"
+
+      - name: Write run summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUMMARY_FILE="${OUTPUT_DIR}/summary.md"
+          if [ -f "${SUMMARY_FILE}" ]; then
+            cat "${SUMMARY_FILE}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload enterprise user inventory artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enterprise-organization-users
+          path: artifacts/enterprise-users/
+          if-no-files-found: error
+          retention-days: 30
