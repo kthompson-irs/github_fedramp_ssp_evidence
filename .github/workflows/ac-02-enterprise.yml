@@ -1,0 +1,117 @@
+name: AC-02 Enterprise Account Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      inventory:
+        description: "Ansible inventory file"
+        required: false
+        default: "inventory/enterprise.yml"
+      limit:
+        description: "Optional Ansible --limit"
+        required: false
+        default: "enterprise_linux"
+      extra_vars:
+        description: "Optional extra vars in JSON format"
+        required: false
+        default: "{}"
+  schedule:
+    - cron: "0 3 * * 1"
+
+concurrency:
+  group: ac-02-enterprise
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-ac02:
+    name: Run AC-02 playbook
+    runs-on: self-hosted
+    timeout-minutes: 120
+
+    env:
+      ANSIBLE_FORCE_COLOR: "true"
+      ANSIBLE_HOST_KEY_CHECKING: "false"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible-core
+
+      - name: Prepare SSH configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          if [ -n "${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}" ]; then
+            printf '%s\n' "${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+          fi
+
+          if [ -n "${{ secrets.ANSIBLE_KNOWN_HOSTS }}" ]; then
+            printf '%s\n' "${{ secrets.ANSIBLE_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+          fi
+
+      - name: Prepare Ansible Vault password
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" ]; then
+            printf '%s' "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
+            chmod 600 .vault_pass
+          fi
+
+      - name: Run AC-02 enterprise playbook
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INVENTORY="${{ github.event.inputs.inventory || 'inventory/enterprise.yml' }}"
+          LIMIT="${{ github.event.inputs.limit || 'enterprise_linux' }}"
+          EXTRA_VARS='${{ github.event.inputs.extra_vars || '{}' }}'
+
+          ANSIBLE_CMD=(ansible-playbook
+            -i "${INVENTORY}"
+            "ac_02_enterprise_account_management.yml"
+            --limit "${LIMIT}"
+          )
+
+          if [ -f .vault_pass ]; then
+            ANSIBLE_CMD+=(--vault-password-file .vault_pass)
+          fi
+
+          if [ "${EXTRA_VARS}" != "{}" ]; then
+            ANSIBLE_CMD+=(--extra-vars "${EXTRA_VARS}")
+          fi
+
+          "${ANSIBLE_CMD[@]}"
+
+      - name: Verify evidence artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d artifacts/ac-02
+          find artifacts/ac-02 -maxdepth 3 -type f | sort
+
+      - name: Upload AC-02 evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac-02-evidence
+          path: artifacts/ac-02/
+          if-no-files-found: error
+          retention-days: 30
