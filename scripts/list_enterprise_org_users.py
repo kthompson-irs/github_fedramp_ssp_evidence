@@ -22,14 +22,13 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
 
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 GITHUB_REST_BASE = "https://api.github.com"
-API_VERSION = os.environ.get("GITHUB_API_VERSION", "2026-03-10")
 
 
 @dataclass
@@ -86,10 +85,12 @@ def build_session(token: str) -> requests.Session:
         {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": API_VERSION,
             "Content-Type": "application/json",
         }
     )
+    api_version = os.environ.get("GITHUB_API_VERSION", "").strip()
+    if api_version:
+        session.headers["X-GitHub-Api-Version"] = api_version
     return session
 
 
@@ -119,10 +120,6 @@ def get_enterprise_orgs(
     enterprise_slug: str,
     max_orgs: int = 0,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Returns (enterprise_name, orgs).
-    Each org entry includes login and name.
-    """
     query = """
     query($slug: String!, $after: String) {
       enterprise(slug: $slug) {
@@ -251,7 +248,7 @@ def write_markdown_summary(
     unique_users = sorted({r.user_login for r in records})
 
     lines: List[str] = []
-    lines.append(f"# GitHub Enterprise user inventory")
+    lines.append("# GitHub Enterprise user inventory")
     lines.append("")
     lines.append(f"- Enterprise slug: `{enterprise_slug}`")
     lines.append(f"- Enterprise name: `{enterprise_name}`")
@@ -329,7 +326,6 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             errors.append({"org_login": org_login, "message": str(exc)})
 
-        # light pacing so a large enterprise does not burst the API unnecessarily
         if idx % 10 == 0:
             time.sleep(0.5)
 
