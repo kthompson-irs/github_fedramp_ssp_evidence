@@ -1,0 +1,25 @@
+---
+ac02_managed_accounts:
+  - name: example_service_acct
+    state: present
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    comment: "Approved service account for enterprise application runtime"
+    password_lock: true
+    groups:
+      - exampleapp
+
+  - name: example_admin
+    state: present
+    system: false
+    create_home: true
+    shell: /bin/bash
+    comment: "Approved enterprise administrative user"
+    password_lock: false
+    groups:
+      - wheel
+    append: true
+
+  - name: former_user
+    state: absent
