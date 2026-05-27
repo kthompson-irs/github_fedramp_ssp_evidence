@@ -1,0 +1,106 @@
+---
+- name: Prepare AC-02 controller evidence workspace
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ac02_controller_evidence_root: "{{ playbook_dir }}/artifacts/ac-02"
+    ac02_controller_host_dir: "{{ playbook_dir }}/artifacts/ac-02/hosts"
+    ac02_controller_report_file: "{{ playbook_dir }}/artifacts/ac-02/ac-02-enterprise-summary.json"
+  tasks:
+    - name: Ensure controller evidence directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0750"
+      loop:
+        - "{{ ac02_controller_evidence_root }}"
+        - "{{ ac02_controller_host_dir }}"
+
+- name: Enforce AC-02 account management across enterprise hosts
+  hosts: enterprise_linux
+  become: true
+  gather_facts: true
+  serial: 20
+
+  vars:
+    ac02_control_id: "AC-02"
+    ac02_control_name: "Account Management"
+    ac02_review_id: "AC02-ENTERPRISE-{{ ansible_date_time.date | default('unknown-date') }}"
+    ac02_reviewed_by: "Treasury ChatGPT Production IAM Operations"
+    ac02_review_scope: "Enterprise Linux fleet"
+    ac02_controller_evidence_root: "{{ playbook_dir }}/artifacts/ac-02"
+    ac02_remote_evidence_dir: /var/tmp/ac-02
+    ac02_remote_evidence_file: /var/tmp/ac-02/ac-02-account-management-evidence.json
+    ac02_controller_host_dir: "{{ playbook_dir }}/artifacts/ac-02/hosts"
+    ac02_review_uid_floor: 1000
+    ac02_noninteractive_shells:
+      - /sbin/nologin
+      - /usr/sbin/nologin
+      - /bin/false
+
+    # Put your enterprise-approved roster in group_vars / host_vars.
+    # Example structure:
+    # ac02_managed_accounts:
+    #   - name: example_service_acct
+    #     state: present
+    #     system: true
+    #     create_home: false
+    #     shell: /usr/sbin/nologin
+    #     comment: "Approved service account"
+    #     password_lock: true
+    #     groups: ["exampleapp"]
+    #   - name: example_admin
+    #     state: present
+    #     system: false
+    #     create_home: true
+    #     shell: /bin/bash
+    #     comment: "Approved admin user"
+    #     password_lock: false
+    #     groups: ["wheel"]
+    #     append: true
+
+  roles:
+    - ac_02_account_management
+
+- name: Build consolidated AC-02 enterprise evidence report
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ac02_controller_host_dir: "{{ playbook_dir }}/artifacts/ac-02/hosts"
+    ac02_controller_report_file: "{{ playbook_dir }}/artifacts/ac-02/ac-02-enterprise-summary.json"
+  tasks:
+    - name: Find host evidence files
+      ansible.builtin.find:
+        paths: "{{ ac02_controller_host_dir }}"
+        patterns: "ac-02-account-management-evidence.json"
+        recurse: true
+        file_type: file
+      register: ac02_host_evidence_files
+
+    - name: Read host evidence files
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ ac02_host_evidence_files.files | default([]) }}"
+      register: ac02_slurped_evidence
+
+    - name: Assemble enterprise summary data
+      ansible.builtin.set_fact:
+        ac02_enterprise_summary:
+          control_id: "AC-02"
+          control_name: "Account Management"
+          collected_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          host_count: "{{ ac02_slurped_evidence.results | default([]) | length }}"
+          host_reports: >-
+            {{
+              ac02_slurped_evidence.results | default([]) |
+              map(attribute='content') |
+              map('b64decode') |
+              map('from_json') |
+              list
+            }}
+
+    - name: Write enterprise summary file
+      ansible.builtin.copy:
+        dest: "{{ ac02_controller_report_file }}"
+        mode: "0640"
+        content: "{{ ac02_enterprise_summary | to_nice_json }}"
