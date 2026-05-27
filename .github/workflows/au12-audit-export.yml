@@ -1,4 +1,3 @@
----
 name: AU-12 Enterprise Audit Export
 
 on:
@@ -153,6 +152,3 @@ jobs:
         run: |
           echo "Archive repository target configured: ${AUDIT_ARCHIVE_REPO}"
           echo "Integrate your approved storage or SIEM handoff here."
-
-* SIEM integration runbook
-* evidence collection checklist
