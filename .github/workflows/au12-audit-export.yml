@@ -17,7 +17,7 @@ on:
         default: '1'
 
       gh_host:
-        description: 'GitHub host for this enterprise, such as github.com or the enterprise GHE.com subdomain'
+        description: 'Exact GitHub host for this enterprise, for example your-enterprise.ghe.com'
         required: false
         default: ''
 
@@ -37,13 +37,13 @@ jobs:
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
 
-      # REQUIRED SECRET: PAT Classic with audit-log access and the right enterprise permissions
+      # Required secret: PAT Classic with audit-log access and enterprise permissions.
       GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
 
-      # Optional secret override. If empty, the workflow_dispatch input is used.
+      # Optional secret override for the GitHub host.
       GH_HOST_SECRET: ${{ secrets.GH_HOST }}
 
-      # OPTIONAL
+      # Optional
       AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
 
     steps:
@@ -70,13 +70,14 @@ jobs:
           INPUT_HOST="${{ github.event.inputs.gh_host || '' }}"
           SECRET_HOST="${GH_HOST_SECRET:-}"
 
-          if [ -n "$SECRET_HOST" ]; then
-            GH_HOST="$SECRET_HOST"
-          elif [ -n "$INPUT_HOST" ]; then
-            GH_HOST="$INPUT_HOST"
+          if [ -n "${SECRET_HOST}" ]; then
+            GH_HOST="${SECRET_HOST}"
+          elif [ -n "${INPUT_HOST}" ]; then
+            GH_HOST="${INPUT_HOST}"
           else
             echo "ERROR: GH_HOST is not set."
             echo "Set the GH_HOST secret or pass gh_host in workflow_dispatch."
+            echo "Use your enterprise's exact host, such as your-enterprise.ghe.com."
             exit 1
           fi
 
