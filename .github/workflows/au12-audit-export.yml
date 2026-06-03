@@ -16,11 +16,6 @@ on:
         required: false
         default: '1'
 
-      gh_host:
-        description: 'Exact GitHub host, for example internal-revenue-service.ghe.com'
-        required: false
-        default: ''
-
 permissions:
   contents: read
 
@@ -30,125 +25,103 @@ concurrency:
 
 jobs:
   export-audit-logs:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     env:
       ENTERPRISE_SLUG: internal-revenue-service
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
-      GH_HOST_SECRET: ${{ secrets.GH_HOST }}
-      AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
+
+      # Air-gapped GitHub Enterprise Server values
+      # Example:
+      # GH_HOST=github.irs.local
+      # GH_API_BASE_URL=https://github.irs.local/api/v3
+      GH_HOST: ${{ secrets.GH_HOST }}
+      GH_API_BASE_URL: ${{ secrets.GH_API_BASE_URL }}
+
+      AU12_AUDIT_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+      AU12_ARCHIVE_DIR: ${{ secrets.AU12_ARCHIVE_DIR }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq dnsutils curl
-
-      - name: Resolve GitHub host
-        id: host
+      - name: Validate required configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          INPUT_HOST="${{ github.event.inputs.gh_host || '' }}"
-          SECRET_HOST="${GH_HOST_SECRET:-}"
-
-          if [ -n "${SECRET_HOST}" ]; then
-            GH_HOST="${SECRET_HOST}"
-          elif [ -n "${INPUT_HOST}" ]; then
-            GH_HOST="${INPUT_HOST}"
-          else
-            GH_HOST="internal-revenue-service.ghe.com"
-          fi
-
-          GH_HOST="$(printf '%s' "${GH_HOST}" | tr -d '[:space:]')"
-
-          if [ "${GH_HOST}" = "internal-revenue-serivce.ghe.com" ]; then
-            echo "ERROR: GH_HOST is misspelled."
-            echo "Use internal-revenue-service.ghe.com"
+          if [ -z "${GH_HOST:-}" ]; then
+            echo "ERROR: GH_HOST is empty."
+            echo "Set GH_HOST to the internal GitHub Enterprise Server hostname."
             exit 1
           fi
 
-          API_HOST="api.${GH_HOST}"
+          if [ -z "${GH_API_BASE_URL:-}" ]; then
+            echo "ERROR: GH_API_BASE_URL is empty."
+            echo "Set GH_API_BASE_URL to https://${GH_HOST}/api/v3"
+            exit 1
+          fi
 
-          echo "Resolved GH_HOST=${GH_HOST}"
-          echo "Resolved API_HOST=${API_HOST}"
+          if [ -z "${AU12_AUDIT_TOKEN:-}" ]; then
+            echo "ERROR: AU12_AUDIT_TOKEN is empty."
+            exit 1
+          fi
 
-          echo "gh_host=${GH_HOST}" >> "$GITHUB_OUTPUT"
-          echo "api_host=${API_HOST}" >> "$GITHUB_OUTPUT"
+          if printf '%s' "${AU12_AUDIT_TOKEN}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
+            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace, a line break, or a control character."
+            exit 1
+          fi
 
-      - name: Validate network reachability
+          echo "GH_HOST=${GH_HOST}"
+          echo "GH_API_BASE_URL=${GH_API_BASE_URL}"
+
+      - name: Validate internal DNS and API reachability
         shell: bash
-        env:
-          GH_HOST: ${{ steps.host.outputs.gh_host }}
-          API_HOST: ${{ steps.host.outputs.api_host }}
         run: |
           set -euo pipefail
 
           echo "Checking DNS for ${GH_HOST}..."
-          nslookup "${GH_HOST}"
+          getent hosts "${GH_HOST}"
 
-          echo "Checking DNS for ${API_HOST}..."
-          nslookup "${API_HOST}"
+          echo "Checking GitHub Enterprise API metadata endpoint..."
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "${GH_API_BASE_URL}/meta" \
+            >/dev/null
 
-          echo "Checking HTTPS reachability for ${GH_HOST}..."
-          curl --fail --silent --show-error --location --head "https://${GH_HOST}" >/dev/null
-
-          echo "Checking HTTPS reachability for ${API_HOST}..."
-          curl --fail --silent --show-error --location --head "https://${API_HOST}" >/dev/null
-
-          echo "Network reachability verified."
+          echo "Internal GitHub API is reachable."
 
       - name: Validate GitHub authentication
         shell: bash
-        env:
-          GH_HOST: ${{ steps.host.outputs.gh_host }}
-          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          for TOKEN_NAME in GH_TOKEN GH_ENTERPRISE_TOKEN; do
-            TOKEN_VALUE="${!TOKEN_NAME:-}"
+          echo "Validating authenticated user..."
 
-            if [ -z "${TOKEN_VALUE}" ]; then
-              echo "ERROR: ${TOKEN_NAME} is empty."
-              echo "Recreate repository secret AU12_AUDIT_TOKEN using only the raw PAT value."
-              exit 1
-            fi
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "${GH_API_BASE_URL}/user" \
+            >/dev/null
 
-            if printf '%s' "${TOKEN_VALUE}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
-              echo "ERROR: ${TOKEN_NAME} contains whitespace, a line break, or a control character."
-              echo "Recreate repository secret AU12_AUDIT_TOKEN using only the raw PAT value."
-              exit 1
-            fi
+          echo "Validating enterprise access..."
 
-            if printf '%s' "${TOKEN_VALUE}" | grep -qi '^bearer '; then
-              echo "ERROR: ${TOKEN_NAME} includes a Bearer prefix."
-              echo "Store only the raw PAT value, not 'Bearer <token>'."
-              exit 1
-            fi
-
-            if printf '%s' "${TOKEN_VALUE}" | grep -qi '^token '; then
-              echo "ERROR: ${TOKEN_NAME} includes a token prefix."
-              echo "Store only the raw PAT value, not 'token <token>'."
-              exit 1
-            fi
-          done
-
-          echo "Validating GitHub API authentication against ${GH_HOST}..."
-
-          gh api --hostname "${GH_HOST}" /user >/dev/null
-
-          echo "Testing enterprise access..."
-
-          gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}" >/dev/null
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}" \
+            >/dev/null
 
           echo "Enterprise access verified."
 
@@ -156,20 +129,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/raw out/normalized out/summaries
+
+          mkdir -p out/raw
+          mkdir -p out/normalized
+          mkdir -p out/summaries
 
       - name: Resolve organization list
         id: orgs
         shell: bash
-        env:
-          GH_HOST: ${{ steps.host.outputs.gh_host }}
-          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
           if [ "${ORG_SCOPE}" = "ALL" ]; then
-            ORG_LIST="$(gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100" --paginate --jq '.[].login' | paste -sd, -)"
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100" \
+              > out/summaries/orgs.json
+
+            ORG_LIST="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("out/summaries/orgs.json").read_text())
+          print(",".join(item["login"] for item in data))
+          PY
+          )"
           else
             ORG_LIST="${ORG_SCOPE}"
           fi
@@ -184,50 +173,48 @@ jobs:
 
       - name: Export enterprise audit log
         shell: bash
-        env:
-          GH_HOST: ${{ steps.host.outputs.gh_host }}
-          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          SINCE=$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)
-          UNTIL=$(date -u +%F)
+          SINCE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)"
+          UNTIL="$(date -u +%F)"
 
           OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
 
-          gh api \
-            --hostname "${GH_HOST}" \
-            -H "Accept: application/vnd.github+json" \
-            "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-            --paginate \
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
             > "${OUTFILE}"
 
       - name: Export organization audit logs
         shell: bash
-        env:
-          GH_HOST: ${{ steps.host.outputs.gh_host }}
-          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          SINCE=$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)
-          UNTIL=$(date -u +%F)
+          SINCE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)"
+          UNTIL="$(date -u +%F)"
 
           IFS=',' read -ra ORGS <<< "${{ steps.orgs.outputs.org_list }}"
 
           for ORG in "${ORGS[@]}"; do
-            ORG_TRIMMED=$(echo "$ORG" | xargs)
+            ORG_TRIMMED="$(echo "$ORG" | xargs)"
             [ -z "$ORG_TRIMMED" ] && continue
 
             OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
 
-            gh api \
-              --hostname "${GH_HOST}" \
-              -H "Accept: application/vnd.github+json" \
-              "/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-              --paginate \
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              "${GH_API_BASE_URL}/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
               > "${OUTFILE}"
           done
 
@@ -307,17 +294,21 @@ jobs:
             find . -type f | sort | xargs sha256sum
           ) > out/summaries/sha256sums.txt
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: au12-audit-exports
-          path: out/
-          retention-days: 90
-
-      - name: Archive integration placeholder
-        if: env.AUDIT_ARCHIVE_REPO != ''
+      - name: Archive AU-12 evidence locally
         shell: bash
         run: |
-          echo "Archive repository configured:"
-          echo "${AUDIT_ARCHIVE_REPO}"
-          echo "Integrate SIEM or evidence archive here."
+          set -euo pipefail
+
+          RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          ARCHIVE_DIR="${AU12_ARCHIVE_DIR:-/var/log/github-au12-audit}"
+
+          mkdir -p "${ARCHIVE_DIR}/${RUN_STAMP}"
+
+          cp -R out/* "${ARCHIVE_DIR}/${RUN_STAMP}/"
+
+          tar -czf "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz" -C out .
+
+          sha256sum "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz" \
+            > "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz.sha256"
+
+          echo "Archived AU-12 evidence to ${ARCHIVE_DIR}/${RUN_STAMP}"
