@@ -68,8 +68,14 @@ jobs:
           elif [ -n "${INPUT_HOST}" ]; then
             GH_HOST="${INPUT_HOST}"
           else
-            echo "ERROR: GH_HOST is not set."
-            echo "Set secret GH_HOST to internal-revenue-service.ghe.com or pass gh_host manually."
+            GH_HOST="internal-revenue-service.ghe.com"
+          fi
+
+          GH_HOST="$(echo "${GH_HOST}" | tr -d '[:space:]')"
+
+          if [ "${GH_HOST}" = "internal-revenue-serivce.ghe.com" ]; then
+            echo "ERROR: GH_HOST is misspelled."
+            echo "Use internal-revenue-service.ghe.com"
             exit 1
           fi
 
@@ -85,33 +91,22 @@ jobs:
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "ERROR: GH_TOKEN is empty."
-            echo "Configure repository secret: AU12_AUDIT_TOKEN"
             exit 1
           fi
 
-          if [ -z "${GH_ENTERPRISE_TOKEN:-}" ]; then
-            echo "ERROR: GH_ENTERPRISE_TOKEN is empty."
-            echo "Configure repository secret: AU12_AUDIT_TOKEN"
+          if printf '%s' "${GH_TOKEN}" | grep -q '[[:space:]]'; then
+            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace or line breaks."
+            echo "Recreate the secret using only the raw PAT value."
             exit 1
           fi
 
           echo "Validating GitHub API authentication against ${GH_HOST}..."
 
-          if ! gh api --hostname "${GH_HOST}" /user >/dev/null; then
-            echo "ERROR: Token failed /user authentication for ${GH_HOST}."
-            echo "Verify the PAT was created on ${GH_HOST}, not github.com."
-            echo "Verify the PAT is classic, unexpired, and SSO-authorized."
-            exit 1
-          fi
+          gh api --hostname "${GH_HOST}" /user >/dev/null
 
           echo "Testing enterprise access..."
 
-          if ! gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}" >/dev/null; then
-            echo "ERROR: Token authenticated, but enterprise access failed."
-            echo "Verify token owner is an Enterprise Owner or delegated enterprise audit-log admin."
-            echo "Verify read:enterprise and read:audit_log scopes are selected."
-            exit 1
-          fi
+          gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}" >/dev/null
 
           echo "Enterprise access verified."
 
@@ -119,9 +114,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/raw
-          mkdir -p out/normalized
-          mkdir -p out/summaries
+          mkdir -p out/raw out/normalized out/summaries
 
       - name: Resolve organization list
         id: orgs
@@ -202,7 +195,6 @@ jobs:
           from pathlib import Path
 
           raw_files = sorted(glob.glob("out/raw/*.json"))
-
           summary_path = Path("out/summaries/au12-summary.csv")
           detail_path = Path("out/normalized/au12-normalized.jsonl")
 
