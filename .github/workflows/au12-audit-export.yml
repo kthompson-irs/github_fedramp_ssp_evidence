@@ -36,8 +36,6 @@ jobs:
       ENTERPRISE_SLUG: internal-revenue-service
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
-
-      AU12_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
       GH_HOST_SECRET: ${{ secrets.GH_HOST }}
       AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
 
@@ -50,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq dnsutils curl
 
       - name: Resolve GitHub host
         id: host
@@ -77,8 +75,35 @@ jobs:
             exit 1
           fi
 
+          API_HOST="api.${GH_HOST}"
+
           echo "Resolved GH_HOST=${GH_HOST}"
+          echo "Resolved API_HOST=${API_HOST}"
+
           echo "gh_host=${GH_HOST}" >> "$GITHUB_OUTPUT"
+          echo "api_host=${API_HOST}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate network reachability
+        shell: bash
+        env:
+          GH_HOST: ${{ steps.host.outputs.gh_host }}
+          API_HOST: ${{ steps.host.outputs.api_host }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking DNS for ${GH_HOST}..."
+          nslookup "${GH_HOST}"
+
+          echo "Checking DNS for ${API_HOST}..."
+          nslookup "${API_HOST}"
+
+          echo "Checking HTTPS reachability for ${GH_HOST}..."
+          curl --fail --silent --show-error --location --head "https://${GH_HOST}" >/dev/null
+
+          echo "Checking HTTPS reachability for ${API_HOST}..."
+          curl --fail --silent --show-error --location --head "https://${API_HOST}" >/dev/null
+
+          echo "Network reachability verified."
 
       - name: Validate GitHub authentication
         shell: bash
