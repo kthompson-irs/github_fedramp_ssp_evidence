@@ -25,40 +25,30 @@ concurrency:
 
 jobs:
   export-audit-logs:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     env:
       ENTERPRISE_SLUG: internal-revenue-service
+      GH_API_BASE_URL: https://api.github.com
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
-
-      # Air-gapped GitHub Enterprise Server values
-      # Example:
-      # GH_HOST=github.irs.local
-      # GH_API_BASE_URL=https://github.irs.local/api/v3
-      GH_HOST: ${{ secrets.GH_HOST }}
-      GH_API_BASE_URL: ${{ secrets.GH_API_BASE_URL }}
-
       AU12_AUDIT_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-      AU12_ARCHIVE_DIR: ${{ secrets.AU12_ARCHIVE_DIR }}
 
     steps:
-      - name: Validate required configuration
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq curl
 
-          if [ -z "${GH_HOST:-}" ]; then
-            echo "ERROR: GH_HOST is empty."
-            echo "Set GH_HOST to the internal GitHub Enterprise Server hostname."
-            exit 1
-          fi
-
-          if [ -z "${GH_API_BASE_URL:-}" ]; then
-            echo "ERROR: GH_API_BASE_URL is empty."
-            echo "Set GH_API_BASE_URL to https://${GH_HOST}/api/v3"
-            exit 1
-          fi
+      - name: Validate GitHub token
+        shell: bash
+        run: |
+          set -euo pipefail
 
           if [ -z "${AU12_AUDIT_TOKEN:-}" ]; then
             echo "ERROR: AU12_AUDIT_TOKEN is empty."
@@ -66,40 +56,12 @@ jobs:
           fi
 
           if printf '%s' "${AU12_AUDIT_TOKEN}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
-            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace, a line break, or a control character."
+            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace, line breaks, or control characters."
+            echo "Recreate the secret using only the raw PAT value."
             exit 1
           fi
 
-          echo "GH_HOST=${GH_HOST}"
-          echo "GH_API_BASE_URL=${GH_API_BASE_URL}"
-
-      - name: Validate internal DNS and API reachability
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking DNS for ${GH_HOST}..."
-          getent hosts "${GH_HOST}"
-
-          echo "Checking GitHub Enterprise API metadata endpoint..."
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            "${GH_API_BASE_URL}/meta" \
-            >/dev/null
-
-          echo "Internal GitHub API is reachable."
-
-      - name: Validate GitHub authentication
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Validating authenticated user..."
+          echo "Validating GitHub.com authentication..."
 
           curl \
             --fail \
@@ -108,6 +70,7 @@ jobs:
             --location \
             --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GH_API_BASE_URL}/user" \
             >/dev/null
 
@@ -120,6 +83,7 @@ jobs:
             --location \
             --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}" \
             >/dev/null
 
@@ -129,10 +93,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          mkdir -p out/raw
-          mkdir -p out/normalized
-          mkdir -p out/summaries
+          mkdir -p out/raw out/normalized out/summaries
 
       - name: Resolve organization list
         id: orgs
@@ -148,17 +109,11 @@ jobs:
               --location \
               --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
               --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
               "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100" \
               > out/summaries/orgs.json
 
-            ORG_LIST="$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          data = json.loads(Path("out/summaries/orgs.json").read_text())
-          print(",".join(item["login"] for item in data))
-          PY
-          )"
+            ORG_LIST="$(jq -r '.[].login' out/summaries/orgs.json | paste -sd, -)"
           else
             ORG_LIST="${ORG_SCOPE}"
           fi
@@ -178,7 +133,6 @@ jobs:
 
           SINCE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)"
           UNTIL="$(date -u +%F)"
-
           OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
 
           curl \
@@ -188,6 +142,7 @@ jobs:
             --location \
             --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
             > "${OUTFILE}"
 
@@ -214,6 +169,7 @@ jobs:
               --location \
               --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
               --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
               "${GH_API_BASE_URL}/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
               > "${OUTFILE}"
           done
@@ -294,21 +250,9 @@ jobs:
             find . -type f | sort | xargs sha256sum
           ) > out/summaries/sha256sums.txt
 
-      - name: Archive AU-12 evidence locally
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-          ARCHIVE_DIR="${AU12_ARCHIVE_DIR:-/var/log/github-au12-audit}"
-
-          mkdir -p "${ARCHIVE_DIR}/${RUN_STAMP}"
-
-          cp -R out/* "${ARCHIVE_DIR}/${RUN_STAMP}/"
-
-          tar -czf "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz" -C out .
-
-          sha256sum "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz" \
-            > "${ARCHIVE_DIR}/au12-audit-${RUN_STAMP}.tar.gz.sha256"
-
-          echo "Archived AU-12 evidence to ${ARCHIVE_DIR}/${RUN_STAMP}"
+      - name: Upload AU-12 audit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: au12-audit-exports
+          path: out/
+          retention-days: 90
