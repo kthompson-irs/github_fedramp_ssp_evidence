@@ -17,7 +17,7 @@ on:
         default: '1'
 
       gh_host:
-        description: 'Exact GitHub host for this enterprise, for example your-enterprise.ghe.com'
+        description: 'Exact GitHub host, for example internal-revenue-service.ghe.com'
         required: false
         default: ''
 
@@ -37,13 +37,10 @@ jobs:
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
 
-      # Required secret: PAT Classic with audit-log access and enterprise permissions.
       GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-
-      # Optional secret override for the GitHub host.
+      GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
       GH_HOST_SECRET: ${{ secrets.GH_HOST }}
 
-      # Optional
       AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
 
     steps:
@@ -56,10 +53,6 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq
-
-      ######################################################################
-      # RESOLVE HOST
-      ######################################################################
 
       - name: Resolve GitHub host
         id: host
@@ -76,17 +69,12 @@ jobs:
             GH_HOST="${INPUT_HOST}"
           else
             echo "ERROR: GH_HOST is not set."
-            echo "Set the GH_HOST secret or pass gh_host in workflow_dispatch."
-            echo "Use your enterprise's exact host, such as your-enterprise.ghe.com."
+            echo "Set secret GH_HOST to internal-revenue-service.ghe.com or pass gh_host manually."
             exit 1
           fi
 
           echo "Resolved GH_HOST=${GH_HOST}"
           echo "gh_host=${GH_HOST}" >> "$GITHUB_OUTPUT"
-
-      ######################################################################
-      # VALIDATE TOKEN AND HOST
-      ######################################################################
 
       - name: Validate GitHub authentication
         shell: bash
@@ -101,42 +89,31 @@ jobs:
             exit 1
           fi
 
-          echo "Validating GitHub authentication against ${GH_HOST}..."
-
-          if ! gh auth status --hostname "${GH_HOST}"; then
-            echo "ERROR: GitHub authentication failed."
-            echo "Possible causes:"
-            echo " - invalid PAT"
-            echo " - expired PAT"
-            echo " - PAT Classic required"
-            echo " - missing read:audit_log scope"
-            echo " - SSO authorization missing"
-            echo " - insufficient enterprise permissions"
-            echo " - incorrect GH_HOST value for your cloud"
+          if [ -z "${GH_ENTERPRISE_TOKEN:-}" ]; then
+            echo "ERROR: GH_ENTERPRISE_TOKEN is empty."
+            echo "Configure repository secret: AU12_AUDIT_TOKEN"
             exit 1
           fi
 
-          echo "Authentication validated."
+          echo "Validating GitHub API authentication against ${GH_HOST}..."
 
-          echo "Testing authenticated user endpoint..."
           if ! gh api --hostname "${GH_HOST}" /user >/dev/null; then
-            echo "ERROR: Token authenticated, but /user request failed."
+            echo "ERROR: Token failed /user authentication for ${GH_HOST}."
+            echo "Verify the PAT was created on ${GH_HOST}, not github.com."
+            echo "Verify the PAT is classic, unexpired, and SSO-authorized."
             exit 1
           fi
 
           echo "Testing enterprise access..."
+
           if ! gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}" >/dev/null; then
             echo "ERROR: Token authenticated, but enterprise access failed."
-            echo "Verify that the token owner is an Enterprise Owner or has audit-log admin access."
-            echo "Also verify the token is SSO-authorized for the enterprise."
+            echo "Verify token owner is an Enterprise Owner or delegated enterprise audit-log admin."
+            echo "Verify read:enterprise and read:audit_log scopes are selected."
             exit 1
           fi
 
           echo "Enterprise access verified."
-
-      ######################################################################
-      # PREPARE OUTPUT
-      ######################################################################
 
       - name: Prepare output directories
         shell: bash
@@ -146,29 +123,27 @@ jobs:
           mkdir -p out/normalized
           mkdir -p out/summaries
 
-      ######################################################################
-      # RESOLVE ORGANIZATION LIST
-      ######################################################################
-
       - name: Resolve organization list
         id: orgs
         shell: bash
+        env:
+          GH_HOST: ${{ steps.host.outputs.gh_host }}
         run: |
           set -euo pipefail
 
           if [ "${ORG_SCOPE}" = "ALL" ]; then
-            # Replace with the actual authoritative enterprise organization inventory.
-            ORG_LIST="platform,applications,security,data,operations,sandbox"
+            ORG_LIST="$(gh api --hostname "${GH_HOST}" "/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100" --paginate --jq '.[].login' | paste -sd, -)"
           else
             ORG_LIST="${ORG_SCOPE}"
           fi
 
+          if [ -z "${ORG_LIST}" ]; then
+            echo "ERROR: No organizations resolved."
+            exit 1
+          fi
+
           echo "Organizations to export: ${ORG_LIST}"
           echo "org_list=${ORG_LIST}" >> "$GITHUB_OUTPUT"
-
-      ######################################################################
-      # EXPORT ENTERPRISE AUDIT LOG
-      ######################################################################
 
       - name: Export enterprise audit log
         shell: bash
@@ -182,21 +157,12 @@ jobs:
 
           OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
 
-          echo "Exporting enterprise audit logs..."
-          echo "Enterprise: ${ENTERPRISE_SLUG}"
-          echo "Window: ${SINCE} -> ${UNTIL}"
-
           gh api \
             --hostname "${GH_HOST}" \
             -H "Accept: application/vnd.github+json" \
             "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
+            --paginate \
             > "${OUTFILE}"
-
-          echo "Enterprise audit export completed: ${OUTFILE}"
-
-      ######################################################################
-      # EXPORT ORGANIZATION AUDIT LOGS
-      ######################################################################
 
       - name: Export organization audit logs
         shell: bash
@@ -212,10 +178,7 @@ jobs:
 
           for ORG in "${ORGS[@]}"; do
             ORG_TRIMMED=$(echo "$ORG" | xargs)
-
             [ -z "$ORG_TRIMMED" ] && continue
-
-            echo "Exporting org audit log: ${ORG_TRIMMED}"
 
             OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
 
@@ -223,14 +186,9 @@ jobs:
               --hostname "${GH_HOST}" \
               -H "Accept: application/vnd.github+json" \
               "/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
+              --paginate \
               > "${OUTFILE}"
-
-            echo "Org audit export completed: ${OUTFILE}"
           done
-
-      ######################################################################
-      # NORMALIZE DATA
-      ######################################################################
 
       - name: Normalize audit data
         shell: bash
@@ -238,24 +196,24 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import json
-          import glob
           import csv
+          import glob
+          import json
           from pathlib import Path
 
-          raw_files = sorted(glob.glob('out/raw/*.json'))
+          raw_files = sorted(glob.glob("out/raw/*.json"))
 
-          summary_path = Path('out/summaries/au12-summary.csv')
-          detail_path = Path('out/normalized/au12-normalized.jsonl')
+          summary_path = Path("out/summaries/au12-summary.csv")
+          detail_path = Path("out/normalized/au12-normalized.jsonl")
 
           rows = []
 
-          with detail_path.open('w', encoding='utf-8') as detail:
+          with detail_path.open("w", encoding="utf-8") as detail:
               for file in raw_files:
                   source = Path(file).stem
 
                   try:
-                      data = json.loads(Path(file).read_text(encoding='utf-8'))
+                      data = json.loads(Path(file).read_text(encoding="utf-8"))
                   except Exception:
                       data = []
 
@@ -263,41 +221,41 @@ jobs:
                       data = [data]
 
                   for item in data:
-                      item['_source_file'] = source
-                      detail.write(json.dumps(item, sort_keys=True) + '\n')
+                      item["_source_file"] = source
+                      detail.write(json.dumps(item, sort_keys=True) + "\n")
 
                       rows.append({
-                          'source_file': source,
-                          'action': item.get('action', ''),
-                          'actor': item.get('actor', ''),
-                          'org': item.get('org', ''),
-                          'repo': item.get('repo', ''),
-                          'created_at': item.get('created_at', '')
+                          "source_file": source,
+                          "action": item.get("action", ""),
+                          "actor": item.get("actor", ""),
+                          "org": item.get("org", ""),
+                          "repo": item.get("repo", ""),
+                          "created_at": item.get("created_at", ""),
+                          "operation_type": item.get("operation_type", ""),
+                          "actor_ip": item.get("actor_ip", ""),
                       })
 
           summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-          with summary_path.open('w', newline='', encoding='utf-8') as f:
+          with summary_path.open("w", newline="", encoding="utf-8") as f:
               writer = csv.DictWriter(
                   f,
                   fieldnames=[
-                      'source_file',
-                      'action',
-                      'actor',
-                      'org',
-                      'repo',
-                      'created_at'
-                  ]
+                      "source_file",
+                      "action",
+                      "actor",
+                      "org",
+                      "repo",
+                      "created_at",
+                      "operation_type",
+                      "actor_ip",
+                  ],
               )
               writer.writeheader()
               writer.writerows(rows)
 
           print("Normalization complete.")
           PY
-
-      ######################################################################
-      # CHECKSUMS
-      ######################################################################
 
       - name: Compute checksums
         shell: bash
@@ -309,20 +267,12 @@ jobs:
             find . -type f | sort | xargs sha256sum
           ) > out/summaries/sha256sums.txt
 
-      ######################################################################
-      # UPLOAD ARTIFACTS
-      ######################################################################
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: au12-audit-exports
           path: out/
           retention-days: 90
-
-      ######################################################################
-      # OPTIONAL ARCHIVE INTEGRATION
-      ######################################################################
 
       - name: Archive integration placeholder
         if: env.AUDIT_ARCHIVE_REPO != ''
