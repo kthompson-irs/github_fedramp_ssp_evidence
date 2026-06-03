@@ -37,10 +37,8 @@ jobs:
       LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
       ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
 
-      GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-      GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+      AU12_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
       GH_HOST_SECRET: ${{ secrets.GH_HOST }}
-
       AUDIT_ARCHIVE_REPO: ${{ secrets.AU12_ARCHIVE_REPO }}
 
     steps:
@@ -71,7 +69,7 @@ jobs:
             GH_HOST="internal-revenue-service.ghe.com"
           fi
 
-          GH_HOST="$(echo "${GH_HOST}" | tr -d '[:space:]')"
+          GH_HOST="$(printf '%s' "${GH_HOST}" | tr -d '[:space:]')"
 
           if [ "${GH_HOST}" = "internal-revenue-serivce.ghe.com" ]; then
             echo "ERROR: GH_HOST is misspelled."
@@ -86,19 +84,38 @@ jobs:
         shell: bash
         env:
           GH_HOST: ${{ steps.host.outputs.gh_host }}
+          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "ERROR: GH_TOKEN is empty."
-            exit 1
-          fi
+          for TOKEN_NAME in GH_TOKEN GH_ENTERPRISE_TOKEN; do
+            TOKEN_VALUE="${!TOKEN_NAME:-}"
 
-          if printf '%s' "${GH_TOKEN}" | grep -q '[[:space:]]'; then
-            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace or line breaks."
-            echo "Recreate the secret using only the raw PAT value."
-            exit 1
-          fi
+            if [ -z "${TOKEN_VALUE}" ]; then
+              echo "ERROR: ${TOKEN_NAME} is empty."
+              echo "Recreate repository secret AU12_AUDIT_TOKEN using only the raw PAT value."
+              exit 1
+            fi
+
+            if printf '%s' "${TOKEN_VALUE}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
+              echo "ERROR: ${TOKEN_NAME} contains whitespace, a line break, or a control character."
+              echo "Recreate repository secret AU12_AUDIT_TOKEN using only the raw PAT value."
+              exit 1
+            fi
+
+            if printf '%s' "${TOKEN_VALUE}" | grep -qi '^bearer '; then
+              echo "ERROR: ${TOKEN_NAME} includes a Bearer prefix."
+              echo "Store only the raw PAT value, not 'Bearer <token>'."
+              exit 1
+            fi
+
+            if printf '%s' "${TOKEN_VALUE}" | grep -qi '^token '; then
+              echo "ERROR: ${TOKEN_NAME} includes a token prefix."
+              echo "Store only the raw PAT value, not 'token <token>'."
+              exit 1
+            fi
+          done
 
           echo "Validating GitHub API authentication against ${GH_HOST}..."
 
@@ -121,6 +138,8 @@ jobs:
         shell: bash
         env:
           GH_HOST: ${{ steps.host.outputs.gh_host }}
+          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -142,6 +161,8 @@ jobs:
         shell: bash
         env:
           GH_HOST: ${{ steps.host.outputs.gh_host }}
+          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -161,6 +182,8 @@ jobs:
         shell: bash
         env:
           GH_HOST: ${{ steps.host.outputs.gh_host }}
+          GH_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
+          GH_ENTERPRISE_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
         run: |
           set -euo pipefail
 
