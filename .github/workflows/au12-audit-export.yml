@@ -45,7 +45,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      - name: Validate GitHub token
+      - name: Validate GitHub token and audit-log access
         shell: bash
         run: |
           set -euo pipefail
@@ -57,7 +57,6 @@ jobs:
 
           if printf '%s' "${AU12_AUDIT_TOKEN}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
             echo "ERROR: AU12_AUDIT_TOKEN contains whitespace, line breaks, or control characters."
-            echo "Recreate the secret using only the raw PAT value."
             exit 1
           fi
 
@@ -74,20 +73,32 @@ jobs:
             "${GH_API_BASE_URL}/user" \
             >/dev/null
 
-          echo "Validating enterprise access..."
+          echo "Validating enterprise audit-log access..."
 
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}" \
-            >/dev/null
+          HTTP_CODE="$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --output /tmp/au12-audit-check.json \
+              --write-out "%{http_code}" \
+              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?per_page=1"
+          )"
 
-          echo "Enterprise access verified."
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "ERROR: Enterprise audit-log access failed with HTTP ${HTTP_CODE}."
+            echo "Check that ENTERPRISE_SLUG is the enterprise URL handle."
+            echo "Check that the PAT owner is an Enterprise Owner."
+            echo "Check that the classic PAT has read:audit_log and is SSO-authorized."
+            echo "GitHub response:"
+            cat /tmp/au12-audit-check.json
+            exit 1
+          fi
+
+          echo "Enterprise audit-log access verified."
 
       - name: Prepare output directories
         shell: bash
@@ -102,16 +113,24 @@ jobs:
           set -euo pipefail
 
           if [ "${ORG_SCOPE}" = "ALL" ]; then
-            curl \
-              --fail \
-              --silent \
-              --show-error \
-              --location \
-              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100" \
-              > out/summaries/orgs.json
+            HTTP_CODE="$(
+              curl \
+                --silent \
+                --show-error \
+                --location \
+                --output out/summaries/orgs.json \
+                --write-out "%{http_code}" \
+                --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/orgs?per_page=100"
+            )"
+
+            if [ "${HTTP_CODE}" != "200" ]; then
+              echo "ERROR: Could not list enterprise organizations. HTTP ${HTTP_CODE}."
+              cat out/summaries/orgs.json
+              exit 1
+            fi
 
             ORG_LIST="$(jq -r '.[].login' out/summaries/orgs.json | paste -sd, -)"
           else
@@ -135,16 +154,24 @@ jobs:
           UNTIL="$(date -u +%F)"
           OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
 
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-            > "${OUTFILE}"
+          HTTP_CODE="$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --output "${OUTFILE}" \
+              --write-out "%{http_code}" \
+              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}"
+          )"
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "ERROR: Enterprise audit export failed. HTTP ${HTTP_CODE}."
+            cat "${OUTFILE}"
+            exit 1
+          fi
 
       - name: Export organization audit logs
         shell: bash
@@ -162,16 +189,24 @@ jobs:
 
             OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
 
-            curl \
-              --fail \
-              --silent \
-              --show-error \
-              --location \
-              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GH_API_BASE_URL}/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}" \
-              > "${OUTFILE}"
+            HTTP_CODE="$(
+              curl \
+                --silent \
+                --show-error \
+                --location \
+                --output "${OUTFILE}" \
+                --write-out "%{http_code}" \
+                --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GH_API_BASE_URL}/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}"
+            )"
+
+            if [ "${HTTP_CODE}" != "200" ]; then
+              echo "ERROR: Org audit export failed for ${ORG_TRIMMED}. HTTP ${HTTP_CODE}."
+              cat "${OUTFILE}"
+              exit 1
+            fi
           done
 
       - name: Normalize audit data
