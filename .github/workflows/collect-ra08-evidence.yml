@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       audit_days:
-        description: "Number of days of enterprise audit log history to collect"
+        description: "Number of days of audit log history to collect"
         required: false
         default: "90"
+      audit_scope:
+        description: "Audit log scope: enterprise or org"
+        required: false
+        default: "org"
 
 permissions:
   contents: read
@@ -19,6 +23,7 @@ jobs:
       GITHUB_ENTERPRISE: internal-revenue-service
       GITHUB_ORG: internal-revenue-service
       AUDIT_DAYS: ${{ inputs.audit_days }}
+      AUDIT_SCOPE: ${{ inputs.audit_scope }}
       GITHUB_TOKEN_RA08: ${{ secrets.GH_ENTERPRISE_AUDIT_PAT }}
 
     steps:
