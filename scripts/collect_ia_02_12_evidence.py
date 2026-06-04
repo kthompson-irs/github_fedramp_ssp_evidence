@@ -7,9 +7,9 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -26,6 +26,15 @@ AUDIT_SEARCH_PHRASES = {
     "enterprise_managed_user_events": "enterprise_managed_user",
     "identity_provider_events": "identity_provider",
 }
+
+
+class GitHubApiError(Exception):
+    def __init__(self, message, status=None, headers=None, body=None, url=None):
+        super().__init__(message)
+        self.status = status
+        self.headers = headers or {}
+        self.body = body
+        self.url = url
 
 
 def utc_now():
@@ -95,34 +104,34 @@ def github_request(method, url, token, body=None, accept="application/vnd.github
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             headers_out = dict(exc.headers)
-
-            rate_remaining = headers_out.get("x-ratelimit-remaining")
             retry_after = headers_out.get("retry-after")
 
-            if exc.code in (403, 429):
-                if rate_remaining == "0":
-                    raise RuntimeError(
-                        f"GitHub API rate limit exceeded for URL: {url}. "
-                        f"HTTP {exc.code}. Response: {detail}"
-                    )
+            if exc.code in (403, 429) and retry_after and attempt < 3:
+                time.sleep(int(retry_after))
+                continue
 
-                if retry_after and attempt < 3:
-                    time.sleep(int(retry_after))
-                    continue
+            if exc.code in (403, 429) and attempt < 3:
+                time.sleep(10 * attempt)
+                continue
 
-                if attempt < 3:
-                    time.sleep(10 * attempt)
-                    continue
-
-            print(f"ERROR: GitHub API request failed: {method} {url}", file=sys.stderr)
-            print(f"HTTP {exc.code}: {detail}", file=sys.stderr)
-            raise
+            raise GitHubApiError(
+                message=f"GitHub API request failed: {method} {url}",
+                status=exc.code,
+                headers=headers_out,
+                body=detail,
+                url=url,
+            ) from exc
 
         except urllib.error.URLError as exc:
             if attempt < 3:
                 time.sleep(10 * attempt)
                 continue
-            raise exc
+
+            raise GitHubApiError(
+                message=f"GitHub network request failed: {method} {url}",
+                body=str(exc),
+                url=url,
+            ) from exc
 
 
 def graphql(token, query, variables):
@@ -137,8 +146,11 @@ def graphql(token, query, variables):
     )
 
     if payload.get("errors"):
-        print(json.dumps(payload["errors"], indent=2), file=sys.stderr)
-        raise RuntimeError("GraphQL query failed")
+        raise GitHubApiError(
+            message="GraphQL query failed",
+            body=json.dumps(payload["errors"], indent=2),
+            url=GITHUB_GRAPHQL,
+        )
 
     return payload["data"]
 
@@ -326,6 +338,10 @@ def collect_audit_log(token, enterprise, phrase, created_after, max_pages):
         "records_collected": 0,
         "complete": False,
         "stopped_reason": None,
+        "http_status": None,
+        "rate_limit_remaining": None,
+        "rate_limit_reset": None,
+        "api_error_body": None,
     }
 
     while page <= max_pages:
@@ -344,12 +360,18 @@ def collect_audit_log(token, enterprise, phrase, created_after, max_pages):
         )
 
         try:
-            payload, _ = github_request("GET", url, token)
-        except RuntimeError as exc:
+            payload, response_headers = github_request("GET", url, token)
+        except GitHubApiError as exc:
+            status["http_status"] = exc.status
+            status["rate_limit_remaining"] = exc.headers.get("x-ratelimit-remaining")
+            status["rate_limit_reset"] = exc.headers.get("x-ratelimit-reset")
+            status["api_error_body"] = exc.body
             status["stopped_reason"] = str(exc)
             break
 
         status["pages_requested"] = page
+        status["rate_limit_remaining"] = response_headers.get("x-ratelimit-remaining")
+        status["rate_limit_reset"] = response_headers.get("x-ratelimit-reset")
 
         if not payload:
             status["complete"] = True
@@ -398,6 +420,7 @@ def make_markdown_summary(
     generated_at,
     lookback_days,
     max_audit_pages,
+    skip_audit_logs,
     profile,
     orgs,
     members,
@@ -413,6 +436,7 @@ def make_markdown_summary(
         f"Generated at: `{generated_at}`",
         f"Lookback period: `{lookback_days}` days",
         f"Max audit pages per query: `{max_audit_pages}`",
+        f"Audit logs skipped: `{skip_audit_logs}`",
         "",
         "## Control Context",
         "",
@@ -436,14 +460,19 @@ def make_markdown_summary(
         "",
         "## Audit Evidence Collected",
         "",
-        "| Evidence Set | Events | Complete | Stopped Reason |",
-        "|---|---:|---|---|",
+        "| Evidence Set | Events | Complete | HTTP Status | Stopped Reason |",
+        "|---|---:|---|---|---|",
     ]
 
     for name, count in audit_counts.items():
         status = audit_statuses.get(name, {})
         lines.append(
-            f"| {name} | {count} | {status.get('complete')} | {status.get('stopped_reason', '')} |"
+            "| "
+            f"{name} | "
+            f"{count} | "
+            f"{status.get('complete')} | "
+            f"{status.get('http_status', '')} | "
+            f"{status.get('stopped_reason', '')} |"
         )
 
     lines.extend(
@@ -491,8 +520,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--enterprise", required=True)
     parser.add_argument("--lookback-days", type=int, default=30)
-    parser.add_argument("--max-audit-pages", type=int, default=25)
+    parser.add_argument("--max-audit-pages", type=int, default=5)
     parser.add_argument("--output-dir", default="evidence/IA-02-12")
+    parser.add_argument("--skip-audit-logs", action="store_true")
     args = parser.parse_args()
 
     token = require_token()
@@ -510,6 +540,7 @@ def main():
     print(f"Collecting IA-02(12) evidence for enterprise: {args.enterprise}")
     print(f"Audit log lookback starts at: {created_after}")
     print(f"Max audit pages per query: {args.max_audit_pages}")
+    print(f"Skip audit logs: {args.skip_audit_logs}")
 
     profile = collect_enterprise_profile(token, args.enterprise)
     write_json(out_dir / "enterprise_profile.json", profile)
@@ -528,25 +559,40 @@ def main():
     audit_counts = {}
     audit_statuses = {}
 
-    for evidence_name, phrase in AUDIT_SEARCH_PHRASES.items():
-        print(f"Collecting audit log evidence: {evidence_name}")
+    if args.skip_audit_logs:
+        for evidence_name, phrase in AUDIT_SEARCH_PHRASES.items():
+            audit_counts[evidence_name] = 0
+            audit_statuses[evidence_name] = {
+                "phrase": phrase,
+                "created_after": created_after,
+                "max_pages": args.max_audit_pages,
+                "pages_requested": 0,
+                "records_collected": 0,
+                "complete": False,
+                "stopped_reason": "Audit log collection skipped by --skip-audit-logs.",
+            }
+            write_json(audit_dir / f"{evidence_name}.json", [])
+            write_csv(audit_dir / f"{evidence_name}.csv", [])
+    else:
+        for evidence_name, phrase in AUDIT_SEARCH_PHRASES.items():
+            print(f"Collecting audit log evidence: {evidence_name}")
 
-        rows, status = collect_audit_log(
-            token=token,
-            enterprise=args.enterprise,
-            phrase=phrase,
-            created_after=created_after,
-            max_pages=args.max_audit_pages,
-        )
+            rows, status = collect_audit_log(
+                token=token,
+                enterprise=args.enterprise,
+                phrase=phrase,
+                created_after=created_after,
+                max_pages=args.max_audit_pages,
+            )
 
-        audit_counts[evidence_name] = len(rows)
-        audit_statuses[evidence_name] = status
+            audit_counts[evidence_name] = len(rows)
+            audit_statuses[evidence_name] = status
 
-        write_json(audit_dir / f"{evidence_name}.json", rows)
-        write_csv(
-            audit_dir / f"{evidence_name}.csv",
-            [flatten_json(row) for row in rows],
-        )
+            write_json(audit_dir / f"{evidence_name}.json", rows)
+            write_csv(
+                audit_dir / f"{evidence_name}.csv",
+                [flatten_json(row) for row in rows],
+            )
 
     write_json(out_dir / "audit_collection_status.json", audit_statuses)
 
@@ -557,6 +603,7 @@ def main():
         "generated_at": generated_at,
         "lookback_days": args.lookback_days,
         "max_audit_pages": args.max_audit_pages,
+        "skip_audit_logs": args.skip_audit_logs,
         "created_after": created_after,
         "audit_search_phrases": AUDIT_SEARCH_PHRASES,
         "audit_counts": audit_counts,
@@ -574,6 +621,7 @@ def main():
         generated_at=generated_at,
         lookback_days=args.lookback_days,
         max_audit_pages=args.max_audit_pages,
+        skip_audit_logs=args.skip_audit_logs,
         profile=profile,
         orgs=orgs,
         members=members,
