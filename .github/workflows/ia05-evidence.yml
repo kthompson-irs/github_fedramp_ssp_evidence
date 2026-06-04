@@ -31,8 +31,8 @@ jobs:
 
       - name: Collect IA-05 GitHub evidence
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_ENTERPRISE_ADMIN_TOKEN }}
-          GITHUB_ENTERPRISE: ${{ github.event.inputs.enterprise }}
+          GH_TOKEN: ${{ secrets.GH_ENTERPRISE_ADMIN_TOKEN }}
+          GH_ENTERPRISE: ${{ github.event.inputs.enterprise }}
           IA05_LOOKBACK_DAYS: ${{ github.event.inputs.days }}
           OUTPUT_DIR: ia05-evidence
         run: |
