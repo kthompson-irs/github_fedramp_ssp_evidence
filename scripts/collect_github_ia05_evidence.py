@@ -17,19 +17,18 @@ API_VERSION = "2022-11-28"
 
 
 IA05_AUDIT_ACTION_PREFIXES = [
-    "oauth_authorization.",
-    "personal_access_token.",
-    "fine_grained_personal_access_token.",
-    "ssh_key.",
-    "public_key.",
-    "gpg_key.",
-    "webauthn_credential.",
-    "two_factor_authentication.",
-    "saml_identity.",
-    "org_credential_authorization.",
-    "integration_installation.",
-    "github_app_authorization.",
-    "user_status.",
+    "oauth_authorization",
+    "personal_access_token",
+    "fine_grained_personal_access_token",
+    "ssh_key",
+    "public_key",
+    "gpg_key",
+    "webauthn_credential",
+    "two_factor_authentication",
+    "saml_identity",
+    "org_credential_authorization",
+    "integration_installation",
+    "github_app_authorization",
     "repo.add_member",
     "repo.remove_member",
     "org.add_member",
@@ -61,6 +60,7 @@ class GitHubClient:
         accept: str = "application/vnd.github+json",
     ) -> Any:
         data = None
+
         if body is not None:
             data = json.dumps(body).encode("utf-8")
 
@@ -76,19 +76,26 @@ class GitHubClient:
                 if not raw:
                     return None
                 return json.loads(raw)
+
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
                 f"{method} {url} failed: HTTP {exc.code}: {details}"
             ) from exc
 
-    def get_paginated(self, url: str, max_pages: int = 50) -> List[Any]:
+    def get_paginated(
+        self,
+        url: str,
+        max_pages: int = 50,
+        tolerate_http_errors: bool = False,
+    ) -> List[Any]:
         results: List[Any] = []
         next_url = url
         pages = 0
 
         while next_url and pages < max_pages:
             pages += 1
+
             req = urllib.request.Request(next_url, method="GET")
             req.add_header("Authorization", f"Bearer {self.token}")
             req.add_header("Accept", "application/vnd.github+json")
@@ -109,6 +116,18 @@ class GitHubClient:
 
             except urllib.error.HTTPError as exc:
                 details = exc.read().decode("utf-8", errors="replace")
+
+                if tolerate_http_errors:
+                    results.append(
+                        {
+                            "status": "not_collected",
+                            "url": next_url,
+                            "http_status": exc.code,
+                            "reason": details,
+                        }
+                    )
+                    return results
+
                 raise RuntimeError(
                     f"GET {next_url} failed: HTTP {exc.code}: {details}"
                 ) from exc
@@ -178,12 +197,6 @@ def collect_enterprise_organizations(
             login
             name
             viewerCanAdminister
-            samlIdentityProvider {
-              ssoUrl
-              issuer
-              digestMethod
-              signatureMethod
-            }
           }
         }
       }
@@ -215,25 +228,65 @@ def collect_enterprise_audit_log(
     client: GitHubClient,
     enterprise: str,
     lookback_days: int,
-) -> List[Dict[str, Any]]:
-    since = utc_now() - dt.timedelta(days=lookback_days)
+) -> Dict[str, Any]:
+    since_date = (utc_now() - dt.timedelta(days=lookback_days)).date().isoformat()
 
-    phrase = " OR ".join(
-        [f"action:{prefix}*" for prefix in IA05_AUDIT_ACTION_PREFIXES]
-    )
+    collected_events: List[Dict[str, Any]] = []
+    query_results: List[Dict[str, Any]] = []
 
-    query = f"created:>={since.isoformat()} ({phrase})"
+    for action_prefix in IA05_AUDIT_ACTION_PREFIXES:
+        phrase = f"action:{action_prefix} created:>={since_date}"
 
-    encoded = urllib.parse.urlencode(
-        {
-            "phrase": query,
-            "include": "web,git,all",
-            "per_page": "100",
-        }
-    )
+        encoded = urllib.parse.urlencode(
+            {
+                "phrase": phrase,
+                "include": "all",
+                "per_page": "100",
+            }
+        )
 
-    url = f"{API_BASE}/enterprises/{enterprise}/audit-log?{encoded}"
-    return client.get_paginated(url, max_pages=100)
+        url = f"{API_BASE}/enterprises/{enterprise}/audit-log?{encoded}"
+
+        try:
+            events = client.get_paginated(url, max_pages=20)
+            collected_events.extend(events)
+
+            query_results.append(
+                {
+                    "action_prefix": action_prefix,
+                    "phrase": phrase,
+                    "status": "collected",
+                    "event_count": len(events),
+                }
+            )
+
+        except Exception as exc:
+            query_results.append(
+                {
+                    "action_prefix": action_prefix,
+                    "phrase": phrase,
+                    "status": "not_collected",
+                    "reason": str(exc),
+                }
+            )
+
+    deduped_events: Dict[str, Dict[str, Any]] = {}
+
+    for event in collected_events:
+        event_id = (
+            event.get("_document_id")
+            or event.get("@timestamp")
+            or event.get("created_at")
+            or json.dumps(event, sort_keys=True)
+        )
+        deduped_events[str(event_id)] = event
+
+    return {
+        "lookback_days": lookback_days,
+        "since_date": since_date,
+        "query_results": query_results,
+        "events": list(deduped_events.values()),
+    }
 
 
 def collect_org_saml_credential_authorizations(
@@ -244,11 +297,13 @@ def collect_org_saml_credential_authorizations(
 
     try:
         records = client.get_paginated(url, max_pages=50)
+
         return {
             "org": org,
             "status": "collected",
             "credential_authorizations": records,
         }
+
     except Exception as exc:
         return {
             "org": org,
@@ -265,11 +320,13 @@ def collect_org_pat_requests(
 
     try:
         records = client.get_paginated(url, max_pages=50)
+
         return {
             "org": org,
             "status": "collected",
             "personal_access_token_requests": records,
         }
+
     except Exception as exc:
         return {
             "org": org,
@@ -286,11 +343,13 @@ def collect_org_fine_grained_pats(
 
     try:
         records = client.get_paginated(url, max_pages=50)
+
         return {
             "org": org,
             "status": "collected",
             "fine_grained_personal_access_tokens": records,
         }
+
     except Exception as exc:
         return {
             "org": org,
@@ -303,12 +362,19 @@ def build_markdown_summary(
     enterprise: str,
     lookback_days: int,
     orgs: List[Dict[str, Any]],
-    audit_events: List[Dict[str, Any]],
+    audit_log: Dict[str, Any],
     saml_authz: List[Dict[str, Any]],
     pat_requests: List[Dict[str, Any]],
     fine_grained_pats: List[Dict[str, Any]],
 ) -> str:
     generated = utc_now().isoformat()
+
+    audit_events = audit_log.get("events", [])
+    audit_query_results = audit_log.get("query_results", [])
+
+    collected_audit_queries = sum(
+        1 for item in audit_query_results if item["status"] == "collected"
+    )
 
     collected_saml = sum(1 for item in saml_authz if item["status"] == "collected")
     collected_pat_requests = sum(
@@ -324,45 +390,70 @@ def build_markdown_summary(
         f"Enterprise: `{enterprise}`",
         f"Generated UTC: `{generated}`",
         f"Audit log lookback: `{lookback_days}` days",
+        f"Audit log since date: `{audit_log.get('since_date', 'unknown')}`",
         "",
         "## Collection Summary",
         "",
         "| Evidence Area | Result | IA-05 Relevance |",
         "|---|---:|---|",
         f"| Enterprise organizations discovered | {len(orgs)} | Scope of GitHub Enterprise Cloud organizations |",
+        f"| IA-05 audit-log queries completed | {collected_audit_queries}/{len(audit_query_results)} | Authenticator-related audit evidence collection coverage |",
         f"| IA-05-related enterprise audit events | {len(audit_events)} | Authenticator issuance, change, revocation, SSO, token, SSH key, and MFA activity |",
         f"| Organizations with SAML credential authorization evidence collected | {collected_saml}/{len(orgs)} | Authorized PAT and SSH-key usage with SAML SSO |",
         f"| Organizations with PAT request evidence collected | {collected_pat_requests}/{len(orgs)} | PAT approval and denial workflow evidence |",
         f"| Organizations with fine-grained PAT inventory evidence collected | {collected_fine_grained_pats}/{len(orgs)} | Token inventory, scope, owner, and lifecycle review evidence |",
         "",
-        "## IA-05 Control Mapping",
+        "## IA-05 Audit Query Results",
         "",
-        "| IA-05 Evidence Need | GitHub Evidence Collected |",
-        "|---|---|",
-        "| Authenticator issuance and lifecycle | Enterprise audit log events for SSO, PAT, SSH key, GitHub App, OAuth, and membership activity |",
-        "| Authenticator revocation | Audit events showing removal, deletion, expiration, or authorization revocation |",
-        "| Non-password authenticators | SAML credential authorizations, SSH keys, PATs, fine-grained PATs, GitHub App authorizations |",
-        "| Least privilege and token review | Fine-grained PAT inventory and PAT access-request records |",
-        "| Compromise response support | Audit events showing credential changes, revocations, and administrative actions |",
-        "| Continuous monitoring | Timestamped enterprise-level and organization-level evidence artifacts |",
-        "",
-        "## Output Files",
-        "",
-        "- `enterprise-organizations.json`",
-        "- `enterprise-audit-log-ia05.json`",
-        "- `org-saml-credential-authorizations.json`",
-        "- `org-personal-access-token-requests.json`",
-        "- `org-fine-grained-personal-access-tokens.json`",
-        "- `ia05-summary.md`",
-        "",
-        "## Notes",
-        "",
-        "- Some organization evidence may report `not_collected` if the token lacks required enterprise or organization permissions.",
-        "- The token should belong to an enterprise administrator or GitHub App with equivalent approved permissions.",
-        "- This collection does not retrieve secret values, passwords, private keys, or token plaintext.",
-        "- Identity-provider password policy, MFA policy, and FIPS/FedRAMP boundary evidence should be collected from the IdP and SSP package separately.",
-        "",
+        "| Action Prefix | Status | Event Count / Reason |",
+        "|---|---|---|",
     ]
+
+    for item in audit_query_results:
+        result = (
+            str(item.get("event_count", 0))
+            if item["status"] == "collected"
+            else item.get("reason", "not collected").replace("\n", " ")
+        )
+
+        lines.append(
+            f"| `{item['action_prefix']}` | `{item['status']}` | {result} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## IA-05 Control Mapping",
+            "",
+            "| IA-05 Evidence Need | GitHub Evidence Collected |",
+            "|---|---|",
+            "| Authenticator issuance and lifecycle | Enterprise audit log events for SSO, PAT, SSH key, GitHub App, OAuth, and membership activity |",
+            "| Authenticator revocation | Audit events showing removal, deletion, expiration, or authorization revocation |",
+            "| Non-password authenticators | SAML credential authorizations, SSH keys, PATs, fine-grained PATs, GitHub App authorizations |",
+            "| Least privilege and token review | Fine-grained PAT inventory and PAT access-request records |",
+            "| Compromise response support | Audit events showing credential changes, revocations, and administrative actions |",
+            "| Continuous monitoring | Timestamped enterprise-level and organization-level evidence artifacts |",
+            "",
+            "## Output Files",
+            "",
+            "- `enterprise-organizations.json`",
+            "- `enterprise-audit-log-ia05.json`",
+            "- `org-saml-credential-authorizations.json`",
+            "- `org-personal-access-token-requests.json`",
+            "- `org-fine-grained-personal-access-tokens.json`",
+            "- `ia05-summary.md`",
+            "",
+            "## Notes",
+            "",
+            "- GitHub audit-log phrase filters are collected one action prefix at a time to avoid invalid compound query syntax.",
+            "- Some organization evidence may report `not_collected` if the token lacks required enterprise or organization permissions.",
+            "- The token should belong to an enterprise administrator or GitHub App with equivalent approved permissions.",
+            "- Classic PATs for enterprise audit-log access require `read:audit_log`.",
+            "- This collection does not retrieve secret values, passwords, private keys, or token plaintext.",
+            "- Identity-provider password policy, MFA policy, and FIPS/FedRAMP boundary evidence should be collected from the IdP and SSP package separately.",
+            "",
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -396,8 +487,8 @@ def main() -> int:
         orgs = collect_enterprise_organizations(client, enterprise)
         write_json(output_dir / "enterprise-organizations.json", orgs)
 
-        audit_events = collect_enterprise_audit_log(client, enterprise, lookback_days)
-        write_json(output_dir / "enterprise-audit-log-ia05.json", audit_events)
+        audit_log = collect_enterprise_audit_log(client, enterprise, lookback_days)
+        write_json(output_dir / "enterprise-audit-log-ia05.json", audit_log)
 
         saml_authz = []
         pat_requests = []
@@ -437,7 +528,7 @@ def main() -> int:
             enterprise=enterprise,
             lookback_days=lookback_days,
             orgs=orgs,
-            audit_events=audit_events,
+            audit_log=audit_log,
             saml_authz=saml_authz,
             pat_requests=pat_requests,
             fine_grained_pats=fine_grained_pats,
