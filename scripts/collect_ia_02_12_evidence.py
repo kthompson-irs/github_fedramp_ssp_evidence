@@ -67,7 +67,7 @@ def require_token():
 
 def github_request(method, url, token, body=None, accept="application/vnd.github+json"):
     headers = {
-        "Authorization": f"token {token}",
+        "Authorization": f"Bearer {token}",
         "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ia-02-12-evidence-collector",
@@ -169,6 +169,23 @@ def flatten_json(value, prefix=""):
     return output
 
 
+def normalize_enterprise_member(node):
+    row = {
+        "type": node.get("__typename"),
+        "id": node.get("id"),
+        "login": node.get("login"),
+        "name": node.get("name"),
+        "url": node.get("url"),
+        "resource_path": node.get("resourcePath"),
+        "created_at": node.get("createdAt"),
+    }
+
+    if row["url"] is None and row["resource_path"]:
+        row["url"] = f"https://github.com{row['resource_path']}"
+
+    return row
+
+
 def collect_enterprise_profile(token, enterprise):
     query = """
     query EnterpriseProfile($slug: String!) {
@@ -182,32 +199,11 @@ def collect_enterprise_profile(token, enterprise):
         createdAt
         location
         viewerIsAdmin
-        organizations(first: 100) {
+        organizations(first: 1) {
           totalCount
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            id
-            login
-            name
-            url
-            viewerCanAdminister
-          }
         }
-        members(first: 100) {
+        members(first: 1) {
           totalCount
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            login
-            name
-            url
-            createdAt
-          }
         }
       }
     }
@@ -267,10 +263,24 @@ def collect_all_enterprise_members(token, enterprise):
             endCursor
           }
           nodes {
-            login
-            name
-            url
-            createdAt
+            __typename
+
+            ... on User {
+              id
+              login
+              name
+              url
+              resourcePath
+              createdAt
+            }
+
+            ... on EnterpriseUserAccount {
+              id
+              login
+              name
+              resourcePath
+              createdAt
+            }
           }
         }
       }
@@ -285,7 +295,7 @@ def collect_all_enterprise_members(token, enterprise):
         connection = data["enterprise"]["members"]
 
         for node in connection["nodes"]:
-            rows.append(node)
+            rows.append(normalize_enterprise_member(node))
 
         if not connection["pageInfo"]["hasNextPage"]:
             break
@@ -380,6 +390,8 @@ def make_markdown_summary(
         f"- Name: `{enterprise_data.get('name', '')}`",
         f"- URL: `{enterprise_data.get('url', '')}`",
         f"- Viewer is enterprise admin: `{enterprise_data.get('viewerIsAdmin', '')}`",
+        f"- Enterprise-reported organization count: `{enterprise_data.get('organizations', {}).get('totalCount', '')}`",
+        f"- Enterprise-reported member count: `{enterprise_data.get('members', {}).get('totalCount', '')}`",
         f"- Organizations collected: `{len(orgs)}`",
         f"- Enterprise members collected: `{len(members)}`",
         "",
