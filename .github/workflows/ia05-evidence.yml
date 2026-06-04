@@ -1,0 +1,46 @@
+name: IA-05 GitHub Enterprise Evidence Collection
+
+on:
+  workflow_dispatch:
+    inputs:
+      enterprise:
+        description: "GitHub Enterprise slug"
+        required: true
+        default: "internal-revenue-service"
+      days:
+        description: "Audit-log lookback window in days"
+        required: true
+        default: "90"
+
+permissions:
+  contents: read
+
+jobs:
+  collect-ia05-evidence:
+    name: Collect IA-05 evidence
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect IA-05 GitHub evidence
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_ENTERPRISE_ADMIN_TOKEN }}
+          GITHUB_ENTERPRISE: ${{ github.event.inputs.enterprise }}
+          IA05_LOOKBACK_DAYS: ${{ github.event.inputs.days }}
+          OUTPUT_DIR: ia05-evidence
+        run: |
+          python3 scripts/collect_github_ia05_evidence.py
+
+      - name: Upload IA-05 evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia05-github-enterprise-evidence
+          path: ia05-evidence/
+          retention-days: 30
