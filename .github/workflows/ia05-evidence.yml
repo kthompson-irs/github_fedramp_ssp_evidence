@@ -10,7 +10,7 @@ on:
       days:
         description: "Audit-log lookback window in days"
         required: true
-        default: "90"
+        default: "30"
 
 permissions:
   contents: read
@@ -32,9 +32,9 @@ jobs:
       - name: Collect IA-05 GitHub evidence
         env:
           GH_TOKEN: ${{ secrets.GH_ENTERPRISE_ADMIN_TOKEN }}
-          GH_ENTERPRISE: ${{ github.event.inputs.enterprise }}
-          IA05_LOOKBACK_DAYS: ${{ github.event.inputs.days }}
-          OUTPUT_DIR: ia05-evidence
+          GH_ENTERPRISE: ${{ inputs.enterprise }}
+          GH_IA05_LOOKBACK_DAYS: ${{ inputs.days }}
+          GH_OUTPUT_DIR: ia05-evidence
         run: |
           python3 scripts/collect_github_ia05_evidence.py
 
