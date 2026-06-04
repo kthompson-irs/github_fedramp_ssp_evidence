@@ -66,6 +66,9 @@ CANDIDATE_PATHS = [
 ]
 
 
+COLLECTION_WARNINGS = []
+
+
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -124,6 +127,17 @@ def parse_link_header(value: str | None) -> dict:
     return links
 
 
+def add_warning(area: str, url: str, status: int, message: str):
+    warning = {
+        "area": area,
+        "url": url,
+        "status": status,
+        "message": message,
+    }
+    COLLECTION_WARNINGS.append(warning)
+    print(f"WARNING: {area}: HTTP {status}: {message}", file=sys.stderr)
+
+
 def request_json(url: str, params: dict | None = None):
     final_url = build_url(url, params)
 
@@ -158,6 +172,19 @@ def request_json(url: str, params: dict | None = None):
             raise
 
 
+def request_json_optional(area: str, url: str, params: dict | None = None):
+    final_url = build_url(url, params)
+
+    try:
+        return request_json(url, params)
+
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        message = body[:1000] if body else str(error)
+        add_warning(area, final_url, error.code, message)
+        return None, {}
+
+
 def paginate(url: str, params: dict | None = None) -> list:
     items = []
     next_url = url
@@ -169,6 +196,29 @@ def paginate(url: str, params: dict | None = None) -> list:
         if isinstance(data, list):
             items.extend(data)
         elif data is not None:
+            items.append(data)
+
+        links = parse_link_header(headers.get("Link"))
+        next_url = links.get("next")
+        next_params = None
+
+    return items
+
+
+def paginate_optional(area: str, url: str, params: dict | None = None) -> list:
+    items = []
+    next_url = url
+    next_params = params
+
+    while next_url:
+        data, headers = request_json_optional(area, next_url, next_params)
+
+        if data is None:
+            break
+
+        if isinstance(data, list):
+            items.extend(data)
+        else:
             items.append(data)
 
         links = parse_link_header(headers.get("Link"))
@@ -244,6 +294,12 @@ def get_file_if_exists(repo_full_name: str, path: str):
             return None
 
         body = error.read().decode("utf-8", errors="replace")
+        add_warning(
+            "governance_file_lookup",
+            url,
+            error.code,
+            body[:1000] if body else str(error),
+        )
         return {
             "repo": repo_full_name,
             "path": path,
@@ -291,7 +347,9 @@ def collect_readme_candidate_hits(repo_full_name: str):
             "matched_terms": ",".join(matches),
         }
 
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            add_warning("readme_lookup", url, error.code, str(error))
         return None
 
 
@@ -312,9 +370,12 @@ def main():
         "audit_days": AUDIT_DAYS,
     }
 
-    org, _org_headers = request_json(f"{API}/orgs/{ORG}")
+    org, _org_headers = request_json_optional("organization_profile", f"{API}/orgs/{ORG}")
+    if org is None:
+        org = {}
 
-    repos = paginate(
+    repos = paginate_optional(
+        "repositories",
         f"{API}/orgs/{ORG}/repos",
         {
             "per_page": 100,
@@ -324,13 +385,27 @@ def main():
         },
     )
 
-    members = paginate(f"{API}/orgs/{ORG}/members", {"per_page": 100})
-    teams = paginate(f"{API}/orgs/{ORG}/teams", {"per_page": 100})
+    members = paginate_optional(
+        "members",
+        f"{API}/orgs/{ORG}/members",
+        {
+            "per_page": 100,
+        },
+    )
+
+    teams = paginate_optional(
+        "teams",
+        f"{API}/orgs/{ORG}/teams",
+        {
+            "per_page": 100,
+        },
+    )
 
     audit_phrase = " OR ".join(RA08_AUDIT_KEYWORDS)
     audit_query = f"created:>={audit_start.strftime('%Y-%m-%d')} ({audit_phrase})"
 
-    audit_logs = paginate(
+    audit_logs = paginate_optional(
+        "audit_log",
         build_audit_url(),
         {
             "per_page": 100,
@@ -424,6 +499,16 @@ def main():
         for team in teams
     ]
 
+    warning_rows = [
+        {
+            "area": warning.get("area"),
+            "url": warning.get("url"),
+            "status": warning.get("status"),
+            "message": warning.get("message"),
+        }
+        for warning in COLLECTION_WARNINGS
+    ]
+
     summary = {
         **metadata,
         "organization_profile": {
@@ -445,7 +530,9 @@ def main():
             "privacy_candidate_repositories": len(privacy_candidate_repos),
             "governance_files_found": len(governance_files),
             "readme_privacy_hits": len(readme_privacy_hits),
+            "collection_warnings": len(COLLECTION_WARNINGS),
         },
+        "collection_warnings": COLLECTION_WARNINGS,
     }
 
     write_json("summary.json", summary)
@@ -456,6 +543,7 @@ def main():
     write_json("privacy_candidate_repositories.json", privacy_candidate_repos)
     write_json("governance_files.json", governance_files)
     write_json("readme_privacy_hits.json", readme_privacy_hits)
+    write_json("collection_warnings.json", COLLECTION_WARNINGS)
 
     write_csv("repositories.csv", repo_rows)
     write_csv("members.csv", member_rows)
@@ -464,6 +552,7 @@ def main():
     write_csv("privacy_candidate_repositories.csv", privacy_candidate_repos)
     write_csv("governance_files.csv", governance_files)
     write_csv("readme_privacy_hits.csv", readme_privacy_hits)
+    write_csv("collection_warnings.csv", warning_rows)
 
     markdown = f"""# RA-08 Evidence Collection Summary
 
@@ -486,10 +575,20 @@ Audit lookback days: `{AUDIT_DAYS}`
 | Privacy candidate repositories | {len(privacy_candidate_repos)} |
 | Governance files found | {len(governance_files)} |
 | README privacy hits | {len(readme_privacy_hits)} |
+| Collection warnings | {len(COLLECTION_WARNINGS)} |
 
 ## RA-08 Use
 
 This package supports RA-08 by identifying repositories, users, teams, governance files, README privacy indicators, and audit events that may indicate collection, processing, storage, transmission, or governance of PII.
+
+## Permission or Collection Warnings
+
+Review:
+
+- `collection_warnings.csv`
+- `collection_warnings.json`
+
+A warning usually means the provided token does not have access to that evidence source. The workflow still creates the evidence artifact so the missing evidence can be tracked as an assessment finding or collection limitation.
 
 ## Required Human Review
 
@@ -499,6 +598,7 @@ The Privacy Officer, System Owner, and ISSO should review:
 - `governance_files.csv`
 - `readme_privacy_hits.csv`
 - `audit_log_ra08_events.csv`
+- `collection_warnings.csv`
 
 These files help determine whether a Privacy Threshold Analysis, Privacy Impact Assessment, or PIA update is required.
 
@@ -510,6 +610,7 @@ This collection does not itself prove that a PIA exists or that one is not requi
     (OUT_DIR / "RA-08-evidence-summary.md").write_text(markdown, encoding="utf-8")
 
     print(f"RA-08 evidence written to {OUT_DIR}")
+    print(f"Collection warnings: {len(COLLECTION_WARNINGS)}")
 
 
 if __name__ == "__main__":
