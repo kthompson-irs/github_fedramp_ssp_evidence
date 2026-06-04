@@ -39,6 +39,15 @@ IA05_AUDIT_ACTION_PREFIXES = [
 ]
 
 
+class GitHubApiError(RuntimeError):
+    def __init__(self, method: str, url: str, status_code: int, details: str) -> None:
+        self.method = method
+        self.url = url
+        self.status_code = status_code
+        self.details = details
+        super().__init__(f"{method} {url} failed: HTTP {status_code}: {details}")
+
+
 class GitHubClient:
     def __init__(self, token: str) -> None:
         self.token = token.strip()
@@ -79,16 +88,9 @@ class GitHubClient:
 
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"{method} {url} failed: HTTP {exc.code}: {details}"
-            ) from exc
+            raise GitHubApiError(method, url, exc.code, details) from exc
 
-    def get_paginated(
-        self,
-        url: str,
-        max_pages: int = 50,
-        tolerate_http_errors: bool = False,
-    ) -> List[Any]:
+    def get_paginated(self, url: str, max_pages: int = 50) -> List[Any]:
         results: List[Any] = []
         next_url = url
         pages = 0
@@ -116,21 +118,7 @@ class GitHubClient:
 
             except urllib.error.HTTPError as exc:
                 details = exc.read().decode("utf-8", errors="replace")
-
-                if tolerate_http_errors:
-                    results.append(
-                        {
-                            "status": "not_collected",
-                            "url": next_url,
-                            "http_status": exc.code,
-                            "reason": details,
-                        }
-                    )
-                    return results
-
-                raise RuntimeError(
-                    f"GET {next_url} failed: HTTP {exc.code}: {details}"
-                ) from exc
+                raise GitHubApiError("GET", next_url, exc.code, details) from exc
 
             time.sleep(0.25)
 
@@ -177,6 +165,46 @@ def utc_now() -> dt.datetime:
 
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def classify_collection_error(exc: Exception) -> Dict[str, Any]:
+    if isinstance(exc, GitHubApiError):
+        if exc.status_code == 404:
+            return {
+                "status": "not_available_or_not_authorized",
+                "http_status": exc.status_code,
+                "reason": (
+                    "GitHub returned 404. For these organization programmatic-access "
+                    "endpoints, this usually means the endpoint is unavailable for the "
+                    "token type, the token lacks required org/enterprise visibility, "
+                    "the org policy does not expose this resource, or the org is not "
+                    "accessible to the caller."
+                ),
+                "details": exc.details,
+            }
+
+        if exc.status_code == 403:
+            return {
+                "status": "not_authorized",
+                "http_status": exc.status_code,
+                "reason": (
+                    "GitHub returned 403. The token can reach the endpoint but lacks "
+                    "the required permission."
+                ),
+                "details": exc.details,
+            }
+
+        return {
+            "status": "not_collected",
+            "http_status": exc.status_code,
+            "reason": str(exc),
+            "details": exc.details,
+        }
+
+    return {
+        "status": "not_collected",
+        "reason": str(exc),
+    }
 
 
 def collect_enterprise_organizations(
@@ -261,14 +289,10 @@ def collect_enterprise_audit_log(
             )
 
         except Exception as exc:
-            query_results.append(
-                {
-                    "action_prefix": action_prefix,
-                    "phrase": phrase,
-                    "status": "not_collected",
-                    "reason": str(exc),
-                }
-            )
+            result = classify_collection_error(exc)
+            result["action_prefix"] = action_prefix
+            result["phrase"] = phrase
+            query_results.append(result)
 
     deduped_events: Dict[str, Dict[str, Any]] = {}
 
@@ -305,11 +329,9 @@ def collect_org_saml_credential_authorizations(
         }
 
     except Exception as exc:
-        return {
-            "org": org,
-            "status": "not_collected",
-            "reason": str(exc),
-        }
+        result = classify_collection_error(exc)
+        result["org"] = org
+        return result
 
 
 def collect_org_pat_requests(
@@ -328,11 +350,9 @@ def collect_org_pat_requests(
         }
 
     except Exception as exc:
-        return {
-            "org": org,
-            "status": "not_collected",
-            "reason": str(exc),
-        }
+        result = classify_collection_error(exc)
+        result["org"] = org
+        return result
 
 
 def collect_org_fine_grained_pats(
@@ -351,11 +371,13 @@ def collect_org_fine_grained_pats(
         }
 
     except Exception as exc:
-        return {
-            "org": org,
-            "status": "not_collected",
-            "reason": str(exc),
-        }
+        result = classify_collection_error(exc)
+        result["org"] = org
+        return result
+
+
+def count_status(items: List[Dict[str, Any]], status: str) -> int:
+    return sum(1 for item in items if item.get("status") == status)
 
 
 def build_markdown_summary(
@@ -372,16 +394,14 @@ def build_markdown_summary(
     audit_events = audit_log.get("events", [])
     audit_query_results = audit_log.get("query_results", [])
 
-    collected_audit_queries = sum(
-        1 for item in audit_query_results if item["status"] == "collected"
-    )
+    collected_audit_queries = count_status(audit_query_results, "collected")
+    collected_saml = count_status(saml_authz, "collected")
+    collected_pat_requests = count_status(pat_requests, "collected")
+    collected_fine_grained_pats = count_status(fine_grained_pats, "collected")
 
-    collected_saml = sum(1 for item in saml_authz if item["status"] == "collected")
-    collected_pat_requests = sum(
-        1 for item in pat_requests if item["status"] == "collected"
-    )
-    collected_fine_grained_pats = sum(
-        1 for item in fine_grained_pats if item["status"] == "collected"
+    unavailable_fine_grained_pats = count_status(
+        fine_grained_pats,
+        "not_available_or_not_authorized",
     )
 
     lines = [
@@ -402,6 +422,7 @@ def build_markdown_summary(
         f"| Organizations with SAML credential authorization evidence collected | {collected_saml}/{len(orgs)} | Authorized PAT and SSH-key usage with SAML SSO |",
         f"| Organizations with PAT request evidence collected | {collected_pat_requests}/{len(orgs)} | PAT approval and denial workflow evidence |",
         f"| Organizations with fine-grained PAT inventory evidence collected | {collected_fine_grained_pats}/{len(orgs)} | Token inventory, scope, owner, and lifecycle review evidence |",
+        f"| Organizations where fine-grained PAT inventory was unavailable or unauthorized | {unavailable_fine_grained_pats}/{len(orgs)} | Boundary/permission limitation to document in SSP evidence |",
         "",
         "## IA-05 Audit Query Results",
         "",
@@ -412,12 +433,31 @@ def build_markdown_summary(
     for item in audit_query_results:
         result = (
             str(item.get("event_count", 0))
-            if item["status"] == "collected"
+            if item.get("status") == "collected"
             else item.get("reason", "not collected").replace("\n", " ")
         )
 
         lines.append(
-            f"| `{item['action_prefix']}` | `{item['status']}` | {result} |"
+            f"| `{item.get('action_prefix', 'unknown')}` | `{item.get('status', 'unknown')}` | {result} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Fine-Grained PAT Inventory Results",
+            "",
+            "| Organization | Status | Notes |",
+            "|---|---|---|",
+        ]
+    )
+
+    for item in fine_grained_pats:
+        notes = item.get("reason", "")
+        if len(notes) > 240:
+            notes = notes[:237] + "..."
+
+        lines.append(
+            f"| `{item.get('org', 'unknown')}` | `{item.get('status', 'unknown')}` | {notes} |"
         )
 
     lines.extend(
@@ -430,7 +470,7 @@ def build_markdown_summary(
             "| Authenticator issuance and lifecycle | Enterprise audit log events for SSO, PAT, SSH key, GitHub App, OAuth, and membership activity |",
             "| Authenticator revocation | Audit events showing removal, deletion, expiration, or authorization revocation |",
             "| Non-password authenticators | SAML credential authorizations, SSH keys, PATs, fine-grained PATs, GitHub App authorizations |",
-            "| Least privilege and token review | Fine-grained PAT inventory and PAT access-request records |",
+            "| Least privilege and token review | Fine-grained PAT inventory and PAT access-request records where endpoint access is available |",
             "| Compromise response support | Audit events showing credential changes, revocations, and administrative actions |",
             "| Continuous monitoring | Timestamped enterprise-level and organization-level evidence artifacts |",
             "",
@@ -446,9 +486,8 @@ def build_markdown_summary(
             "## Notes",
             "",
             "- GitHub audit-log phrase filters are collected one action prefix at a time to avoid invalid compound query syntax.",
-            "- Some organization evidence may report `not_collected` if the token lacks required enterprise or organization permissions.",
-            "- The token should belong to an enterprise administrator or GitHub App with equivalent approved permissions.",
-            "- Classic PATs for enterprise audit-log access require `read:audit_log`.",
+            "- `404` from fine-grained PAT organization endpoints is recorded as `not_available_or_not_authorized` because GitHub may return 404 when the endpoint is unavailable to the token type, organization, or caller.",
+            "- Some fine-grained PAT organization endpoints require GitHub App authentication rather than the default workflow `GITHUB_TOKEN`.",
             "- This collection does not retrieve secret values, passwords, private keys, or token plaintext.",
             "- Identity-provider password policy, MFA policy, and FIPS/FedRAMP boundary evidence should be collected from the IdP and SSP package separately.",
             "",
