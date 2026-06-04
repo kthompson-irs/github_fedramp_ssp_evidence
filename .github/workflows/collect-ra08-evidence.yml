@@ -3,12 +3,20 @@ name: Collect RA-08 Evidence
 on:
   workflow_dispatch:
     inputs:
+      gh_org:
+        description: "GitHub organization slug to collect evidence from"
+        required: true
+        default: "Taxpayer-Services-and-Online-Accounts"
+      gh_enterprise:
+        description: "GitHub enterprise slug, only used when audit_scope is enterprise"
+        required: false
+        default: ""
       audit_days:
         description: "Number of days of audit log history to collect"
         required: false
         default: "90"
       audit_scope:
-        description: "Audit log scope: enterprise or org"
+        description: "Audit log scope: org, enterprise, or none"
         required: false
         default: "org"
 
@@ -20,8 +28,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GH_ENTERPRISE: internal-revenue-service
-      GH_ORG: internal-revenue-service
+      GH_ORG: ${{ inputs.gh_org }}
+      GH_ENTERPRISE: ${{ inputs.gh_enterprise }}
       AUDIT_DAYS: ${{ inputs.audit_days }}
       AUDIT_SCOPE: ${{ inputs.audit_scope }}
       GH_TOKEN_RA08: ${{ secrets.GH_ENTERPRISE_AUDIT_PAT }}
@@ -42,6 +50,6 @@ jobs:
       - name: Upload RA-08 evidence
         uses: actions/upload-artifact@v4
         with:
-          name: ra08-evidence
+          name: ra08-evidence-${{ inputs.gh_org }}
           path: evidence/ra08/
           if-no-files-found: error
