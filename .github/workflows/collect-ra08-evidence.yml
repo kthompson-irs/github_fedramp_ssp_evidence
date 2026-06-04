@@ -1,0 +1,41 @@
+name: Collect RA-08 Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      audit_days:
+        description: "Number of days of enterprise audit log history to collect"
+        required: false
+        default: "90"
+
+permissions:
+  contents: read
+
+jobs:
+  collect-ra08:
+    runs-on: ubuntu-latest
+
+    env:
+      GITHUB_ENTERPRISE: internal-revenue-service
+      GITHUB_ORG: internal-revenue-service
+      AUDIT_DAYS: ${{ inputs.audit_days }}
+      GITHUB_TOKEN_RA08: ${{ secrets.GH_ENTERPRISE_AUDIT_PAT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect RA-08 evidence
+        run: |
+          python scripts/collect_ra08_evidence.py
+
+      - name: Upload RA-08 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ra08-evidence
+          path: evidence/ra08/
