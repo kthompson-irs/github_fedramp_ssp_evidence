@@ -12,25 +12,24 @@ on:
         required: true
         default: "30"
 
-  schedule:
-    - cron: "0 6 1 * *"
-
 permissions:
   contents: read
 
 jobs:
   collect-evidence:
-    name: Collect IA-02(12) Evidence
     runs-on: ubuntu-latest
 
     env:
-      ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || 'internal-revenue-service' }}
-      LOOKBACK_DAYS: ${{ inputs.lookback_days || '30' }}
+      ENTERPRISE_SLUG: ${{ inputs.enterprise_slug }}
+      LOOKBACK_DAYS: ${{ inputs.lookback_days }}
       GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Validate token
         run: |
@@ -38,11 +37,6 @@ jobs:
             echo "Missing required secret: GH_ENTERPRISE_TOKEN"
             exit 1
           fi
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Collect IA-02(12) evidence
         run: |
