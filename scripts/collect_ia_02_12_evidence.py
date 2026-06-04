@@ -32,20 +32,42 @@ def utc_now():
 
 
 def iso_z(value):
-    return value.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        value.astimezone(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def require_token():
-    token = os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token:
+    raw_token = os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_TOKEN")
+
+    if raw_token is None:
         print("ERROR: Set GH_ENTERPRISE_TOKEN as a repository secret.", file=sys.stderr)
         sys.exit(1)
+
+    token = raw_token.strip()
+
+    if not token:
+        print("ERROR: GH_ENTERPRISE_TOKEN is empty after trimming whitespace.", file=sys.stderr)
+        sys.exit(1)
+
+    invalid_chars = ["\n", "\r", "\t", " "]
+    if any(char in token for char in invalid_chars):
+        print(
+            "ERROR: GH_ENTERPRISE_TOKEN contains whitespace or line breaks. "
+            "Re-create the GitHub secret as a single-line token value.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     return token
 
 
 def github_request(method, url, token, body=None, accept="application/vnd.github+json"):
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
         "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "ia-02-12-evidence-collector",
@@ -63,25 +85,32 @@ def github_request(method, url, token, body=None, accept="application/vnd.github
             with urllib.request.urlopen(request, timeout=60) as response:
                 payload = response.read().decode("utf-8")
                 headers_out = dict(response.headers)
+
                 if not payload:
                     return None, headers_out
+
                 return json.loads(payload), headers_out
+
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+
             if exc.code in (403, 429) and attempt < 5:
                 wait = 30 * attempt
                 print(f"Rate limited or forbidden temporarily. Waiting {wait} seconds.")
                 time.sleep(wait)
                 continue
+
             print(f"ERROR: GitHub API request failed: {method} {url}", file=sys.stderr)
             print(f"HTTP {exc.code}: {detail}", file=sys.stderr)
             raise
+
         except urllib.error.URLError as exc:
             if attempt < 5:
                 wait = 10 * attempt
                 print(f"Network issue. Waiting {wait} seconds.")
                 time.sleep(wait)
                 continue
+
             raise exc
 
 
@@ -90,7 +119,10 @@ def graphql(token, query, variables):
         "POST",
         GITHUB_GRAPHQL,
         token,
-        body={"query": query, "variables": variables},
+        body={
+            "query": query,
+            "variables": variables,
+        },
     )
 
     if payload.get("errors"):
@@ -117,6 +149,7 @@ def write_csv(path, rows):
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
+
         for row in rows:
             writer.writerow(row)
 
@@ -179,6 +212,7 @@ def collect_enterprise_profile(token, enterprise):
       }
     }
     """
+
     return graphql(token, query, {"slug": enterprise})
 
 
@@ -305,11 +339,23 @@ def collect_audit_stream_config(token, enterprise):
         return {
             "collection_status": "not_collected",
             "reason": str(exc),
-            "note": "Audit log streaming configuration may require enterprise owner permissions or may not be enabled.",
+            "note": (
+                "Audit log streaming configuration may require enterprise owner "
+                "permissions or may not be enabled."
+            ),
         }
 
 
-def make_markdown_summary(path, enterprise, generated_at, lookback_days, profile, orgs, members, audit_counts, out_dir):
+def make_markdown_summary(
+    path,
+    enterprise,
+    generated_at,
+    lookback_days,
+    profile,
+    orgs,
+    members,
+    audit_counts,
+):
     enterprise_data = profile.get("enterprise", {})
 
     lines = [
@@ -321,7 +367,13 @@ def make_markdown_summary(path, enterprise, generated_at, lookback_days, profile
         "",
         "## Control Context",
         "",
-        "IA-02(12) evidence from GitHub demonstrates that the enterprise accepts federated authentication events, records SAML/SSO/SCIM-related events, and maintains an enterprise-level user and organization population. GitHub evidence should be correlated with the IRS identity provider evidence showing PIV/CAC certificate-based authentication.",
+        (
+            "IA-02(12) evidence from GitHub demonstrates that the enterprise "
+            "accepts federated authentication events, records SAML/SSO/SCIM-related "
+            "events, and maintains an enterprise-level user and organization "
+            "population. GitHub evidence should be correlated with IRS identity "
+            "provider evidence showing PIV/CAC certificate-based authentication."
+        ),
         "",
         "## Enterprise Profile",
         "",
@@ -351,11 +403,18 @@ def make_markdown_summary(path, enterprise, generated_at, lookback_days, profile
             "- `audit_log_stream_config.json`",
             "- `audit_logs/*.json`",
             "- `audit_logs/*.csv`",
+            "- `collection_metadata.json`",
             "- `IA-02-12-evidence-package.zip`",
             "",
             "## Assessor Note",
             "",
-            "GitHub audit data does not independently prove that a user presented a PIV credential. The authoritative proof of PIV/CAC use must come from the IRS identity provider sign-in logs. GitHub evidence supports the GitHub side of the implementation by showing enterprise federation, authentication, SSO, SCIM, and account activity.",
+            (
+                "GitHub audit data does not independently prove that a user presented "
+                "a PIV credential. The authoritative proof of PIV/CAC use must come "
+                "from the IRS identity provider sign-in logs. GitHub evidence supports "
+                "the GitHub side of the implementation by showing enterprise federation, "
+                "authentication, SSO, SCIM, and account activity."
+            ),
             "",
         ]
     )
@@ -368,6 +427,7 @@ def zip_directory(source_dir, zip_path):
         for file_path in source_dir.rglob("*"):
             if file_path == zip_path:
                 continue
+
             if file_path.is_file():
                 archive.write(file_path, file_path.relative_to(source_dir))
 
@@ -387,6 +447,7 @@ def main():
 
     out_dir = Path(args.output_dir)
     audit_dir = out_dir / "audit_logs"
+
     out_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
 
@@ -411,7 +472,13 @@ def main():
 
     for evidence_name, phrase in AUDIT_SEARCH_PHRASES.items():
         print(f"Collecting audit log evidence: {evidence_name}")
-        rows = collect_audit_log(token, args.enterprise, phrase, created_after)
+
+        rows = collect_audit_log(
+            token=token,
+            enterprise=args.enterprise,
+            phrase=phrase,
+            created_after=created_after,
+        )
 
         audit_counts[evidence_name] = len(rows)
 
@@ -430,21 +497,23 @@ def main():
         "created_after": created_after,
         "audit_search_phrases": AUDIT_SEARCH_PHRASES,
         "audit_counts": audit_counts,
-        "important_note": "GitHub evidence must be correlated with IRS IdP logs to prove PIV/CAC authentication method.",
+        "important_note": (
+            "GitHub evidence must be correlated with IRS identity provider logs "
+            "to prove PIV/CAC authentication method."
+        ),
     }
 
     write_json(out_dir / "collection_metadata.json", metadata)
 
     make_markdown_summary(
-        out_dir / "IA-02-12-summary.md",
-        args.enterprise,
-        generated_at,
-        args.lookback_days,
-        profile,
-        orgs,
-        members,
-        audit_counts,
-        out_dir,
+        path=out_dir / "IA-02-12-summary.md",
+        enterprise=args.enterprise,
+        generated_at=generated_at,
+        lookback_days=args.lookback_days,
+        profile=profile,
+        orgs=orgs,
+        members=members,
+        audit_counts=audit_counts,
     )
 
     zip_directory(out_dir, out_dir / "IA-02-12-evidence-package.zip")
