@@ -71,15 +71,17 @@ COLLECTION_WARNINGS = []
 
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
+
     if not value:
         print(f"ERROR: Missing required environment variable: {name}", file=sys.stderr)
         sys.exit(1)
+
     return value
 
 
 TOKEN = required_env("GH_TOKEN_RA08")
-ENTERPRISE = required_env("GH_ENTERPRISE")
 ORG = required_env("GH_ORG")
+ENTERPRISE = os.getenv("GH_ENTERPRISE", "").strip()
 AUDIT_DAYS = int(os.getenv("AUDIT_DAYS", "90"))
 AUDIT_SCOPE = os.getenv("AUDIT_SCOPE", "org").strip().lower()
 
@@ -104,21 +106,26 @@ def build_url(url: str, params: dict | None = None) -> str:
 
 def parse_link_header(value: str | None) -> dict:
     links = {}
+
     if not value:
         return links
 
     for part in value.split(","):
         section = part.strip().split(";")
+
         if len(section) < 2:
             continue
 
         url = section[0].strip()
+
         if url.startswith("<") and url.endswith(">"):
             url = url[1:-1]
 
         rel = None
+
         for item in section[1:]:
             item = item.strip()
+
             if item.startswith("rel="):
                 rel = item.split("=", 1)[1].strip('"')
 
@@ -135,15 +142,26 @@ def add_warning(area: str, url: str, status: int, message: str):
         "status": status,
         "message": message,
     }
+
     COLLECTION_WARNINGS.append(warning)
     print(f"WARNING: {area}: HTTP {status}: {message}", file=sys.stderr)
 
 
-def request_json(url: str, params: dict | None = None, optional: bool = False, area: str = "request"):
+def request_json(
+    url: str,
+    params: dict | None = None,
+    optional: bool = False,
+    area: str = "request",
+    warn_on_404: bool = True,
+):
     final_url = build_url(url, params)
 
     while True:
-        request = urllib.request.Request(final_url, headers=github_headers(), method="GET")
+        request = urllib.request.Request(
+            final_url,
+            headers=github_headers(),
+            method="GET",
+        )
 
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -162,6 +180,7 @@ def request_json(url: str, params: dict | None = None, optional: bool = False, a
             if error.code in (403, 429):
                 remaining = headers.get("X-RateLimit-Remaining")
                 reset = headers.get("X-RateLimit-Reset")
+
                 if remaining == "0" and reset:
                     sleep_for = max(5, int(reset) - int(time.time()) + 5)
                     print(f"Rate limited. Sleeping {sleep_for} seconds.", file=sys.stderr)
@@ -169,7 +188,14 @@ def request_json(url: str, params: dict | None = None, optional: bool = False, a
                     continue
 
             if optional:
-                add_warning(area, final_url, error.code, body[:1000] if body else str(error))
+                if error.code != 404 or warn_on_404:
+                    add_warning(
+                        area,
+                        final_url,
+                        error.code,
+                        body[:1000] if body else str(error),
+                    )
+
                 return None, {}
 
             print(f"ERROR: HTTP {error.code} {final_url}", file=sys.stderr)
@@ -177,13 +203,23 @@ def request_json(url: str, params: dict | None = None, optional: bool = False, a
             raise
 
 
-def paginate(url: str, params: dict | None = None, optional: bool = False, area: str = "request") -> list:
+def paginate(
+    url: str,
+    params: dict | None = None,
+    optional: bool = False,
+    area: str = "request",
+) -> list:
     items = []
     next_url = url
     next_params = params
 
     while next_url:
-        data, headers = request_json(next_url, next_params, optional=optional, area=area)
+        data, headers = request_json(
+            next_url,
+            next_params,
+            optional=optional,
+            area=area,
+        )
 
         if data is None:
             break
@@ -202,7 +238,10 @@ def paginate(url: str, params: dict | None = None, optional: bool = False, area:
 
 def write_json(name: str, data):
     path = OUT_DIR / name
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -242,9 +281,82 @@ def flatten_repo(repo: dict) -> dict:
     }
 
 
+def collect_token_user() -> dict:
+    user, _headers = request_json(
+        f"{API}/user",
+        optional=True,
+        area="token_user",
+    )
+
+    if not isinstance(user, dict):
+        return {}
+
+    return {
+        "login": user.get("login"),
+        "id": user.get("id"),
+        "type": user.get("type"),
+        "site_admin": user.get("site_admin"),
+        "html_url": user.get("html_url"),
+    }
+
+
+def collect_org_membership() -> dict:
+    membership, _headers = request_json(
+        f"{API}/user/memberships/orgs/{ORG}",
+        optional=True,
+        area="org_membership",
+    )
+
+    if not isinstance(membership, dict):
+        return {}
+
+    organization = membership.get("organization", {})
+
+    return {
+        "organization_login": organization.get("login"),
+        "state": membership.get("state"),
+        "role": membership.get("role"),
+        "organization_url": organization.get("html_url"),
+    }
+
+
+def collect_access_diagnostics() -> dict:
+    token_user = collect_token_user()
+    org_membership = collect_org_membership()
+
+    diagnostics = {
+        "token_user": token_user,
+        "org_membership": org_membership,
+        "expected_access": {
+            "org": ORG,
+            "enterprise": ENTERPRISE,
+            "audit_scope": AUDIT_SCOPE,
+            "recommended_classic_pat_scopes": [
+                "repo",
+                "read:org",
+                "read:enterprise",
+                "read:audit_log",
+            ],
+            "notes": [
+                "The token user must be an Organization Owner to collect org audit logs.",
+                "The token user must be an Enterprise Owner/Admin to collect enterprise audit logs.",
+                "If SAML SSO is enabled, the classic PAT must be authorized for the target organization.",
+            ],
+        },
+    }
+
+    return diagnostics
+
+
 def get_file_if_exists(repo_full_name: str, path: str):
     url = f"{API}/repos/{repo_full_name}/contents/{urllib.parse.quote(path)}"
-    data, _headers = request_json(url, optional=True, area="governance_file_lookup")
+
+    data, _headers = request_json(
+        url,
+        optional=True,
+        area="governance_file_lookup",
+        warn_on_404=False,
+    )
 
     if not isinstance(data, dict):
         return None
@@ -260,20 +372,38 @@ def get_file_if_exists(repo_full_name: str, path: str):
     }
 
 
-def build_audit_url() -> str:
+def build_audit_url() -> str | None:
+    if AUDIT_SCOPE == "none":
+        return None
+
     if AUDIT_SCOPE == "enterprise":
+        if not ENTERPRISE:
+            add_warning(
+                "audit_log",
+                "not_applicable",
+                0,
+                "AUDIT_SCOPE is enterprise, but GH_ENTERPRISE is empty.",
+            )
+            return None
+
         return f"{API}/enterprises/{ENTERPRISE}/audit-log"
 
     if AUDIT_SCOPE == "org":
         return f"{API}/orgs/{ORG}/audit-log"
 
-    print("ERROR: AUDIT_SCOPE must be either 'enterprise' or 'org'.", file=sys.stderr)
+    print("ERROR: AUDIT_SCOPE must be 'org', 'enterprise', or 'none'.", file=sys.stderr)
     sys.exit(1)
 
 
 def collect_readme_candidate_hits(repo_full_name: str):
     url = f"{API}/repos/{repo_full_name}/readme"
-    data, _headers = request_json(url, optional=True, area="readme_lookup")
+
+    data, _headers = request_json(
+        url,
+        optional=True,
+        area="readme_lookup",
+        warn_on_404=False,
+    )
 
     if not isinstance(data, dict):
         return None
@@ -298,6 +428,20 @@ def collect_readme_candidate_hits(repo_full_name: str):
     }
 
 
+def build_org_profile(org: dict) -> dict:
+    return {
+        "login": org.get("login") if isinstance(org, dict) else None,
+        "id": org.get("id") if isinstance(org, dict) else None,
+        "html_url": org.get("html_url") if isinstance(org, dict) else None,
+        "description": org.get("description") if isinstance(org, dict) else None,
+        "public_repos": org.get("public_repos") if isinstance(org, dict) else None,
+        "owned_private_repos": org.get("owned_private_repos") if isinstance(org, dict) else None,
+        "two_factor_requirement_enabled": (
+            org.get("two_factor_requirement_enabled") if isinstance(org, dict) else None
+        ),
+    }
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -314,6 +458,8 @@ def main():
         "audit_start_utc": audit_start.isoformat(),
         "audit_days": AUDIT_DAYS,
     }
+
+    access_diagnostics = collect_access_diagnostics()
 
     org, _org_headers = request_json(
         f"{API}/orgs/{ORG}",
@@ -350,18 +496,23 @@ def main():
         area="teams",
     )
 
-    audit_phrase = " OR ".join(RA08_AUDIT_KEYWORDS)
-    audit_query = f"created:>={audit_start.strftime('%Y-%m-%d')} ({audit_phrase})"
+    audit_logs = []
 
-    audit_logs = paginate(
-        build_audit_url(),
-        {
-            "per_page": 100,
-            "phrase": audit_query,
-        },
-        optional=True,
-        area="audit_log",
-    )
+    audit_url = build_audit_url()
+
+    if audit_url:
+        audit_phrase = " OR ".join(RA08_AUDIT_KEYWORDS)
+        audit_query = f"created:>={audit_start.strftime('%Y-%m-%d')} ({audit_phrase})"
+
+        audit_logs = paginate(
+            audit_url,
+            {
+                "per_page": 100,
+                "phrase": audit_query,
+            },
+            optional=True,
+            area="audit_log",
+        )
 
     repo_rows = [flatten_repo(repo) for repo in repos]
 
@@ -461,17 +612,8 @@ def main():
 
     summary = {
         **metadata,
-        "organization_profile": {
-            "login": org.get("login") if isinstance(org, dict) else None,
-            "id": org.get("id") if isinstance(org, dict) else None,
-            "html_url": org.get("html_url") if isinstance(org, dict) else None,
-            "description": org.get("description") if isinstance(org, dict) else None,
-            "public_repos": org.get("public_repos") if isinstance(org, dict) else None,
-            "owned_private_repos": org.get("owned_private_repos") if isinstance(org, dict) else None,
-            "two_factor_requirement_enabled": (
-                org.get("two_factor_requirement_enabled") if isinstance(org, dict) else None
-            ),
-        },
+        "organization_profile": build_org_profile(org),
+        "access_diagnostics": access_diagnostics,
         "counts": {
             "repositories": len(repos),
             "members": len(members),
@@ -486,6 +628,7 @@ def main():
     }
 
     write_json("summary.json", summary)
+    write_json("access_diagnostics.json", access_diagnostics)
     write_json("repositories.json", repos)
     write_json("members.json", members)
     write_json("teams.json", teams)
@@ -504,6 +647,9 @@ def main():
     write_csv("readme_privacy_hits.csv", readme_privacy_hits)
     write_csv("collection_warnings.csv", warning_rows)
 
+    token_user = access_diagnostics.get("token_user", {})
+    org_membership = access_diagnostics.get("org_membership", {})
+
     markdown = f"""# RA-08 Evidence Collection Summary
 
 Control: RA-08 Privacy Impact Assessments
@@ -513,6 +659,15 @@ Organization: `{ORG}`
 Audit scope: `{AUDIT_SCOPE}`  
 Collected UTC: `{collected_at.isoformat()}`  
 Audit lookback days: `{AUDIT_DAYS}`
+
+## Token and Access Diagnostics
+
+| Item | Value |
+|---|---|
+| Token user | `{token_user.get("login")}` |
+| Org membership state | `{org_membership.get("state")}` |
+| Org membership role | `{org_membership.get("role")}` |
+| Org membership login | `{org_membership.get("organization_login")}` |
 
 ## Evidence Counts
 
@@ -537,6 +692,7 @@ Review:
 
 - `collection_warnings.csv`
 - `collection_warnings.json`
+- `access_diagnostics.json`
 
 A warning usually means the provided token does not have access to that evidence source. The workflow still creates the evidence artifact so the missing evidence can be tracked as an assessment finding or collection limitation.
 
@@ -549,6 +705,7 @@ The Privacy Officer, System Owner, and ISSO should review:
 - `readme_privacy_hits.csv`
 - `audit_log_ra08_events.csv`
 - `collection_warnings.csv`
+- `access_diagnostics.json`
 
 These files help determine whether a Privacy Threshold Analysis, Privacy Impact Assessment, or PIA update is required.
 
