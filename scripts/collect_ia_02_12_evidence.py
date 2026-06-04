@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import zipfile
 from pathlib import Path
 
@@ -80,7 +81,7 @@ def github_request(method, url, token, body=None, accept="application/vnd.github
 
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
 
-    for attempt in range(1, 6):
+    for attempt in range(1, 4):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 payload = response.read().decode("utf-8")
@@ -93,24 +94,34 @@ def github_request(method, url, token, body=None, accept="application/vnd.github
 
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            headers_out = dict(exc.headers)
 
-            if exc.code in (403, 429) and attempt < 5:
-                wait = 30 * attempt
-                print(f"Rate limited or forbidden temporarily. Waiting {wait} seconds.")
-                time.sleep(wait)
-                continue
+            rate_remaining = headers_out.get("x-ratelimit-remaining")
+            retry_after = headers_out.get("retry-after")
+
+            if exc.code in (403, 429):
+                if rate_remaining == "0":
+                    raise RuntimeError(
+                        f"GitHub API rate limit exceeded for URL: {url}. "
+                        f"HTTP {exc.code}. Response: {detail}"
+                    )
+
+                if retry_after and attempt < 3:
+                    time.sleep(int(retry_after))
+                    continue
+
+                if attempt < 3:
+                    time.sleep(10 * attempt)
+                    continue
 
             print(f"ERROR: GitHub API request failed: {method} {url}", file=sys.stderr)
             print(f"HTTP {exc.code}: {detail}", file=sys.stderr)
             raise
 
         except urllib.error.URLError as exc:
-            if attempt < 5:
-                wait = 10 * attempt
-                print(f"Network issue. Waiting {wait} seconds.")
-                time.sleep(wait)
+            if attempt < 3:
+                time.sleep(10 * attempt)
                 continue
-
             raise exc
 
 
@@ -241,8 +252,7 @@ def collect_all_enterprise_orgs(token, enterprise):
         data = graphql(token, query, {"slug": enterprise, "cursor": cursor})
         connection = data["enterprise"]["organizations"]
 
-        for node in connection["nodes"]:
-            rows.append(node)
+        rows.extend(connection["nodes"])
 
         if not connection["pageInfo"]["hasNextPage"]:
             break
@@ -305,11 +315,20 @@ def collect_all_enterprise_members(token, enterprise):
     return rows
 
 
-def collect_audit_log(token, enterprise, phrase, created_after):
+def collect_audit_log(token, enterprise, phrase, created_after, max_pages):
     rows = []
     page = 1
+    status = {
+        "phrase": phrase,
+        "created_after": created_after,
+        "max_pages": max_pages,
+        "pages_requested": 0,
+        "records_collected": 0,
+        "complete": False,
+        "stopped_reason": None,
+    }
 
-    while True:
+    while page <= max_pages:
         query = {
             "phrase": f"{phrase} created:>={created_after}",
             "per_page": "100",
@@ -324,19 +343,36 @@ def collect_audit_log(token, enterprise, phrase, created_after):
             f"{urllib.parse.urlencode(query)}"
         )
 
-        payload, _ = github_request("GET", url, token)
+        try:
+            payload, _ = github_request("GET", url, token)
+        except RuntimeError as exc:
+            status["stopped_reason"] = str(exc)
+            break
+
+        status["pages_requested"] = page
 
         if not payload:
+            status["complete"] = True
+            status["stopped_reason"] = "No additional audit log records returned."
             break
 
         rows.extend(payload)
+        status["records_collected"] = len(rows)
 
         if len(payload) < 100:
+            status["complete"] = True
+            status["stopped_reason"] = "Last page contained fewer than 100 records."
             break
 
         page += 1
 
-    return rows
+    if page > max_pages:
+        status["stopped_reason"] = (
+            f"Stopped at configured max page limit of {max_pages} pages "
+            "to avoid exhausting GitHub audit-log API rate limits."
+        )
+
+    return rows, status
 
 
 def collect_audit_stream_config(token, enterprise):
@@ -361,10 +397,12 @@ def make_markdown_summary(
     enterprise,
     generated_at,
     lookback_days,
+    max_audit_pages,
     profile,
     orgs,
     members,
     audit_counts,
+    audit_statuses,
 ):
     enterprise_data = profile.get("enterprise", {})
 
@@ -374,6 +412,7 @@ def make_markdown_summary(
         f"Enterprise slug: `{enterprise}`",
         f"Generated at: `{generated_at}`",
         f"Lookback period: `{lookback_days}` days",
+        f"Max audit pages per query: `{max_audit_pages}`",
         "",
         "## Control Context",
         "",
@@ -397,12 +436,15 @@ def make_markdown_summary(
         "",
         "## Audit Evidence Collected",
         "",
-        "| Evidence Set | Events |",
-        "|---|---:|",
+        "| Evidence Set | Events | Complete | Stopped Reason |",
+        "|---|---:|---|---|",
     ]
 
     for name, count in audit_counts.items():
-        lines.append(f"| {name} | {count} |")
+        status = audit_statuses.get(name, {})
+        lines.append(
+            f"| {name} | {count} | {status.get('complete')} | {status.get('stopped_reason', '')} |"
+        )
 
     lines.extend(
         [
@@ -413,6 +455,7 @@ def make_markdown_summary(
             "- `enterprise_organizations.csv`",
             "- `enterprise_members.csv`",
             "- `audit_log_stream_config.json`",
+            "- `audit_collection_status.json`",
             "- `audit_logs/*.json`",
             "- `audit_logs/*.csv`",
             "- `collection_metadata.json`",
@@ -448,6 +491,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--enterprise", required=True)
     parser.add_argument("--lookback-days", type=int, default=30)
+    parser.add_argument("--max-audit-pages", type=int, default=25)
     parser.add_argument("--output-dir", default="evidence/IA-02-12")
     args = parser.parse_args()
 
@@ -465,6 +509,7 @@ def main():
 
     print(f"Collecting IA-02(12) evidence for enterprise: {args.enterprise}")
     print(f"Audit log lookback starts at: {created_after}")
+    print(f"Max audit pages per query: {args.max_audit_pages}")
 
     profile = collect_enterprise_profile(token, args.enterprise)
     write_json(out_dir / "enterprise_profile.json", profile)
@@ -481,18 +526,21 @@ def main():
     write_json(out_dir / "audit_log_stream_config.json", stream_config)
 
     audit_counts = {}
+    audit_statuses = {}
 
     for evidence_name, phrase in AUDIT_SEARCH_PHRASES.items():
         print(f"Collecting audit log evidence: {evidence_name}")
 
-        rows = collect_audit_log(
+        rows, status = collect_audit_log(
             token=token,
             enterprise=args.enterprise,
             phrase=phrase,
             created_after=created_after,
+            max_pages=args.max_audit_pages,
         )
 
         audit_counts[evidence_name] = len(rows)
+        audit_statuses[evidence_name] = status
 
         write_json(audit_dir / f"{evidence_name}.json", rows)
         write_csv(
@@ -500,12 +548,15 @@ def main():
             [flatten_json(row) for row in rows],
         )
 
+    write_json(out_dir / "audit_collection_status.json", audit_statuses)
+
     metadata = {
         "control": "IA-02(12)",
         "control_name": "Identification and Authentication - Acceptance of PIV Credentials",
         "enterprise": args.enterprise,
         "generated_at": generated_at,
         "lookback_days": args.lookback_days,
+        "max_audit_pages": args.max_audit_pages,
         "created_after": created_after,
         "audit_search_phrases": AUDIT_SEARCH_PHRASES,
         "audit_counts": audit_counts,
@@ -522,10 +573,12 @@ def main():
         enterprise=args.enterprise,
         generated_at=generated_at,
         lookback_days=args.lookback_days,
+        max_audit_pages=args.max_audit_pages,
         profile=profile,
         orgs=orgs,
         members=members,
         audit_counts=audit_counts,
+        audit_statuses=audit_statuses,
     )
 
     zip_directory(out_dir, out_dir / "IA-02-12-evidence-package.zip")
