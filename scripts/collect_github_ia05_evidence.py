@@ -174,11 +174,10 @@ def classify_collection_error(exc: Exception) -> Dict[str, Any]:
                 "status": "not_available_or_not_authorized",
                 "http_status": exc.status_code,
                 "reason": (
-                    "GitHub returned 404. For these organization programmatic-access "
-                    "endpoints, this usually means the endpoint is unavailable for the "
-                    "token type, the token lacks required org/enterprise visibility, "
-                    "the org policy does not expose this resource, or the org is not "
-                    "accessible to the caller."
+                    "GitHub returned 404. This usually means the endpoint is unavailable "
+                    "for the token type, the token lacks required visibility, the org "
+                    "policy does not expose this resource, or the org is not accessible "
+                    "to the caller."
                 ),
                 "details": exc.details,
             }
@@ -487,7 +486,7 @@ def build_markdown_summary(
             "",
             "- GitHub audit-log phrase filters are collected one action prefix at a time to avoid invalid compound query syntax.",
             "- `404` from fine-grained PAT organization endpoints is recorded as `not_available_or_not_authorized` because GitHub may return 404 when the endpoint is unavailable to the token type, organization, or caller.",
-            "- Some fine-grained PAT organization endpoints require GitHub App authentication rather than the default workflow `GITHUB_TOKEN`.",
+            "- Some fine-grained PAT organization endpoints require GitHub App authentication rather than the workflow token.",
             "- This collection does not retrieve secret values, passwords, private keys, or token plaintext.",
             "- Identity-provider password policy, MFA policy, and FIPS/FedRAMP boundary evidence should be collected from the IdP and SSP package separately.",
             "",
@@ -498,16 +497,10 @@ def build_markdown_summary(
 
 
 def get_token_from_environment() -> str:
-    token = (
-        os.environ.get("GH_ENTERPRISE_ADMIN_TOKEN")
-        or os.environ.get("GITHUB_TOKEN")
-        or ""
-    ).strip()
+    token = os.environ.get("GH_TOKEN", "").strip()
 
     if not token:
-        raise ValueError(
-            "GitHub token is required. Set GH_ENTERPRISE_ADMIN_TOKEN or GITHUB_TOKEN."
-        )
+        raise ValueError("GitHub token is required. Set GH_TOKEN.")
 
     return token
 
@@ -515,9 +508,9 @@ def get_token_from_environment() -> str:
 def main() -> int:
     try:
         token = get_token_from_environment()
-        enterprise = os.environ.get("GITHUB_ENTERPRISE", "internal-revenue-service").strip()
-        output_dir = Path(os.environ.get("OUTPUT_DIR", "ia05-evidence"))
-        lookback_days = int(os.environ.get("IA05_LOOKBACK_DAYS", "90"))
+        enterprise = os.environ.get("GH_ENTERPRISE", "internal-revenue-service").strip()
+        output_dir = Path(os.environ.get("GH_OUTPUT_DIR", "ia05-evidence"))
+        lookback_days = int(os.environ.get("GH_IA05_LOOKBACK_DAYS", "90"))
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
