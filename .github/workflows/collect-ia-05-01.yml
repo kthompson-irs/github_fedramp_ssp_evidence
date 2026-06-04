@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GITHUB_TOKEN_FOR_AUDIT: ${{ secrets.IA0501_GITHUB_TOKEN }}
+      GH_TOKEN_FOR_AUDIT: ${{ secrets.IA0501_GH_TOKEN }}
       ENTERPRISE_SLUG: internal-revenue-service
       OUTPUT_DIR: evidence/IA-05-01
 
