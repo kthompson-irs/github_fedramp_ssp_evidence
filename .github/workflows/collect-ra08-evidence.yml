@@ -44,3 +44,4 @@ jobs:
         with:
           name: ra08-evidence
           path: evidence/ra08/
+          if-no-files-found: error
