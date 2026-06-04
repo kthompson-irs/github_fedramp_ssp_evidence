@@ -1,267 +1,77 @@
-name: AU-12 Enterprise Audit Export
+name: Collect IA-02(12) GitHub Enterprise Evidence
 
 on:
-  schedule:
-    - cron: '15 2 * * *'
-
   workflow_dispatch:
     inputs:
-      org_scope:
-        description: 'Comma-separated organization list, or ALL to use AU12_ORG_LIST'
-        required: false
-        default: 'ALL'
-
+      enterprise_slug:
+        description: GitHub Enterprise slug
+        required: true
+        default: internal-revenue-service
       lookback_days:
-        description: 'Number of days to export'
-        required: false
-        default: '1'
+        description: Number of days of audit logs to collect
+        required: true
+        default: "30"
+      max_audit_pages:
+        description: Max audit-log pages per evidence query
+        required: true
+        default: "5"
+      collect_audit_logs:
+        description: Collect enterprise audit logs
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
 
-concurrency:
-  group: au12-audit-export
-  cancel-in-progress: false
-
 jobs:
-  export-audit-logs:
+  collect-evidence:
     runs-on: ubuntu-latest
 
     env:
-      ENTERPRISE_SLUG: internal-revenue-service
-      GH_API_BASE_URL: https://api.github.com
-      LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '1' }}
-      ORG_SCOPE: ${{ github.event.inputs.org_scope || 'ALL' }}
-      AU12_AUDIT_TOKEN: ${{ secrets.AU12_AUDIT_TOKEN }}
-      AU12_ORG_LIST: ${{ secrets.AU12_ORG_LIST }}
+      ENTERPRISE_SLUG: ${{ inputs.enterprise_slug }}
+      LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+      MAX_AUDIT_PAGES: ${{ inputs.max_audit_pages }}
+      COLLECT_AUDIT_LOGS: ${{ inputs.collect_audit_logs }}
+      GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y jq curl
-
-      - name: Validate GitHub token and audit-log access
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -z "${AU12_AUDIT_TOKEN:-}" ]; then
-            echo "ERROR: AU12_AUDIT_TOKEN is empty."
-            exit 1
-          fi
-
-          if printf '%s' "${AU12_AUDIT_TOKEN}" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
-            echo "ERROR: AU12_AUDIT_TOKEN contains whitespace, line breaks, or control characters."
-            exit 1
-          fi
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GH_API_BASE_URL}/user" \
-            >/dev/null
-
-          HTTP_CODE="$(
-            curl \
-              --silent \
-              --show-error \
-              --location \
-              --output /tmp/au12-audit-check.json \
-              --write-out "%{http_code}" \
-              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?per_page=1"
-          )"
-
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Enterprise audit-log access failed with HTTP ${HTTP_CODE}."
-            cat /tmp/au12-audit-check.json
-            exit 1
-          fi
-
-      - name: Prepare output directories
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p out/raw out/normalized out/summaries
-
-      - name: Resolve organization list
-        id: orgs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${ORG_SCOPE}" = "ALL" ]; then
-            ORG_LIST="${AU12_ORG_LIST:-}"
-          else
-            ORG_LIST="${ORG_SCOPE}"
-          fi
-
-          ORG_LIST="$(printf '%s' "${ORG_LIST}" | tr -d '[:space:]')"
-
-          if [ -z "${ORG_LIST}" ]; then
-            echo "ERROR: No organizations resolved."
-            echo "Set secret AU12_ORG_LIST to a comma-separated list of orgs."
-            exit 1
-          fi
-
-          echo "Organizations to export: ${ORG_LIST}"
-          echo "org_list=${ORG_LIST}" >> "$GITHUB_OUTPUT"
-
-      - name: Export enterprise audit log
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SINCE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)"
-          UNTIL="$(date -u +%F)"
-          OUTFILE="out/raw/enterprise-${ENTERPRISE_SLUG}-${SINCE}-to-${UNTIL}.json"
-
-          HTTP_CODE="$(
-            curl \
-              --silent \
-              --show-error \
-              --location \
-              --output "${OUTFILE}" \
-              --write-out "%{http_code}" \
-              --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-              --header "Accept: application/vnd.github+json" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "${GH_API_BASE_URL}/enterprises/${ENTERPRISE_SLUG}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}"
-          )"
-
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Enterprise audit export failed. HTTP ${HTTP_CODE}."
-            cat "${OUTFILE}"
-            exit 1
-          fi
-
-      - name: Export organization audit logs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SINCE="$(date -u -d "${LOOKBACK_DAYS} days ago" +%F)"
-          UNTIL="$(date -u +%F)"
-
-          IFS=',' read -ra ORGS <<< "${{ steps.orgs.outputs.org_list }}"
-
-          for ORG in "${ORGS[@]}"; do
-            ORG_TRIMMED="$(echo "$ORG" | xargs)"
-            [ -z "$ORG_TRIMMED" ] && continue
-
-            OUTFILE="out/raw/org-${ORG_TRIMMED}-${SINCE}-to-${UNTIL}.json"
-
-            HTTP_CODE="$(
-              curl \
-                --silent \
-                --show-error \
-                --location \
-                --output "${OUTFILE}" \
-                --write-out "%{http_code}" \
-                --header "Authorization: Bearer ${AU12_AUDIT_TOKEN}" \
-                --header "Accept: application/vnd.github+json" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "${GH_API_BASE_URL}/orgs/${ORG_TRIMMED}/audit-log?include=all&per_page=100&phrase=created:${SINCE}..${UNTIL}"
-            )"
-
-            if [ "${HTTP_CODE}" != "200" ]; then
-              echo "ERROR: Org audit export failed for ${ORG_TRIMMED}. HTTP ${HTTP_CODE}."
-              cat "${OUTFILE}"
-              exit 1
-            fi
-          done
-
-      - name: Normalize audit data
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import csv
-          import glob
-          import json
-          from pathlib import Path
-
-          raw_files = sorted(glob.glob("out/raw/*.json"))
-          summary_path = Path("out/summaries/au12-summary.csv")
-          detail_path = Path("out/normalized/au12-normalized.jsonl")
-
-          rows = []
-
-          with detail_path.open("w", encoding="utf-8") as detail:
-              for file in raw_files:
-                  source = Path(file).stem
-
-                  try:
-                      data = json.loads(Path(file).read_text(encoding="utf-8"))
-                  except Exception:
-                      data = []
-
-                  if isinstance(data, dict):
-                      data = [data]
-
-                  for item in data:
-                      item["_source_file"] = source
-                      detail.write(json.dumps(item, sort_keys=True) + "\n")
-
-                      rows.append({
-                          "source_file": source,
-                          "action": item.get("action", ""),
-                          "actor": item.get("actor", ""),
-                          "org": item.get("org", ""),
-                          "repo": item.get("repo", ""),
-                          "created_at": item.get("created_at", ""),
-                          "operation_type": item.get("operation_type", ""),
-                          "actor_ip": item.get("actor_ip", ""),
-                      })
-
-          summary_path.parent.mkdir(parents=True, exist_ok=True)
-
-          with summary_path.open("w", newline="", encoding="utf-8") as f:
-              writer = csv.DictWriter(
-                  f,
-                  fieldnames=[
-                      "source_file",
-                      "action",
-                      "actor",
-                      "org",
-                      "repo",
-                      "created_at",
-                      "operation_type",
-                      "actor_ip",
-                  ],
-              )
-              writer.writeheader()
-              writer.writerows(rows)
-
-          print("Normalization complete.")
-          PY
-
-      - name: Compute checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          (
-            cd out
-            find . -type f | sort | xargs sha256sum
-          ) > out/summaries/sha256sums.txt
-
-      - name: Upload AU-12 audit evidence
-        uses: actions/upload-artifact@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: au12-audit-exports
-          path: out/
+          python-version: "3.12"
+
+      - name: Validate token
+        run: |
+          if [ -z "${GH_ENTERPRISE_TOKEN}" ]; then
+            echo "Missing required secret: GH_ENTERPRISE_TOKEN"
+            exit 1
+          fi
+
+      - name: Collect IA-02(12) evidence
+        run: |
+          ARGS=""
+          if [ "${COLLECT_AUDIT_LOGS}" = "false" ]; then
+            ARGS="${ARGS} --skip-audit-logs"
+          fi
+
+          python3 scripts/collect_ia_02_12_evidence.py \
+            --enterprise "${ENTERPRISE_SLUG}" \
+            --lookback-days "${LOOKBACK_DAYS}" \
+            --max-audit-pages "${MAX_AUDIT_PAGES}" \
+            --output-dir evidence/IA-02-12 \
+            ${ARGS}
+
+      - name: Upload evidence artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: IA-02-12-${{ env.ENTERPRISE_SLUG }}-${{ github.run_id }}
+          path: evidence/IA-02-12
           retention-days: 90
