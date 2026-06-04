@@ -96,6 +96,7 @@ def github_headers() -> dict:
 def build_url(url: str, params: dict | None = None) -> str:
     if not params:
         return url
+
     query = urllib.parse.urlencode(params)
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{query}"
@@ -138,7 +139,7 @@ def add_warning(area: str, url: str, status: int, message: str):
     print(f"WARNING: {area}: HTTP {status}: {message}", file=sys.stderr)
 
 
-def request_json(url: str, params: dict | None = None):
+def request_json(url: str, params: dict | None = None, optional: bool = False, area: str = "request"):
     final_url = build_url(url, params)
 
     while True:
@@ -167,51 +168,22 @@ def request_json(url: str, params: dict | None = None):
                     time.sleep(sleep_for)
                     continue
 
+            if optional:
+                add_warning(area, final_url, error.code, body[:1000] if body else str(error))
+                return None, {}
+
             print(f"ERROR: HTTP {error.code} {final_url}", file=sys.stderr)
             print(body[:2000], file=sys.stderr)
             raise
 
 
-def request_json_optional(area: str, url: str, params: dict | None = None):
-    final_url = build_url(url, params)
-
-    try:
-        return request_json(url, params)
-
-    except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        message = body[:1000] if body else str(error)
-        add_warning(area, final_url, error.code, message)
-        return None, {}
-
-
-def paginate(url: str, params: dict | None = None) -> list:
+def paginate(url: str, params: dict | None = None, optional: bool = False, area: str = "request") -> list:
     items = []
     next_url = url
     next_params = params
 
     while next_url:
-        data, headers = request_json(next_url, next_params)
-
-        if isinstance(data, list):
-            items.extend(data)
-        elif data is not None:
-            items.append(data)
-
-        links = parse_link_header(headers.get("Link"))
-        next_url = links.get("next")
-        next_params = None
-
-    return items
-
-
-def paginate_optional(area: str, url: str, params: dict | None = None) -> list:
-    items = []
-    next_url = url
-    next_params = params
-
-    while next_url:
-        data, headers = request_json_optional(area, next_url, next_params)
+        data, headers = request_json(next_url, next_params, optional=optional, area=area)
 
         if data is None:
             break
@@ -272,40 +244,20 @@ def flatten_repo(repo: dict) -> dict:
 
 def get_file_if_exists(repo_full_name: str, path: str):
     url = f"{API}/repos/{repo_full_name}/contents/{urllib.parse.quote(path)}"
-    request = urllib.request.Request(url, headers=github_headers(), method="GET")
+    data, _headers = request_json(url, optional=True, area="governance_file_lookup")
 
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body = response.read().decode("utf-8")
-            data = json.loads(body)
+    if not isinstance(data, dict):
+        return None
 
-            return {
-                "repo": repo_full_name,
-                "path": path,
-                "status": response.status,
-                "name": data.get("name"),
-                "sha": data.get("sha"),
-                "size": data.get("size"),
-                "html_url": data.get("html_url"),
-            }
-
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-
-        body = error.read().decode("utf-8", errors="replace")
-        add_warning(
-            "governance_file_lookup",
-            url,
-            error.code,
-            body[:1000] if body else str(error),
-        )
-        return {
-            "repo": repo_full_name,
-            "path": path,
-            "status": error.code,
-            "error": body[:500],
-        }
+    return {
+        "repo": repo_full_name,
+        "path": path,
+        "status": 200,
+        "name": data.get("name"),
+        "sha": data.get("sha"),
+        "size": data.get("size"),
+        "html_url": data.get("html_url"),
+    }
 
 
 def build_audit_url() -> str:
@@ -321,36 +273,29 @@ def build_audit_url() -> str:
 
 def collect_readme_candidate_hits(repo_full_name: str):
     url = f"{API}/repos/{repo_full_name}/readme"
+    data, _headers = request_json(url, optional=True, area="readme_lookup")
 
-    try:
-        data, _headers = request_json(url)
-
-        if not isinstance(data, dict):
-            return None
-
-        encoded_content = data.get("content")
-        encoding = data.get("encoding")
-
-        if not encoded_content or encoding != "base64":
-            return None
-
-        decoded = base64.b64decode(encoded_content).decode("utf-8", errors="replace").lower()
-        matches = [keyword for keyword in PII_REVIEW_KEYWORDS if keyword in decoded]
-
-        if not matches:
-            return None
-
-        return {
-            "repo": repo_full_name,
-            "path": data.get("path"),
-            "html_url": data.get("html_url"),
-            "matched_terms": ",".join(matches),
-        }
-
-    except urllib.error.HTTPError as error:
-        if error.code != 404:
-            add_warning("readme_lookup", url, error.code, str(error))
+    if not isinstance(data, dict):
         return None
+
+    encoded_content = data.get("content")
+    encoding = data.get("encoding")
+
+    if not encoded_content or encoding != "base64":
+        return None
+
+    decoded = base64.b64decode(encoded_content).decode("utf-8", errors="replace").lower()
+    matches = [keyword for keyword in PII_REVIEW_KEYWORDS if keyword in decoded]
+
+    if not matches:
+        return None
+
+    return {
+        "repo": repo_full_name,
+        "path": data.get("path"),
+        "html_url": data.get("html_url"),
+        "matched_terms": ",".join(matches),
+    }
 
 
 def main():
@@ -370,12 +315,16 @@ def main():
         "audit_days": AUDIT_DAYS,
     }
 
-    org, _org_headers = request_json_optional("organization_profile", f"{API}/orgs/{ORG}")
+    org, _org_headers = request_json(
+        f"{API}/orgs/{ORG}",
+        optional=True,
+        area="organization_profile",
+    )
+
     if org is None:
         org = {}
 
-    repos = paginate_optional(
-        "repositories",
+    repos = paginate(
         f"{API}/orgs/{ORG}/repos",
         {
             "per_page": 100,
@@ -383,34 +332,35 @@ def main():
             "sort": "updated",
             "direction": "desc",
         },
+        optional=True,
+        area="repositories",
     )
 
-    members = paginate_optional(
-        "members",
+    members = paginate(
         f"{API}/orgs/{ORG}/members",
-        {
-            "per_page": 100,
-        },
+        {"per_page": 100},
+        optional=True,
+        area="members",
     )
 
-    teams = paginate_optional(
-        "teams",
+    teams = paginate(
         f"{API}/orgs/{ORG}/teams",
-        {
-            "per_page": 100,
-        },
+        {"per_page": 100},
+        optional=True,
+        area="teams",
     )
 
     audit_phrase = " OR ".join(RA08_AUDIT_KEYWORDS)
     audit_query = f"created:>={audit_start.strftime('%Y-%m-%d')} ({audit_phrase})"
 
-    audit_logs = paginate_optional(
-        "audit_log",
+    audit_logs = paginate(
         build_audit_url(),
         {
             "per_page": 100,
             "phrase": audit_query,
         },
+        optional=True,
+        area="audit_log",
     )
 
     repo_rows = [flatten_repo(repo) for repo in repos]
