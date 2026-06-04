@@ -42,7 +42,16 @@ IA05_AUDIT_ACTION_PREFIXES = [
 
 class GitHubClient:
     def __init__(self, token: str) -> None:
-        self.token = token
+        self.token = token.strip()
+
+        if not self.token:
+            raise ValueError("GitHub token is empty.")
+
+        if "\n" in self.token or "\r" in self.token:
+            raise ValueError(
+                "GitHub token contains newline characters. "
+                "Re-save the secret as a single-line token."
+            )
 
     def request_json(
         self,
@@ -69,7 +78,9 @@ class GitHubClient:
                 return json.loads(raw)
         except urllib.error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {url} failed: HTTP {exc.code}: {details}") from exc
+            raise RuntimeError(
+                f"{method} {url} failed: HTTP {exc.code}: {details}"
+            ) from exc
 
     def get_paginated(self, url: str, max_pages: int = 50) -> List[Any]:
         results: List[Any] = []
@@ -87,6 +98,7 @@ class GitHubClient:
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     payload = json.loads(resp.read().decode("utf-8") or "[]")
+
                     if isinstance(payload, list):
                         results.extend(payload)
                     else:
@@ -94,9 +106,12 @@ class GitHubClient:
 
                     link = resp.headers.get("Link", "")
                     next_url = self._parse_next_link(link)
+
             except urllib.error.HTTPError as exc:
                 details = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"GET {next_url} failed: HTTP {exc.code}: {details}") from exc
+                raise RuntimeError(
+                    f"GET {next_url} failed: HTTP {exc.code}: {details}"
+                ) from exc
 
             time.sleep(0.25)
 
@@ -111,8 +126,10 @@ class GitHubClient:
             section = part.strip().split(";")
             if len(section) < 2:
                 continue
+
             url_part = section[0].strip()
             rel_part = section[1].strip()
+
             if rel_part == 'rel="next"':
                 return url_part[1:-1]
 
@@ -122,11 +139,16 @@ class GitHubClient:
         payload = self.request_json(
             "POST",
             GRAPHQL_URL,
-            {"query": query, "variables": variables},
+            {
+                "query": query,
+                "variables": variables,
+            },
             accept="application/vnd.github+json",
         )
+
         if payload.get("errors"):
             raise RuntimeError(json.dumps(payload["errors"], indent=2))
+
         return payload["data"]
 
 
@@ -138,7 +160,10 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def collect_enterprise_organizations(client: GitHubClient, enterprise: str) -> List[Dict[str, Any]]:
+def collect_enterprise_organizations(
+    client: GitHubClient,
+    enterprise: str,
+) -> List[Dict[str, Any]]:
     query = """
     query($slug: String!, $cursor: String) {
       enterprise(slug: $slug) {
@@ -171,6 +196,7 @@ def collect_enterprise_organizations(client: GitHubClient, enterprise: str) -> L
     while True:
         data = client.graphql(query, {"slug": enterprise, "cursor": cursor})
         enterprise_data = data.get("enterprise")
+
         if not enterprise_data:
             raise RuntimeError(f"Enterprise not found or inaccessible: {enterprise}")
 
@@ -192,7 +218,10 @@ def collect_enterprise_audit_log(
 ) -> List[Dict[str, Any]]:
     since = utc_now() - dt.timedelta(days=lookback_days)
 
-    phrase = " OR ".join([f"action:{prefix}*" for prefix in IA05_AUDIT_ACTION_PREFIXES])
+    phrase = " OR ".join(
+        [f"action:{prefix}*" for prefix in IA05_AUDIT_ACTION_PREFIXES]
+    )
+
     query = f"created:>={since.isoformat()} ({phrase})"
 
     encoded = urllib.parse.urlencode(
@@ -228,7 +257,10 @@ def collect_org_saml_credential_authorizations(
         }
 
 
-def collect_org_pat_requests(client: GitHubClient, org: str) -> Dict[str, Any]:
+def collect_org_pat_requests(
+    client: GitHubClient,
+    org: str,
+) -> Dict[str, Any]:
     url = f"{API_BASE}/orgs/{org}/personal-access-token-requests?per_page=100"
 
     try:
@@ -246,7 +278,10 @@ def collect_org_pat_requests(client: GitHubClient, org: str) -> Dict[str, Any]:
         }
 
 
-def collect_org_fine_grained_pats(client: GitHubClient, org: str) -> Dict[str, Any]:
+def collect_org_fine_grained_pats(
+    client: GitHubClient,
+    org: str,
+) -> Dict[str, Any]:
     url = f"{API_BASE}/orgs/{org}/personal-access-tokens?per_page=100"
 
     try:
@@ -276,8 +311,12 @@ def build_markdown_summary(
     generated = utc_now().isoformat()
 
     collected_saml = sum(1 for item in saml_authz if item["status"] == "collected")
-    collected_pat_requests = sum(1 for item in pat_requests if item["status"] == "collected")
-    collected_fine_grained_pats = sum(1 for item in fine_grained_pats if item["status"] == "collected")
+    collected_pat_requests = sum(
+        1 for item in pat_requests if item["status"] == "collected"
+    )
+    collected_fine_grained_pats = sum(
+        1 for item in fine_grained_pats if item["status"] == "collected"
+    )
 
     lines = [
         "# IA-05 Authenticator Management Evidence",
@@ -328,53 +367,90 @@ def build_markdown_summary(
     return "\n".join(lines)
 
 
-def main() -> int:
-    token = os.environ.get("GITHUB_TOKEN")
-    enterprise = os.environ.get("GITHUB_ENTERPRISE", "internal-revenue-service")
-    output_dir = Path(os.environ.get("OUTPUT_DIR", "ia05-evidence"))
-    lookback_days = int(os.environ.get("IA05_LOOKBACK_DAYS", "90"))
+def get_token_from_environment() -> str:
+    token = (
+        os.environ.get("GH_ENTERPRISE_ADMIN_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+        or ""
+    ).strip()
 
     if not token:
-        print("ERROR: GITHUB_TOKEN is required.", file=sys.stderr)
-        return 2
+        raise ValueError(
+            "GitHub token is required. Set GH_ENTERPRISE_ADMIN_TOKEN or GITHUB_TOKEN."
+        )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    client = GitHubClient(token)
+    return token
 
-    orgs = collect_enterprise_organizations(client, enterprise)
-    write_json(output_dir / "enterprise-organizations.json", orgs)
 
-    audit_events = collect_enterprise_audit_log(client, enterprise, lookback_days)
-    write_json(output_dir / "enterprise-audit-log-ia05.json", audit_events)
+def main() -> int:
+    try:
+        token = get_token_from_environment()
+        enterprise = os.environ.get("GITHUB_ENTERPRISE", "internal-revenue-service").strip()
+        output_dir = Path(os.environ.get("OUTPUT_DIR", "ia05-evidence"))
+        lookback_days = int(os.environ.get("IA05_LOOKBACK_DAYS", "90"))
 
-    saml_authz = []
-    pat_requests = []
-    fine_grained_pats = []
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    for org in orgs:
-        login = org["login"]
-        saml_authz.append(collect_org_saml_credential_authorizations(client, login))
-        pat_requests.append(collect_org_pat_requests(client, login))
-        fine_grained_pats.append(collect_org_fine_grained_pats(client, login))
+        client = GitHubClient(token)
 
-    write_json(output_dir / "org-saml-credential-authorizations.json", saml_authz)
-    write_json(output_dir / "org-personal-access-token-requests.json", pat_requests)
-    write_json(output_dir / "org-fine-grained-personal-access-tokens.json", fine_grained_pats)
+        orgs = collect_enterprise_organizations(client, enterprise)
+        write_json(output_dir / "enterprise-organizations.json", orgs)
 
-    summary = build_markdown_summary(
-        enterprise=enterprise,
-        lookback_days=lookback_days,
-        orgs=orgs,
-        audit_events=audit_events,
-        saml_authz=saml_authz,
-        pat_requests=pat_requests,
-        fine_grained_pats=fine_grained_pats,
-    )
+        audit_events = collect_enterprise_audit_log(client, enterprise, lookback_days)
+        write_json(output_dir / "enterprise-audit-log-ia05.json", audit_events)
 
-    (output_dir / "ia05-summary.md").write_text(summary, encoding="utf-8")
+        saml_authz = []
+        pat_requests = []
+        fine_grained_pats = []
 
-    print(f"IA-05 evidence collection complete. Output: {output_dir}")
-    return 0
+        for org in orgs:
+            login = org["login"]
+
+            saml_authz.append(
+                collect_org_saml_credential_authorizations(client, login)
+            )
+
+            pat_requests.append(
+                collect_org_pat_requests(client, login)
+            )
+
+            fine_grained_pats.append(
+                collect_org_fine_grained_pats(client, login)
+            )
+
+        write_json(
+            output_dir / "org-saml-credential-authorizations.json",
+            saml_authz,
+        )
+
+        write_json(
+            output_dir / "org-personal-access-token-requests.json",
+            pat_requests,
+        )
+
+        write_json(
+            output_dir / "org-fine-grained-personal-access-tokens.json",
+            fine_grained_pats,
+        )
+
+        summary = build_markdown_summary(
+            enterprise=enterprise,
+            lookback_days=lookback_days,
+            orgs=orgs,
+            audit_events=audit_events,
+            saml_authz=saml_authz,
+            pat_requests=pat_requests,
+            fine_grained_pats=fine_grained_pats,
+        )
+
+        (output_dir / "ia05-summary.md").write_text(summary, encoding="utf-8")
+
+        print(f"IA-05 evidence collection complete. Output: {output_dir}")
+        return 0
+
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
