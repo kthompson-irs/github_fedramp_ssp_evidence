@@ -20,11 +20,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GITHUB_ENTERPRISE: internal-revenue-service
-      GITHUB_ORG: internal-revenue-service
+      GH_ENTERPRISE: internal-revenue-service
+      GH_ORG: internal-revenue-service
       AUDIT_DAYS: ${{ inputs.audit_days }}
       AUDIT_SCOPE: ${{ inputs.audit_scope }}
-      GITHUB_TOKEN_RA08: ${{ secrets.GH_ENTERPRISE_AUDIT_PAT }}
+      GH_TOKEN_RA08: ${{ secrets.GH_ENTERPRISE_AUDIT_PAT }}
 
     steps:
       - name: Checkout
