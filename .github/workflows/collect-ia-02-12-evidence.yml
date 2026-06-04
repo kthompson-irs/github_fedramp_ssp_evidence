@@ -11,6 +11,10 @@ on:
         description: Number of days of audit logs to collect
         required: true
         default: "30"
+      max_audit_pages:
+        description: Max audit-log pages per evidence query
+        required: true
+        default: "25"
 
 permissions:
   contents: read
@@ -22,6 +26,7 @@ jobs:
     env:
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug }}
       LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+      MAX_AUDIT_PAGES: ${{ inputs.max_audit_pages }}
       GH_ENTERPRISE_TOKEN: ${{ secrets.GH_ENTERPRISE_TOKEN }}
 
     steps:
@@ -45,10 +50,12 @@ jobs:
           python3 scripts/collect_ia_02_12_evidence.py \
             --enterprise "${ENTERPRISE_SLUG}" \
             --lookback-days "${LOOKBACK_DAYS}" \
+            --max-audit-pages "${MAX_AUDIT_PAGES}" \
             --output-dir evidence/IA-02-12
 
       - name: Upload evidence artifact
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: IA-02-12-${{ env.ENTERPRISE_SLUG }}-${{ github.run_id }}
           path: evidence/IA-02-12
