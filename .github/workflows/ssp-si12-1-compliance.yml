@@ -8,30 +8,79 @@ on:
   workflow_dispatch:
 
 jobs:
-  verify-si12-1:
+  verify-and-export-si12-1:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Scan for Prohibited PII Patterns
+      - name: Run PII Scan and Generate Compliance JSON
+        id: pii-scanner
         run: |
           echo "Scanning codebase for prohibited high-risk PII elements..."
-          # Example regex scan for unauthorized SSN or credit card patterns in non-test code
-          MATCHES=$(git grep -E '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b' || true)
-          if [ -n "$MATCHES" ]; then
-            echo "::error::Prohibited PII (SSN pattern) detected!"
-            echo "$MATCHES"
-            exit 1
-          else
-            echo "No prohibited high-risk PII patterns found."
+          
+          # Scan for SSN patterns (e.g., 000-00-0000)
+          SSN_MATCHES=$(git grep -n -E '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b' || true)
+          
+          # Initialize variables
+          COMPLIANCE_STATUS="COMPLIANT"
+          VIOLATIONS_FOUND="false"
+          FINDINGS_ARRAY="[]"
+          
+          if [ -n "$SSN_MATCHES" ]; then
+            COMPLIANCE_STATUS="NON-COMPLIANT"
+            VIOLATIONS_FOUND="true"
+            # Format findings into a safe JSON array structure
+            FINDINGS_ARRAY=$(echo "$SSN_MATCHES" | awk -F: '{print "{\"file\":\""$1"\",\"line\":"$2",\"issue\":\"Potential SSN pattern exposed\"}"}' | jq -s '.')
+            echo "::error::Prohibited PII detected! Check the generated artifact for details."
           fi
+          
+          # Construct the FedRAMP compliance JSON schema
+          cat <<EOF > fedramp-si12-1-evidence.json
+          {
+            "control_id": "SI-12(1)",
+            "control_name": "Limit Personally Identifiable Information Elements",
+            "framework": "FedRAMP",
+            "impact_level": "Low",
+            "assessment_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "repository": "${{ github.repository }}",
+            "commit_sha": "${{ github.sha }}",
+            "compliance_status": "${COMPLIANCE_STATUS}",
+            "violations_detected": ${VIOLATIONS_FOUND},
+            "allowed_pii_elements": [
+              "user account usernames",
+              "professional email addresses",
+              "public SSH keys",
+              "public GPG keys"
+            ],
+            "findings": ${FINDINGS_ARRAY}
+          }
+          EOF
+          
+          # Export status to environment for subsequent step logic
+          echo "violations_detected=${VIOLATIONS_FOUND}" >> $GITHUB_ENV
 
-      - name: Generate SI-12(1) Compliance Output
+      - name: Generate Markdown Job Summary
         run: |
           echo "### FedRAMP Control SI-12(1) Compliance Status" >> $GITHUB_STEP_SUMMARY
-          echo "**Control:** Limit Personally Identifiable Information Elements" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ✅ COMPLIANT" >> $GITHUB_STEP_SUMMARY
-          echo "**Implementation Scope:** GitHub.com Code & Actions Pipeline" >> $GITHUB_STEP_SUMMARY
-          echo "**Allowed PII Elements:** Usernames, Professional Email Addresses, Public Keys." >> $GITHUB_STEP_SUMMARY
-          echo "**Last Verified:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ env.violations_detected }}" = "true" ]; then
+            echo "**Status:** ❌ NON-COMPLIANT" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Prohibited PII leaked in codebase history. Audit package updated with details." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Status:** ✅ COMPLIANT" >> $GITHUB_STEP_SUMMARY
+            echo "No prohibited high-risk PII patterns found." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Artifact Exported:** \`fedramp-si12-1-evidence.json\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Auditor Evidence Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedramp-si12-1-compliance-evidence
+          path: fedramp-si12-1-evidence.json
+          retention-days: 90
+
+      - name: Enforce Build Failure on Non-Compliance
+        run: |
+          if [ "${{ env.violations_detected }}" = "true" ]; then
+            exit 1
+          fi
