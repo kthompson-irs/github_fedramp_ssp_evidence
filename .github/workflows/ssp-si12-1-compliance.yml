@@ -1,113 +1,137 @@
-name: FedRAMP SSP Compliance - SI-12(1)
+name: Enterprise FedRAMP Compliance - SI-12(1)
 
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  schedule:
+    # Runs every Sunday at midnight to maintain continuous compliance records
+    - cron: '0 0 * * 0'
   workflow_dispatch:
 
 jobs:
-  verify-and-export-si12-1:
+  enterprise-pii-audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Run PII Scan and Generate Compliance JSON
-        id: pii-scanner
+      - name: Initialize Master Evidence File
         run: |
-          echo "Scanning codebase for prohibited high-risk PII elements..."
-          
-          # Use grep -rn to catch both tracked and untracked workspace files
-          # Exclude the .git directory to prevent scanning internal repository metadata
-          SSN_MATCHES=$(grep -rnE '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b' . --exclude-dir=.git || true)
-          
-          # Initialize baseline variables
-          COMPLIANCE_STATUS="COMPLIANT"
-          VIOLATIONS_FOUND="false"
-          
-          if [ -n "$SSN_MATCHES" ]; then
-            COMPLIANCE_STATUS="NON-COMPLIANT"
-            VIOLATIONS_FOUND="true"
-            echo "::error::Prohibited PII detected! Check the generated artifact for details."
-          fi
-          
-          # Safely export matches to environment to avoid bash string-injection flaws during JSON packaging
-          export SSN_MATCHES
-          
-          # Utilize jq natively to safely build a bulletproof JSON array out of raw text findings
-          FINDINGS_ARRAY=$(echo "$SSN_MATCHES" | jq -R -s -c '
-            split("\n") 
-            | map(select(length > 0)) 
-            | map(
-                split(":") 
-                | {
-                    "file": .[0], 
-                    "line": (.[1] | tonumber? // 0), 
-                    "issue": "Potential SSN pattern exposed"
-                  }
-              )
-          ')
-          
-          # Use jq to construct the final validated FedRAMP compliance JSON schema
           jq -n \
-            --arg ctrl_id "SI-12(1)" \
-            --arg ctrl_name "Limit Personally Identifiable Information Elements" \
-            --arg fw "FedRAMP" \
-            --arg lvl "Low" \
             --arg ts "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            --arg repo "${{ github.repository }}" \
-            --arg sha "${{ github.sha }}" \
-            --arg status "${COMPLIANCE_STATUS}" \
-            --argjson violations "${VIOLATIONS_FOUND}" \
-            --argjson findings "${FINDINGS_ARRAY}" \
-            '
-            {
-              "control_id": $ctrl_id,
-              "control_name": $ctrl_name,
-              "framework": $fw,
-              "impact_level": $lvl,
+            --arg ent "${{ github.repository_owner }}" \
+            '{
+              "control_id": "SI-12(1)",
+              "control_name": "Limit Personally Identifiable Information Elements",
+              "framework": "FedRAMP",
+              "scope": "Enterprise Wide",
+              "enterprise_account": $ent,
               "assessment_timestamp": $ts,
-              "repository": $repo,
-              "commit_sha": $sha,
-              "compliance_status": $status,
-              "violations_detected": $violations,
+              "global_compliance_status": "COMPLIANT",
               "allowed_pii_elements": [
                 "user account usernames",
                 "professional email addresses",
                 "public SSH keys",
                 "public GPG keys"
               ],
-              "findings": $findings
-            }
-            ' > fedramp-si12-1-evidence.json
+              "repository_results": []
+            }' > master-enterprise-evidence.json
+
+      - name: Audit All Enterprise Repositories
+        env:
+          # Enterprise or Org-level token capable of reading all repos
+          GH_TOKEN: ${{ secrets.ENTERPRISE_AUDIT_TOKEN }}
+          ORG_NAME: ${{ github.repository_owner }}
+        run: |
+          echo "Fetching active repositories for organization: $ORG_NAME..."
           
-          # Export status safely to the environment for subsequent step logic
+          # Retrieve all non-archived repositories in the organization/enterprise scope
+          REPOS=$(gh repo list "$ORG_NAME" --limit 1000 --json name,sshUrl --jq '.[] | select(.isArchived == false) | "\(.name)|\(.sshUrl)"')
+          
+          VIOLATIONS_FOUND="false"
+
+          for REPO_DATA in $REPOS; do
+            REPO_NAME=$(echo "$REPO_DATA" | cut -d'|' -f1)
+            REPO_URL=$(echo "$REPO_DATA" | cut -d'|' -f2)
+            
+            echo "----------------------------------------"
+            echo "Auditing Repository: $REPO_NAME"
+            echo "----------------------------------------"
+            
+            # Shallow clone the target repo to speed up large enterprise execution
+            mkdir -p scan_workspace
+            git clone --depth 1 "$REPO_URL" scan_workspace/"$REPO_NAME" || continue
+            
+            # Execute regex scanning across the cloned directory
+            SSN_MATCHES=$(grep -rnE '\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b' scan_workspace/"$REPO_NAME" --exclude-dir=.git || true)
+            
+            REPO_STATUS="COMPLIANT"
+            REPO_VIOLATIONS="false"
+            
+            if [ -n "$SSN_MATCHES" ]; then
+              REPO_STATUS="NON-COMPLIANT"
+              REPO_VIOLATIONS="true"
+              VIOLATIONS_FOUND="true"
+              echo "::warning:: Prohibited PII identified in $REPO_NAME"
+            fi
+            
+            # Format findings into safe JSON
+            export SSN_MATCHES
+            FINDINGS_ARRAY=$(echo "$SSN_MATCHES" | jq -R -s -c '
+              split("\n") 
+              | map(select(length > 0)) 
+              | map(
+                  split(":") 
+                  | {
+                      "file": (.[0] | sub("scan_workspace/[^/]+/"; "")), 
+                      "line": (.[1] | tonumber? // 0), 
+                      "issue": "Potential SSN pattern exposed"
+                    }
+                )
+            ')
+            
+            # Append this specific repository result into the master JSON
+            jq --arg rname "$REPO_NAME" \
+               --arg rstatus "$REPO_STATUS" \
+               --argjson rviol "$REPO_VIOLATIONS" \
+               --argjson rfind "$FINDINGS_ARRAY" \
+               '.repository_results += [{
+                  "repository_name": $rname,
+                  "compliance_status": $rstatus,
+                  "violations_detected": $rviol,
+                  "findings": $rfind
+               }]' master-enterprise-evidence.json > tmp.json && mv tmp.json master-enterprise-evidence.json
+            
+            # Clean up workspace for the next repo loop iteration
+            rm -rf scan_workspace/"$REPO_NAME"
+          done
+          
+          # If any single repository failed compliance, toggle the top-level flag
+          if [ "$VIOLATIONS_FOUND" = "true" ]; then
+            jq '.global_compliance_status = "NON-COMPLIANT"' master-enterprise-evidence.json > tmp.json && mv tmp.json master-enterprise-evidence.json
+          fi
+          
           echo "violations_detected=${VIOLATIONS_FOUND}" >> $GITHUB_ENV
 
-      - name: Generate Markdown Job Summary
+      - name: Generate Enterprise Markdown Summary
         run: |
-          echo "### FedRAMP Control SI-12(1) Compliance Status" >> $GITHUB_STEP_SUMMARY
+          echo "### FedRAMP Control SI-12(1) Enterprise Audit Summary" >> $GITHUB_STEP_SUMMARY
           if [ "${{ env.violations_detected }}" = "true" ]; then
-            echo "**Status:** ❌ NON-COMPLIANT" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ Prohibited PII leaked in workspace. Audit package updated with details." >> $GITHUB_STEP_SUMMARY
+            echo "**Global Status:** ❌ NON-COMPLIANT" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ One or more repositories failed the PII constraint audit. Review the JSON report for targeting remediations." >> $GITHUB_STEP_SUMMARY
           else
-            echo "**Status:** ✅ COMPLIANT" >> $GITHUB_STEP_SUMMARY
-            echo "No prohibited high-risk PII patterns found." >> $GITHUB_STEP_SUMMARY
+            echo "**Global Status:** ✅ COMPLIANT" >> $GITHUB_STEP_SUMMARY
+            echo "All scanned enterprise repositories conform to SI-12(1) limitations." >> $GITHUB_STEP_SUMMARY
           fi
-          echo "**Artifact Exported:** \`fedramp-si12-1-evidence.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "#### High-Level Metrics" >> $GITHUB_STEP_SUMMARY
+          jq -r '"* Total Repos Scanned: \(.repository_results | length)"' master-enterprise-evidence.json >> $GITHUB_STEP_SUMMARY
+          jq -r '"* Non-Compliant Repos: \([.repository_results[] | select(.compliance_status == "NON-COMPLIANT")] | length)"' master-enterprise-evidence.json >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Auditor Evidence Artifact
+      - name: Upload 3PAO Enterprise Evidence Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fedramp-si12-1-compliance-evidence
-          path: fedramp-si12-1-evidence.json
-          retention-days: 90
+          name: fedramp-enterprise-si12-1-evidence
+          path: master-enterprise-evidence.json
+          retention-days: 180
 
-      - name: Enforce Build Failure on Non-Compliance
+      - name: Enforce Strict Build Failures
         run: |
           if [ "${{ env.violations_detected }}" = "true" ]; then
-            echo "Failing pipeline due to FedRAMP SI-12(1) non-compliance."
+            echo "Failing pipeline due to Enterprise-wide FedRAMP SI-12(1) non-compliance."
             exit 1
           fi
