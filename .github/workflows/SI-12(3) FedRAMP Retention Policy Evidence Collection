@@ -1,4 +1,4 @@
-name: FedRAMP Retention Policy Evidence Collection
+name: SI-12(3)FedRAMP Retention Policy Evidence Collection
 
 on:
   workflow_dispatch:
