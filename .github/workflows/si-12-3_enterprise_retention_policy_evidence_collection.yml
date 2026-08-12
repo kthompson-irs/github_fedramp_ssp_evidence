@@ -7,15 +7,18 @@ on:
         description: "GitHub Enterprise slug"
         required: true
         type: string
+
       organizations:
         description: "Comma-separated list of in-scope GitHub organizations"
         required: true
         type: string
+
       expected_min_retention_days:
         description: "Minimum required GitHub Actions artifact/log retention in days"
         required: true
         default: "90"
         type: string
+
       evidence_artifact_retention_days:
         description: "GitHub Actions retention for this evidence artifact"
         required: true
@@ -29,10 +32,6 @@ on:
 permissions:
   contents: read
 
-env:
-  API_VERSION: "2026-03-10"
-  API_BASE: "https://api.github.com"
-
 jobs:
   collect-retention-evidence:
     name: Collect Enterprise Retention Evidence
@@ -42,20 +41,26 @@ jobs:
       contents: read
 
     env:
-      # Required secret:
-      # FEDRAMP_ENTERPRISE_TOKEN
-      #
-      # Recommended authentication:
-      # GitHub classic PAT with the administrative read scopes required
-      # to query the enterprise and in-scope organizations.
+      # Dedicated GitHub PAT stored as an Actions secret.
       GH_TOKEN: ${{ secrets.FEDRAMP_ENTERPRISE_TOKEN }}
 
+      API_VERSION: "2026-03-10"
+      API_BASE: "https://api.github.com"
+
       ENTERPRISE_SLUG: ${{ inputs.enterprise_slug || vars.FEDRAMP_ENTERPRISE_SLUG }}
+
       ORGANIZATIONS: ${{ inputs.organizations || vars.FEDRAMP_IN_SCOPE_ORGANIZATIONS }}
+
       EXPECTED_MIN_RETENTION_DAYS: ${{ inputs.expected_min_retention_days || vars.FEDRAMP_EXPECTED_MIN_RETENTION_DAYS || '90' }}
+
       EVIDENCE_ARTIFACT_RETENTION_DAYS: ${{ inputs.evidence_artifact_retention_days || vars.FEDRAMP_EVIDENCE_ARTIFACT_RETENTION_DAYS || '90' }}
 
     steps:
+
+      # ------------------------------------------------------------------
+      # 1. Validate configuration
+      # ------------------------------------------------------------------
+
       - name: Validate configuration
         shell: bash
         run: |
@@ -88,19 +93,31 @@ jobs:
             exit 1
           fi
 
+          if (( EVIDENCE_ARTIFACT_RETENTION_DAYS < 1 )); then
+            echo "::error::EVIDENCE_ARTIFACT_RETENTION_DAYS must be greater than zero."
+            exit 1
+          fi
+
           echo "Enterprise: ${ENTERPRISE_SLUG}"
           echo "Organizations: ${ORGANIZATIONS}"
           echo "Expected minimum retention: ${EXPECTED_MIN_RETENTION_DAYS} days"
           echo "Evidence artifact retention: ${EVIDENCE_ARTIFACT_RETENTION_DAYS} days"
+
+      # ------------------------------------------------------------------
+      # 2. Initialize evidence workspace
+      # ------------------------------------------------------------------
 
       - name: Initialize evidence workspace
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p evidence/raw
-          mkdir -p evidence/normalized
-          mkdir -p evidence/checksums
+          rm -rf evidence
+
+          mkdir -p \
+            evidence/raw \
+            evidence/normalized \
+            evidence/checksums
 
           {
             echo "FedRAMP Retention Policy Evidence Collection"
@@ -116,8 +133,36 @@ jobs:
             echo "GitHub API Version: ${API_VERSION}"
             echo "Enterprise: ${ENTERPRISE_SLUG}"
             echo "Expected Minimum Retention Days: ${EXPECTED_MIN_RETENTION_DAYS}"
+            echo "Evidence Artifact Retention Days: ${EVIDENCE_ARTIFACT_RETENTION_DAYS}"
             echo
           } > evidence/evidence-header.txt
+
+      # ------------------------------------------------------------------
+      # 3. Validate GitHub authentication
+      # ------------------------------------------------------------------
+
+      - name: Validate GitHub authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Validating GitHub authentication..."
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: ${API_VERSION}" \
+            /user \
+            | jq '{
+                login,
+                id,
+                type
+              }'
+
+          echo "GitHub authentication validated."
+
+      # ------------------------------------------------------------------
+      # 4. Collect enterprise Actions artifact/log retention
+      # ------------------------------------------------------------------
 
       - name: Collect enterprise Actions retention policy
         shell: bash
@@ -126,7 +171,8 @@ jobs:
 
           endpoint="/enterprises/${ENTERPRISE_SLUG}/actions/permissions/artifact-and-log-retention"
 
-          echo "Collecting: ${endpoint}"
+          echo "Collecting enterprise Actions artifact/log retention..."
+          echo "Endpoint: ${endpoint}"
 
           gh api \
             -H "Accept: application/vnd.github+json" \
@@ -134,7 +180,8 @@ jobs:
             "${endpoint}" \
             > evidence/raw/enterprise-artifact-log-retention.json
 
-          jq '.' evidence/raw/enterprise-artifact-log-retention.json \
+          jq '.' \
+            evidence/raw/enterprise-artifact-log-retention.json \
             > evidence/normalized/enterprise-artifact-log-retention.json
 
           configured_days="$(
@@ -147,23 +194,35 @@ jobs:
             evidence/raw/enterprise-artifact-log-retention.json
           )"
 
-          {
-            echo
-            echo "Enterprise Actions Artifact/Log Retention"
-            echo "------------------------------------------"
-            echo "Configured retention days: ${configured_days:-NOT_REPORTED}"
-            echo "Maximum allowed retention days: ${maximum_days:-NOT_REPORTED}"
-          } >> evidence/evidence-header.txt
-
           if [[ -z "${configured_days}" ]]; then
             echo "::error::GitHub did not return an enterprise artifact/log retention value."
             exit 1
           fi
 
+          if ! [[ "${configured_days}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Enterprise artifact/log retention is not numeric: ${configured_days}"
+            exit 1
+          fi
+
+          {
+            echo
+            echo "Enterprise Actions Artifact/Log Retention"
+            echo "------------------------------------------"
+            echo "Configured retention days: ${configured_days}"
+            echo "Maximum allowed retention days: ${maximum_days:-NOT_REPORTED}"
+            echo "Required minimum retention days: ${EXPECTED_MIN_RETENTION_DAYS}"
+          } >> evidence/evidence-header.txt
+
           if (( configured_days < EXPECTED_MIN_RETENTION_DAYS )); then
             echo "::error::Enterprise retention ${configured_days} days is below required minimum ${EXPECTED_MIN_RETENTION_DAYS} days."
             exit 1
           fi
+
+          echo "Enterprise retention requirement passed."
+
+      # ------------------------------------------------------------------
+      # 5. Collect enterprise Actions policy
+      # ------------------------------------------------------------------
 
       - name: Collect enterprise Actions policy
         shell: bash
@@ -176,10 +235,15 @@ jobs:
             "/enterprises/${ENTERPRISE_SLUG}/actions/permissions" \
             > evidence/raw/enterprise-actions-permissions.json
 
-          jq '.' evidence/raw/enterprise-actions-permissions.json \
+          jq '.' \
+            evidence/raw/enterprise-actions-permissions.json \
             > evidence/normalized/enterprise-actions-permissions.json
 
-      - name: Collect enterprise workflow token policy
+      # ------------------------------------------------------------------
+      # 6. Collect enterprise workflow token policy
+      # ------------------------------------------------------------------
+
+      - name: Collect enterprise workflow permissions
         shell: bash
         run: |
           set -euo pipefail
@@ -190,15 +254,23 @@ jobs:
             "/enterprises/${ENTERPRISE_SLUG}/actions/permissions/workflow" \
             > evidence/raw/enterprise-workflow-permissions.json
 
-          jq '.' evidence/raw/enterprise-workflow-permissions.json \
+          jq '.' \
+            evidence/raw/enterprise-workflow-permissions.json \
             > evidence/normalized/enterprise-workflow-permissions.json
+
+      # ------------------------------------------------------------------
+      # 7. Collect enterprise audit-log streaming configuration
+      # ------------------------------------------------------------------
 
       - name: Collect enterprise audit log streaming configuration
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Collecting enterprise audit-log streaming configuration..."
+
           set +e
+
           gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: ${API_VERSION}" \
@@ -206,30 +278,32 @@ jobs:
             > evidence/raw/enterprise-audit-log-streams.json
 
           status=$?
+
           set -e
 
           if [[ "${status}" -ne 0 ]]; then
             echo "::warning::Enterprise audit-log streaming configuration could not be retrieved."
-            echo "::warning::This may indicate insufficient token permissions or that the endpoint is not available for the account configuration."
-            echo '{"collection_status":"FAILED","reason":"API request failed"}' \
-              > evidence/raw/enterprise-audit-log-streams.json
+            echo "::warning::This may indicate insufficient permissions or endpoint availability."
+
+            cat > evidence/raw/enterprise-audit-log-streams.json <<'EOF'
+          {
+            "collection_status": "FAILED",
+            "reason": "GitHub API request failed"
+          }
+          EOF
           fi
 
-          jq '.' evidence/raw/enterprise-audit-log-streams.json \
+          jq '.' \
+            evidence/raw/enterprise-audit-log-streams.json \
             > evidence/normalized/enterprise-audit-log-streams.json
 
-          echo
-          echo "Configured enterprise audit-log streams:"
-          jq -r '
-            if type == "array" and length > 0 then
-              .[] |
-              "  stream_type=\(.stream_type // "UNKNOWN") enabled=\(.enabled // false) id=\(.id // "UNKNOWN")"
-            else
-              "  No stream configuration returned."
-            end
-          ' evidence/raw/enterprise-audit-log-streams.json
+          echo "Enterprise audit-log streaming evidence collected."
 
-      - name: Validate Splunk streaming evidence
+      # ------------------------------------------------------------------
+      # 8. Identify Splunk stream
+      # ------------------------------------------------------------------
+
+      - name: Validate Splunk audit log stream
         shell: bash
         run: |
           set -euo pipefail
@@ -238,10 +312,15 @@ jobs:
 
           if jq -e '
               type == "array" and
-              any(.[]; (.stream_type // "" | ascii_downcase) == "splunk" and (.enabled // false) == true)
+              any(
+                .[];
+                (.stream_type // "" | ascii_downcase) == "splunk"
+                and
+                (.enabled // false) == true
+              )
             ' "${stream_file}" > /dev/null 2>&1; then
 
-            echo "Active GitHub enterprise audit-log Splunk stream detected."
+            echo "Active GitHub enterprise Splunk audit-log stream detected."
 
             jq '[
               .[] |
@@ -257,8 +336,9 @@ jobs:
                 updated_at: .updated_at,
                 paused_at: .paused_at
               }
-            ]' "${stream_file}" \
-              > evidence/normalized/splunk-stream-evidence.json
+            ]' \
+            "${stream_file}" \
+            > evidence/normalized/splunk-stream-evidence.json
 
           else
 
@@ -273,6 +353,10 @@ jobs:
 
           fi
 
+      # ------------------------------------------------------------------
+      # 9. Collect organization-level retention policies
+      # ------------------------------------------------------------------
+
       - name: Collect organization retention policies
         shell: bash
         run: |
@@ -285,15 +369,22 @@ jobs:
           echo '[]' > "${org_manifest}"
 
           for raw_org in "${ORG_ARRAY[@]}"; do
+
             org="$(echo "${raw_org}" | xargs)"
 
             if [[ -z "${org}" ]]; then
               continue
             fi
 
-            safe_org="$(echo "${org}" | tr '/:' '__')"
+            safe_org="$(
+              echo "${org}" |
+              tr '/:' '__'
+            )"
 
-            echo "Collecting organization evidence for: ${org}"
+            echo
+            echo "================================================="
+            echo "Collecting organization evidence: ${org}"
+            echo "================================================="
 
             retention_file="evidence/raw/org-${safe_org}-artifact-log-retention.json"
             actions_file="evidence/raw/org-${safe_org}-actions-permissions.json"
@@ -343,28 +434,44 @@ jobs:
               echo "::warning::Failed to retrieve workflow permissions for organization ${org}."
             fi
 
-            if [[ -s "${retention_file}" ]] && jq empty "${retention_file}" 2>/dev/null; then
-              jq '.' "${retention_file}" \
+            if [[ -s "${retention_file}" ]] &&
+               jq empty "${retention_file}" 2>/dev/null; then
+
+              jq '.' \
+                "${retention_file}" \
                 > "evidence/normalized/org-${safe_org}-artifact-log-retention.json"
+
             fi
 
-            if [[ -s "${actions_file}" ]] && jq empty "${actions_file}" 2>/dev/null; then
-              jq '.' "${actions_file}" \
+            if [[ -s "${actions_file}" ]] &&
+               jq empty "${actions_file}" 2>/dev/null; then
+
+              jq '.' \
+                "${actions_file}" \
                 > "evidence/normalized/org-${safe_org}-actions-permissions.json"
+
             fi
 
-            if [[ -s "${workflow_file}" ]] && jq empty "${workflow_file}" 2>/dev/null; then
-              jq '.' "${workflow_file}" \
+            if [[ -s "${workflow_file}" ]] &&
+               jq empty "${workflow_file}" 2>/dev/null; then
+
+              jq '.' \
+                "${workflow_file}" \
                 > "evidence/normalized/org-${safe_org}-workflow-permissions.json"
+
             fi
 
             org_days="NOT_REPORTED"
 
-            if [[ -f "evidence/normalized/org-${safe_org}-artifact-log-retention.json" ]]; then
+            normalized_retention_file="evidence/normalized/org-${safe_org}-artifact-log-retention.json"
+
+            if [[ -f "${normalized_retention_file}" ]]; then
+
               org_days="$(
                 jq -r '.days // "NOT_REPORTED"' \
-                "evidence/normalized/org-${safe_org}-artifact-log-retention.json"
+                "${normalized_retention_file}"
               )"
+
             fi
 
             jq \
@@ -381,7 +488,9 @@ jobs:
               '
               . += [{
                 organization: $org,
+
                 collection_status: $status,
+
                 configured_retention_days:
                   (
                     if ($configured_days | test("^[0-9]+$"))
@@ -389,24 +498,30 @@ jobs:
                     else null
                     end
                   ),
-                required_minimum_retention_days: ($required_days | tonumber)
+
+                required_minimum_retention_days:
+                  ($required_days | tonumber)
               }]
               ' \
-              "${org_manifest}" > "${org_manifest}.tmp"
+              "${org_manifest}" \
+              > "${org_manifest}.tmp"
 
-            mv "${org_manifest}.tmp" "${org_manifest}"
+            mv \
+              "${org_manifest}.tmp" \
+              "${org_manifest}"
+
           done
 
-      - name: Collect enterprise audit-log sample
+      # ------------------------------------------------------------------
+      # 10. Collect recent enterprise audit log sample
+      # ------------------------------------------------------------------
+
+      - name: Collect enterprise audit log sample
         shell: bash
         run: |
           set -euo pipefail
 
-          # Collect a limited, recent sample to demonstrate that enterprise
-          # audit records are available for evidence and monitoring.
-          #
-          # The authoritative long-term retention requirement is AU-11/Splunk,
-          # not the GitHub native audit-log retention window.
+          echo "Collecting recent enterprise audit-log sample..."
 
           start_epoch="$(
             date -u -d '24 hours ago' +%s000
@@ -419,9 +534,9 @@ jobs:
           set +e
 
           gh api \
+            --paginate \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: ${API_VERSION}" \
-            --paginate \
             "/enterprises/${ENTERPRISE_SLUG}/audit-log?include=web&after=${start_epoch}&before=${end_epoch}&per_page=100" \
             > evidence/raw/enterprise-audit-log-sample.json
 
@@ -430,12 +545,20 @@ jobs:
           set -e
 
           if [[ "${audit_status}" -ne 0 ]]; then
+
             echo "::warning::Enterprise audit-log sample could not be retrieved."
-            echo '[]' > evidence/raw/enterprise-audit-log-sample.json
+
+            echo '[]' \
+              > evidence/raw/enterprise-audit-log-sample.json
+
           fi
 
-          if jq -e 'type == "array"' evidence/raw/enterprise-audit-log-sample.json > /dev/null 2>&1; then
-            jq 'length' evidence/raw/enterprise-audit-log-sample.json \
+          if jq -e 'type == "array"' \
+            evidence/raw/enterprise-audit-log-sample.json \
+            > /dev/null 2>&1; then
+
+            jq 'length' \
+              evidence/raw/enterprise-audit-log-sample.json \
               > evidence/normalized/enterprise-audit-log-sample-count.json
 
             jq '
@@ -449,12 +572,23 @@ jobs:
                   created_at: .created_at
                 }
               ]
-            ' evidence/raw/enterprise-audit-log-sample.json \
+            ' \
+              evidence/raw/enterprise-audit-log-sample.json \
               > evidence/normalized/enterprise-audit-log-sample-summary.json
+
           else
-            echo '0' > evidence/normalized/enterprise-audit-log-sample-count.json
-            echo '[]' > evidence/normalized/enterprise-audit-log-sample-summary.json
+
+            echo '0' \
+              > evidence/normalized/enterprise-audit-log-sample-count.json
+
+            echo '[]' \
+              > evidence/normalized/enterprise-audit-log-sample-summary.json
+
           fi
+
+      # ------------------------------------------------------------------
+      # 11. Generate retention compliance report
+      # ------------------------------------------------------------------
 
       - name: Generate retention compliance report
         shell: bash
@@ -472,18 +606,31 @@ jobs:
           )"
 
           audit_sample_count="$(
-            jq -r '.' evidence/normalized/enterprise-audit-log-sample-count.json
+            jq -r '.' \
+            evidence/normalized/enterprise-audit-log-sample-count.json
           )"
 
           splunk_enabled="$(
             jq -r '
               if type == "array" then
-                any(.[]; (.stream_type // "" | ascii_downcase) == "splunk" and (.enabled // false) == true)
+                any(
+                  .[];
+                  (.stream_type // "" | ascii_downcase) == "splunk"
+                  and
+                  (.enabled // false) == true
+                )
               else
                 false
               end
-            ' evidence/raw/enterprise-audit-log-streams.json
+            ' \
+            evidence/raw/enterprise-audit-log-streams.json
           )"
+
+          retention_status="FAIL"
+
+          if (( enterprise_days >= EXPECTED_MIN_RETENTION_DAYS )); then
+            retention_status="PASS"
+          fi
 
           cat > evidence/retention-policy-assessment.md <<EOF
           # FedRAMP SI-12(3) Retention Evidence Assessment
@@ -499,17 +646,16 @@ jobs:
           | Collection Time (UTC) | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |
           | GitHub API Version | ${API_VERSION} |
           | Expected Minimum Retention | ${EXPECTED_MIN_RETENTION_DAYS} days |
+          | Evidence Artifact Retention | ${EVIDENCE_ARTIFACT_RETENTION_DAYS} days |
 
           ## Enterprise GitHub Actions Retention
 
           | Requirement | Observed Value |
           |---|---:|
           | Configured artifact/log retention | ${enterprise_days} days |
-          | Maximum permitted by enterprise policy | ${enterprise_max_days} days |
+          | Maximum permitted retention | ${enterprise_max_days:-NOT_REPORTED} days |
           | Required minimum | ${EXPECTED_MIN_RETENTION_DAYS} days |
-
-          **Assessment result:** \
-          $(if (( enterprise_days >= EXPECTED_MIN_RETENTION_DAYS )); then echo "PASS"; else echo "FAIL"; fi)
+          | Assessment | ${retention_status} |
 
           ## Enterprise Audit Log / Splunk
 
@@ -518,47 +664,61 @@ jobs:
           | GitHub enterprise audit-log stream | ${splunk_enabled} |
           | Recent enterprise audit sample count | ${audit_sample_count} |
           | External long-term retention system | Splunk |
-          | AU-11 authoritative retention | Maintained in the organization's Splunk/log-retention policy |
-
-          **Important:** GitHub's native enterprise audit log is not treated as the authoritative long-term retention mechanism for the ATO. GitHub documents that enterprise audit events are available within a finite native retention window; the organization's configured Splunk retention requirement must therefore be evidenced separately under AU-11. :contentReference[oaicite:1]{index=1}
+          | AU-11 authoritative retention | Organization/Splunk configuration |
 
           ## SI-12(3) Evidence Interpretation
 
           This evidence package demonstrates:
 
-          1. The enterprise-level GitHub Actions artifact/log retention policy currently configured.
-          2. The maximum enterprise retention value supported by GitHub.
+          1. The enterprise-level GitHub Actions artifact/log retention configuration.
+          2. The maximum enterprise retention value reported by GitHub.
           3. Organization-level retention configurations for designated in-scope organizations.
-          4. Enterprise audit-log streaming configuration, including Splunk when configured.
+          4. Enterprise audit-log streaming configuration.
           5. Availability of recent enterprise audit-log events.
-          6. The relationship between GitHub operational retention and the organization's centralized audit-log retention process.
+          6. The relationship between GitHub operational retention and centralized audit-log retention.
 
-          SI-12(3) disposition requirements remain governed by the organization's approved retention and disposition policy. This workflow is evidence collection and does not itself delete or modify organizational information.
+          SI-12(3) disposition requirements remain governed by the organization's approved retention and disposition policy.
+
+          This workflow is read-only and does not delete or modify organizational information.
 
           ## Control Cross-References
 
           | Control | Evidence Relationship |
           |---|---|
-          | AC-2 | Enterprise/organization identity and account lifecycle evidence maintained separately |
-          | AC-3 | GitHub organization/repository authorization evidence maintained separately |
-          | IA-2 | SAML SSO / enterprise authentication evidence maintained separately |
-          | IA-5 | Authenticator management evidence maintained separately |
-          | AU-2 | GitHub audit event selection and collection evidence |
-          | AU-6 | Splunk review, correlation, search, and reporting evidence |
-          | AU-9 | Splunk audit-data access/protection evidence |
-          | AU-11 | Authoritative Splunk retention requirement and configuration |
-          | MP-6 | Sanitization/disposal evidence for organization-controlled media |
-          | SI-4 | GitHub event monitoring and Splunk detection/correlation evidence |
-          | SI-12(3) | Final information disposition after retention requirements are satisfied |
+          | AC-2 | Enterprise/organization identity and account lifecycle evidence |
+          | AC-3 | GitHub organization/repository authorization evidence |
+          | IA-2 | SAML SSO / enterprise authentication evidence |
+          | IA-5 | Enterprise authenticator management evidence |
+          | AU-2 | GitHub audit event selection and collection |
+          | AU-6 | Splunk review, correlation, search, and reporting |
+          | AU-9 | Splunk audit-data protection |
+          | AU-11 | Authoritative Splunk retention configuration |
+          | MP-6 | Sanitization/disposal of organization-controlled media |
+          | SI-4 | GitHub event monitoring and Splunk detection |
+          | SI-12(3) | Final disposition after retention requirements are satisfied |
 
-          ## Evidence Limitations
+          ## Important ATO Evidence Limitation
 
-          This GitHub-generated package does **not** establish the actual Splunk data-retention period. The ATO evidence package should include an independent Splunk configuration export, report, screenshot, or other assessor-acceptable evidence showing the retention period for the GitHub audit-log index/data set.
+          This GitHub-generated package does NOT independently establish the actual
+          Splunk data-retention period.
 
-          It also does not prove that every repository or downstream copy complies with the enterprise policy. Repository-level exceptions, legal holds, backup copies, exports, and organization-controlled copies should be addressed through the applicable SSP procedures and supporting controls.
+          The ATO evidence package should additionally contain an assessor-acceptable
+          Splunk configuration export, report, screenshot, or equivalent evidence
+          showing the retention period for the GitHub audit-log data/index.
+
+          It also does not prove that every repository or downstream copy complies
+          with the enterprise policy.
+
+          Repository-level exceptions, legal holds, backup copies, exports, and
+          organization-controlled copies must be addressed through the applicable
+          SSP procedures and supporting controls.
           EOF
 
-      - name: Generate machine-readable evidence manifest
+      # ------------------------------------------------------------------
+      # 12. Generate machine-readable evidence manifest
+      # ------------------------------------------------------------------
+
+      - name: Generate evidence manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -569,7 +729,8 @@ jobs:
                 configured_days: .days,
                 maximum_allowed_days: .maximum_allowed_days
               }
-            ' evidence/raw/enterprise-artifact-log-retention.json
+            ' \
+            evidence/raw/enterprise-artifact-log-retention.json
           )"
 
           stream_summary="$(
@@ -590,11 +751,13 @@ jobs:
               else
                 []
               end
-            ' evidence/raw/enterprise-audit-log-streams.json
+            ' \
+            evidence/raw/enterprise-audit-log-streams.json
           )"
 
           org_summary="$(
-            jq -c '.' evidence/normalized/organization-retention-summary.json
+            jq -c '.' \
+            evidence/normalized/organization-retention-summary.json
           )"
 
           jq -n \
@@ -611,37 +774,84 @@ jobs:
             --argjson organizations "${org_summary}" \
             '{
               evidence_type: "FedRAMP SI-12(3) GitHub Retention Policy Evidence",
+
               collected_at_utc: $collected_at,
+
               enterprise: $enterprise,
+
               repository: $repository,
+
               workflow_run_id: $run_id,
+
               commit_sha: $commit_sha,
+
               github_api_version: $api_version,
-              required_minimum_retention_days: ($expected_min_days | tonumber),
-              evidence_artifact_retention_days: ($evidence_artifact_retention | tonumber),
-              enterprise_actions_artifact_log_retention: $enterprise_retention,
-              enterprise_audit_log_streams: $audit_streams,
-              organizations: $organizations,
+
+              required_minimum_retention_days:
+                ($expected_min_days | tonumber),
+
+              evidence_artifact_retention_days:
+                ($evidence_artifact_retention | tonumber),
+
+              enterprise_actions_artifact_log_retention:
+                $enterprise_retention,
+
+              enterprise_audit_log_streams:
+                $audit_streams,
+
+              organizations:
+                $organizations,
+
               source_of_truth_notes: {
-                github_actions_retention: "GitHub enterprise Actions retention configuration",
-                github_audit_stream: "GitHub enterprise audit-log stream configuration",
-                long_term_audit_retention: "Organization/Splunk AU-11 configuration must be independently evidenced",
-                sanitization: "Organization MP-6 implementation"
+
+                github_actions_retention:
+                  "GitHub enterprise Actions retention configuration",
+
+                github_audit_stream:
+                  "GitHub enterprise audit-log stream configuration",
+
+                long_term_audit_retention:
+                  "Organization/Splunk AU-11 configuration must be independently evidenced",
+
+                sanitization:
+                  "Organization MP-6 implementation"
               }
             }' \
             > evidence/evidence-manifest.json
 
-      - name: Generate file checksums
+      # ------------------------------------------------------------------
+      # 13. Generate SHA-256 checksums
+      #
+      # IMPORTANT:
+      # The checksum file is generated relative to the evidence directory.
+      # This makes validation internally consistent.
+      # ------------------------------------------------------------------
+
+      - name: Generate SHA-256 checksums
         shell: bash
         run: |
           set -euo pipefail
 
-          find evidence -type f \
-            -not -path 'evidence/checksums/*' \
+          cd evidence
+
+          rm -f checksums/SHA256SUMS
+
+          find . \
+            -type f \
+            -not -path './checksums/*' \
             -print0 \
             | sort -z \
             | xargs -0 sha256sum \
-            > evidence/checksums/SHA256SUMS
+            > checksums/SHA256SUMS
+
+          cd ..
+
+          echo "Generated SHA-256 evidence manifest:"
+          cat evidence/checksums/SHA256SUMS
+
+      # ------------------------------------------------------------------
+      # 14. Validate evidence bundle
+      # ------------------------------------------------------------------
 
       - name: Validate evidence bundle
         shell: bash
@@ -660,22 +870,56 @@ jobs:
             "evidence/checksums/SHA256SUMS"
           )
 
+          echo "Checking required evidence files..."
+
           for file in "${required_files[@]}"; do
+
             if [[ ! -s "${file}" ]]; then
               echo "::error::Required evidence file is missing or empty: ${file}"
               exit 1
             fi
+
+            echo "OK: ${file}"
+
           done
 
-          jq empty evidence/evidence-manifest.json
-          jq empty evidence/normalized/organization-retention-summary.json
+          echo
+          echo "Validating JSON evidence..."
+
+          jq empty \
+            evidence/evidence-manifest.json
+
+          jq empty \
+            evidence/normalized/organization-retention-summary.json
+
+          jq empty \
+            evidence/raw/enterprise-artifact-log-retention.json
+
+          jq empty \
+            evidence/raw/enterprise-actions-permissions.json
+
+          jq empty \
+            evidence/raw/enterprise-workflow-permissions.json
+
+          jq empty \
+            evidence/raw/enterprise-audit-log-streams.json
+
+          echo "JSON validation passed."
+
+          echo
+          echo "Validating SHA-256 checksums..."
 
           (
             cd evidence
             sha256sum -c checksums/SHA256SUMS
           )
 
+          echo
           echo "Evidence bundle validation completed successfully."
+
+      # ------------------------------------------------------------------
+      # 15. Package evidence for ATO
+      # ------------------------------------------------------------------
 
       - name: Package ATO evidence
         shell: bash
@@ -683,6 +927,8 @@ jobs:
           set -euo pipefail
 
           archive_name="github-si-12-3-retention-evidence-${ENTERPRISE_SLUG}-${GITHUB_RUN_NUMBER}.tar.gz"
+
+          echo "Creating evidence archive: ${archive_name}"
 
           tar \
             --sort=name \
@@ -693,22 +939,46 @@ jobs:
             -czf "${archive_name}" \
             evidence
 
-          sha256sum "${archive_name}" \
-            > "${archive_name}.sha256"
+          archive_checksum="${archive_name}.sha256"
 
+          sha256sum "${archive_name}" \
+            > "${archive_checksum}"
+
+          echo "EVIDENCE_ARCHIVE=${archive_name}" \
+            >> "${GITHUB_ENV}"
+
+          echo "EVIDENCE_ARCHIVE_SHA256=${archive_checksum}" \
+            >> "${GITHUB_ENV}"
+
+          echo
           echo "Evidence package:"
-          ls -lh "${archive_name}" "${archive_name}.sha256"
+          ls -lh \
+            "${archive_name}" \
+            "${archive_checksum}"
+
+      # ------------------------------------------------------------------
+      # 16. Upload ATO evidence
+      # ------------------------------------------------------------------
 
       - name: Upload ATO evidence artifact
         uses: actions/upload-artifact@v4
         with:
           name: github-si-12-3-retention-evidence-${{ github.run_number }}
+
           path: |
-            github-si-12-3-retention-evidence-${{ github.run_number }}.tar.gz
-            github-si-12-3-retention-evidence-${{ github.run_number }}.tar.gz.sha256
+            ${{ env.EVIDENCE_ARCHIVE }}
+            ${{ env.EVIDENCE_ARCHIVE_SHA256 }}
             evidence/retention-policy-assessment.md
             evidence/evidence-manifest.json
+            evidence/checksums/SHA256SUMS
+
           retention-days: ${{ fromJSON(inputs.evidence_artifact_retention_days || vars.FEDRAMP_EVIDENCE_ARTIFACT_RETENTION_DAYS || '90') }}
+
+          if-no-files-found: error
+
+      # ------------------------------------------------------------------
+      # 17. Publish GitHub Actions run summary
+      # ------------------------------------------------------------------
 
       - name: Publish run summary
         shell: bash
@@ -716,11 +986,13 @@ jobs:
           set -euo pipefail
 
           enterprise_days="$(
-            jq -r '.days' evidence/raw/enterprise-artifact-log-retention.json
+            jq -r '.days' \
+            evidence/raw/enterprise-artifact-log-retention.json
           )"
 
           maximum_days="$(
-            jq -r '.maximum_allowed_days' evidence/raw/enterprise-artifact-log-retention.json
+            jq -r '.maximum_allowed_days' \
+            evidence/raw/enterprise-artifact-log-retention.json
           )"
 
           splunk_stream_count="$(
@@ -730,45 +1002,109 @@ jobs:
                   .[] |
                   select(
                     (.stream_type // "" | ascii_downcase) == "splunk"
-                    and (.enabled // false) == true
+                    and
+                    (.enabled // false) == true
                   )
                 ] | length
               else
                 0
               end
-            ' evidence/raw/enterprise-audit-log-streams.json
+            ' \
+            evidence/raw/enterprise-audit-log-streams.json
           )"
 
           org_count="$(
-            jq 'length' evidence/normalized/organization-retention-summary.json
+            jq 'length' \
+            evidence/normalized/organization-retention-summary.json
           )"
+
+          retention_status="FAIL"
+
+          if (( enterprise_days >= EXPECTED_MIN_RETENTION_DAYS )); then
+            retention_status="PASS"
+          fi
 
           {
             echo "# FedRAMP Retention Evidence Collection"
             echo
+
             echo "| Evidence Item | Result |"
             echo "|---|---|"
+
             echo "| Enterprise | ${ENTERPRISE_SLUG} |"
+
             echo "| Enterprise Actions retention | ${enterprise_days} days |"
+
             echo "| Enterprise maximum retention | ${maximum_days} days |"
+
             echo "| Required minimum | ${EXPECTED_MIN_RETENTION_DAYS} days |"
+
+            echo "| Retention assessment | ${retention_status} |"
+
             echo "| In-scope organizations assessed | ${org_count} |"
+
             echo "| Enabled Splunk enterprise streams detected | ${splunk_stream_count} |"
+
             echo
+
             echo "## ATO Evidence Interpretation"
             echo
+
             echo "This run captures GitHub-side retention and audit-stream configuration."
-            echo "The authoritative long-term SIEM retention requirement must be independently evidenced from Splunk under AU-11."
+
             echo
+
+            echo "The authoritative long-term SIEM retention requirement must be independently evidenced from Splunk under AU-11."
+
+            echo
+
             echo "## Primary Control"
             echo
+
             echo "SI-12(3) - Information disposal following expiration of the applicable retention period."
+
             echo
+
             echo "## Supporting Controls"
             echo
+
             echo "AC-2, AC-3, IA-2, IA-5, AU-2, AU-6, AU-9, AU-11, MP-6, SI-4"
+
+            echo
+
+            echo "## Evidence Package"
+            echo
+
+            echo "Archive: ${EVIDENCE_ARCHIVE}"
+
+            echo
+
+            echo "SHA-256:"
+
+            cat "${EVIDENCE_ARCHIVE_SHA256}"
+
           } >> "${GITHUB_STEP_SUMMARY}"
 
-    # Protect the workflow from silently producing incomplete evidence.
-    # Collection errors should cause the run to fail rather than generate a
-    # misleading PASS artifact.
+      # ------------------------------------------------------------------
+      # 18. Final validation
+      # ------------------------------------------------------------------
+
+      - name: Final evidence status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "================================================="
+          echo "FedRAMP Evidence Collection Complete"
+          echo "================================================="
+          echo
+          echo "Enterprise: ${ENTERPRISE_SLUG}"
+          echo "Organizations: ${ORGANIZATIONS}"
+          echo
+          echo "Evidence archive:"
+          echo "${EVIDENCE_ARCHIVE}"
+          echo
+          echo "Evidence archive checksum:"
+          echo "${EVIDENCE_ARCHIVE_SHA256}"
+          echo
+          echo "Retention policy evidence is ready for ATO review."
