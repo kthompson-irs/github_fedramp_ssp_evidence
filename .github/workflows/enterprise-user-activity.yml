@@ -2,31 +2,37 @@ name: Enterprise User Activity Report
 
 on:
   workflow_dispatch:
+    inputs:
+      days:
+        description: Number of days to retrieve
+        required: true
+        default: "30"
+        type: choice
+        options:
+          - "30"
+          - "60"
+          - "90"
   schedule:
     - cron: '0 2 * * *'
-
-permissions:
-  contents: read
 
 jobs:
   enterprise-activity:
     runs-on: ubuntu-latest
     env:
       ENTERPRISE: your-enterprise-name
+      DAYS: ${{ github.event.inputs.days || '30' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
       - run: |
           python -m pip install --upgrade pip
           pip install requests pandas
-      - run: mkdir -p reports
-      - name: Collect Enterprise Activity
-        env:
+      - env:
           GH_TOKEN: ${{ secrets.FEDRAMP_ENTERPRISE_TOKEN }}
         run: python scripts/enterprise_user_activity.py
       - uses: actions/upload-artifact@v4
         with:
-          name: enterprise-user-activity
+          name: enterprise-user-activity-${{ env.DAYS }}-days
           path: reports/
